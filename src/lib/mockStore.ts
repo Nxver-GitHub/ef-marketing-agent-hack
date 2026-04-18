@@ -52,6 +52,7 @@ type ScoringRun = {
   sources_succeeded: string[];
   current_source?: string;
   error_log?: string;
+  agent_steps?: Array<Record<string, unknown>>;
   started_at: number;
   completed_at?: number;
 };

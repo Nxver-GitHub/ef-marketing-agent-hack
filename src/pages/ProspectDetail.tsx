@@ -197,36 +197,77 @@ const ProspectDetail = () => {
   );
 };
 
-const ProgressView = ({ run }: { run: any }) => (
-  <div className="max-w-2xl">
-    <div className="label-eyebrow mb-3">Querying sources…</div>
-    <div className="text-3xl font-light tracking-tight mb-8">
-      {run.current_source ?? "starting"}
+const AgentStep = ({ step }: { step: Record<string, unknown> }) => {
+  const type = step.type as string;
+  if (type === "search") return (
+    <div className="px-4 py-2 text-xs flex gap-3">
+      <span className="text-mono text-muted-foreground/60 shrink-0">search</span>
+      <span className="truncate">{step.query as string}</span>
     </div>
-    <div className="space-y-2">
-      {ALL_SOURCES.map((s) => {
-        const ok = run.sources_succeeded.includes(s);
-        const active = run.current_source === s;
-        return (
-          <div
-            key={s}
-            className="flex items-center justify-between border-b border-border py-2 text-xs"
-          >
-            <span className="text-mono text-muted-foreground">{s}</span>
-            <span
-              className={`text-mono ${
-                ok ? "" : active ? "" : "text-muted-foreground/50"
-              }`}
-              style={{ color: ok ? "hsl(var(--success))" : active ? "hsl(var(--accent))" : undefined }}
+  );
+  if (type === "signal") return (
+    <div className="px-4 py-2 text-xs flex gap-3">
+      <span className="text-mono text-muted-foreground/60 shrink-0">signal</span>
+      <span>{step.signal_type as string} = {String(step.value)}</span>
+      <span className="text-muted-foreground/40 ml-auto shrink-0">{step.source as string}</span>
+    </div>
+  );
+  if (type === "finalized") return (
+    <div className="px-4 py-2 text-xs flex gap-3" style={{ color: "hsl(var(--success))" }}>
+      <span className="text-mono shrink-0">identified</span>
+      <span className="font-medium">{step.name as string}</span>
+      <span className="opacity-60 ml-1">({Math.round(((step.confidence as number) ?? 0) * 100)}% confidence)</span>
+    </div>
+  );
+  return null;
+};
+
+const ProgressView = ({ run }: { run: any }) => {
+  const steps = (run.agent_steps ?? []) as Array<Record<string, unknown>>;
+  return (
+    <div className="max-w-2xl">
+      <div className="label-eyebrow mb-3">Agent working…</div>
+      <div className="text-3xl font-light tracking-tight mb-8">
+        {run.current_source ?? "starting"}
+      </div>
+      <div className="space-y-2 mb-8">
+        {ALL_SOURCES.map((s) => {
+          const ok = run.sources_succeeded.includes(s);
+          const active = run.current_source === s;
+          return (
+            <div
+              key={s}
+              className="flex items-center justify-between border-b border-border py-2 text-xs"
             >
-              {ok ? "OK" : active ? "…" : "queued"}
-            </span>
+              <span className="text-mono text-muted-foreground">{s}</span>
+              <span
+                className={`text-mono ${
+                  ok ? "" : active ? "" : "text-muted-foreground/50"
+                }`}
+                style={{ color: ok ? "hsl(var(--success))" : active ? "hsl(var(--accent))" : undefined }}
+              >
+                {ok ? "OK" : active ? "…" : "queued"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {steps.length > 0 && (
+        <div className="border border-border">
+          <div className="px-4 py-3 border-b border-border">
+            <div className="label-eyebrow">Agent reasoning</div>
           </div>
-        );
-      })}
+          <div className="divide-y divide-border/60 max-h-64 overflow-y-auto">
+            {steps.map((step, i) => (
+              <AgentStep key={i} step={step} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
-  </div>
-);
+  );
+};
 
 const OrgChart = ({ prospect }: { prospect: any }) => {
   // TODO: replace mock org graph with real data from fetchOrgChart()

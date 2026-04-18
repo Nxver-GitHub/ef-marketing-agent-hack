@@ -66,6 +66,8 @@ const Validate = () => {
       name: name.trim() || "Unknown",
       company,
       role: finalRoles[0],
+      roles: finalRoles,
+      keywords: finalKeywords,
       industry,
     });
     void db.runScoring(id);

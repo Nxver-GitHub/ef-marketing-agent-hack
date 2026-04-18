@@ -244,6 +244,8 @@ async function supaCreateProspect(p: {
   name: string;
   company: string;
   role: string;
+  roles?: string[];
+  keywords?: string[];
   industry: string;
   linkedin_url?: string;
 }) {
@@ -257,90 +259,11 @@ async function supaCreateProspect(p: {
 }
 
 async function supaRunScoring(prospect_id: string) {
-  const { data: runRow, error: runErr } = await supabase!
-    .from("scoring_runs")
-    .insert({
-      prospect_id,
-      status: "running",
-      sources_attempted: [...ALL_SOURCES],
-      sources_succeeded: [],
-    })
-    .select()
-    .single();
-  if (runErr) throw runErr;
-  const runId = runRow!.id;
-
-  for (const source of ALL_SOURCES) {
-    await supabase!
-      .from("scoring_runs")
-      .update({ current_source: source })
-      .eq("id", runId);
-
-    await new Promise((r) => setTimeout(r, 350 + Math.random() * 350));
-
-    const signalRows = SOURCE_TO_SIGNALS[source].map((signal_type) => ({
-      prospect_id,
-      source,
-      signal_type,
-      value: rand(0, 30),
-      raw_data: { _mock: true, source },
-      weight: 1,
-      confidence: +(0.6 + Math.random() * 0.35).toFixed(2),
-    }));
-    await supabase!.from("signals").insert(signalRows);
-
-    const succIdx = ALL_SOURCES.indexOf(source as any);
-    await supabase!
-      .from("scoring_runs")
-      .update({ sources_succeeded: [...ALL_SOURCES].slice(0, succIdx + 1) })
-      .eq("id", runId);
-  }
-
-  // Compute score from stored signals + weights
-  const { data: signals } = await supabase!
-    .from("signals")
-    .select("*")
-    .eq("prospect_id", prospect_id);
-  const { data: weights } = await supabase!.from("signal_weights").select("*");
-
-  const wmap = new Map(
-    (weights ?? []).map((w: any) => [
-      w.signal_type,
-      { a: w.authenticity_weight, au: w.authority_weight, w: w.warmth_weight },
-    ])
-  );
-  let aN = 0, aD = 0, auN = 0, auD = 0, wN = 0, wD = 0;
-  for (const s of signals ?? []) {
-    const w = wmap.get(s.signal_type);
-    if (!w) continue;
-    const v = norm(Number(s.value) || 0);
-    const base = (s.weight ?? 1) * (s.confidence ?? 1);
-    aN += v * base * w.a; aD += base * w.a;
-    auN += v * base * w.au; auD += base * w.au;
-    wN += v * base * w.w; wD += base * w.w;
-  }
-  const round = (n: number) => Math.round(n * 10) / 10;
-  await supabase!.from("scores").insert({
-    prospect_id,
-    authenticity_score: round(aD ? aN / aD : 0),
-    authority_score: round(auD ? auN / auD : 0),
-    warmth_score: round(wD ? wN / wD : 0),
-    overall_score: round(
-      0.4 * (aD ? aN / aD : 0) +
-      0.4 * (auD ? auN / auD : 0) +
-      0.2 * (wD ? wN / wD : 0)
-    ),
-    falsification_notes: FALSIFICATION_NOTES,
+  // Delegate to Claude agent edge function
+  const { error } = await supabase!.functions.invoke("validate-agent", {
+    body: { prospect_id },
   });
-
-  await supabase!
-    .from("scoring_runs")
-    .update({
-      status: "complete",
-      current_source: null,
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", runId);
+  if (error) console.error("[validate-agent]", error);
 }
 
 async function supaUpsertWeight(
