@@ -1,7 +1,7 @@
 import { useState, useRef, KeyboardEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { PageShell } from "@/components/PageShell";
-import { store } from "@/lib/mockStore";
+import { db } from "@/lib/db";
 
 const INDUSTRIES = ["Semiconductors", "Defense", "Pharma", "Quantum", "Aerospace"];
 
@@ -62,16 +62,13 @@ const Validate = () => {
       : keywords;
     if (finalRoles.length === 0) return;
     setSubmitting(true);
-    const id = store.createProspect({
+    const id = await db.createProspect({
       name: name.trim() || "Unknown",
       company,
       role: finalRoles[0],
       industry,
-      // @ts-ignore — extended fields consumed by agent search layer
-      roles: finalRoles,
-      keywords: finalKeywords,
     });
-    void store.runScoring(id);
+    void db.runScoring(id);
     navigate(`/prospect/${id}`);
   };
 

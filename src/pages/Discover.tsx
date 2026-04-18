@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { PageShell } from "@/components/PageShell";
-import { useProspects, useScoresFor, store } from "@/lib/mockStore";
+import { useProspects, useScoresFor } from "@/lib/db";
 import { scoreColor } from "@/components/ScoreBar";
 
 const ROLES = ["Engineering Lead", "Director", "VP", "Principal", "C-Suite"];

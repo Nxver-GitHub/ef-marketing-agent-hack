@@ -6,7 +6,7 @@ import {
   useSignalsFor,
   useLatestScore,
   useLatestRun,
-} from "@/lib/mockStore";
+} from "@/lib/db";
 import { BigScore, ScoreBar, scoreColor } from "@/components/ScoreBar";
 import { ENABLE_ORG_CHART } from "@/lib/supabase";
 import ReactFlow, { Background, Controls, type Node, type Edge } from "reactflow";

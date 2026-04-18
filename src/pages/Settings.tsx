@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { PageShell } from "@/components/PageShell";
-import { useWeights, store } from "@/lib/mockStore";
+import { useWeights, useProspects, db } from "@/lib/db";
 
 const Settings = () => {
   const weights = useWeights();
+  const prospects = useProspects();
   const [draft, setDraft] = useState<Record<string, [number, number, number]>>({});
 
   const get = (signal_type: string, idx: 0 | 1 | 2, fallback: number) =>
@@ -20,12 +21,11 @@ const Settings = () => {
     setDraft({ ...draft, [signal_type]: next });
   };
 
-  const save = () => {
+  const save = async () => {
     for (const [signal_type, vals] of Object.entries(draft)) {
-      store.upsertWeight(signal_type, vals[0], vals[1], vals[2]);
+      await db.upsertWeight(signal_type, vals[0], vals[1], vals[2]);
     }
-    // recompute every prospect's score with new weights
-    for (const p of store.prospects) store.computeScore(p._id);
+    await db.computeScores(prospects.map((p) => p._id));
     setDraft({});
   };
 
