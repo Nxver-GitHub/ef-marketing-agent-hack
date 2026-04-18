@@ -73,7 +73,7 @@ const Index = () => {
               </div>
             )}
             <div className="flex items-center justify-between text-xs text-mono">
-              <span className="text-muted-foreground">→ /pipeline</span>
+              <span className="text-muted-foreground">→ /discover</span>
               <span className="opacity-0 group-hover:opacity-100 transition-opacity">↗</span>
             </div>
           </Link>
