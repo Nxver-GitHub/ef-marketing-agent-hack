@@ -38,3 +38,8 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for the signal/score separation and how
 ## Out of scope
 
 Auth, real Apify wiring, email outreach, persistent user accounts.
+
+<img width="1320" height="759" alt="image" src="https://github.com/user-attachments/assets/76f50833-a802-459a-ac04-3fc55b24a254" />
+<img width="1304" height="720" alt="image" src="https://github.com/user-attachments/assets/7360eca6-0fd6-462c-94b8-808de6a1e1ad" />
+<img width="1313" height="714" alt="image" src="https://github.com/user-attachments/assets/4656ebb8-2b1c-436e-a25f-a021d2bfe658" />
+
