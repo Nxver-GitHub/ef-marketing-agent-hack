@@ -1,16 +1,46 @@
-import { useMemo, useState } from "react";
-import { useParams, Link } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams, Link } from "react-router-dom";
 import { PageShell } from "@/components/PageShell";
 import {
+  db,
   useProspect,
   useSignalsFor,
   useLatestScore,
   useLatestRun,
 } from "@/lib/db";
 import { BigScore, ScoreBar, scoreColor } from "@/components/ScoreBar";
-import { ENABLE_ORG_CHART } from "@/lib/supabase";
+import { ENABLE_ORG_CHART, supabase } from "@/lib/supabase";
+import { WebPresence } from "@/components/WebPresence";
 import ReactFlow, { Background, Controls, type Node, type Edge } from "reactflow";
 import "reactflow/dist/style.css";
+
+// ─── Org chart helpers ──────────────────────────────────────────────────────
+// Seniority rank derived from role-title tokens. Used to place peers around
+// the target prospect: higher-rank = manager (above), same ±10 = peer, lower
+// = direct report.
+interface OrgPerson {
+  id: string;
+  name: string;
+  role: string;
+  company?: string;
+  industry?: string;
+  linkedin_url?: string;
+  source?: "supabase" | "fastapi";
+}
+
+function seniorityRank(role: string | null | undefined): number {
+  if (!role) return 40;
+  const r = role.toLowerCase();
+  if (/\b(ceo|cto|coo|cfo|chief\b|president|founder)\b/.test(r)) return 95;
+  if (/\b(svp|senior vice president|evp|executive vp)\b/.test(r)) return 88;
+  if (/\b(vp|vice president)\b/.test(r)) return 80;
+  if (/\b(senior director|sr\.? director|head of)\b/.test(r)) return 72;
+  if (/\b(director)\b/.test(r)) return 66;
+  if (/\b(principal|staff|fellow|distinguished)\b/.test(r)) return 58;
+  if (/\b(senior|sr\.?)\b/.test(r)) return 48;
+  if (/\b(manager|lead)\b/.test(r)) return 44;
+  return 36;
+}
 
 const ALL_SOURCES = [
   "linkedin_profile",
@@ -53,6 +83,28 @@ const ProspectDetail = () => {
           <div className="text-sm text-muted-foreground mt-2">
             {prospect.role} · {prospect.company} · {prospect.industry}
           </div>
+          {(prospect.linkedin_url || prospect.email) && (
+            <div className="text-sm mt-3 flex flex-wrap gap-x-4 gap-y-1 items-center">
+              {prospect.linkedin_url && (
+                <a
+                  href={prospect.linkedin_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-foreground underline underline-offset-4 hover:text-foreground/80"
+                >
+                  LinkedIn ↗
+                </a>
+              )}
+              {prospect.email && (
+                <a
+                  href={`mailto:${prospect.email}`}
+                  className="text-foreground underline underline-offset-4 hover:text-foreground/80"
+                >
+                  {prospect.email}
+                </a>
+              )}
+            </div>
+          )}
         </div>
         <Link to="/discover" className="text-xs text-mono text-muted-foreground hover:text-foreground">
           ← back
@@ -105,24 +157,7 @@ const ProspectDetail = () => {
               </div>
 
               <div className="md:col-span-7 space-y-px">
-                <div className="border border-warning/40 bg-warning/5 p-5">
-                  <div
-                    className="label-eyebrow mb-3"
-                    style={{ color: "hsl(var(--warning))" }}
-                  >
-                    Falsification notes
-                  </div>
-                  <ul className="space-y-2 text-sm">
-                    {score.falsification_notes.map((n, i) => (
-                      <li key={i} className="flex gap-3">
-                        <span className="text-mono text-xs text-muted-foreground mt-0.5">
-                          {String(i + 1).padStart(2, "0")}
-                        </span>
-                        <span>{n}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+                <WebPresence signals={signals} />
 
                 <div className="border border-border">
                   <button
@@ -189,11 +224,63 @@ const ProspectDetail = () => {
           ) : null}
 
           {!inProgress && !score && (
-            <div className="text-sm text-muted-foreground">No score yet.</div>
+            <NoScoreState
+              runStatus={run?.status ?? null}
+              errorLog={run?.error_log ?? null}
+              onRetry={() => {
+                if (id) void db.runScoring(id);
+              }}
+            />
           )}
         </>
       )}
     </PageShell>
+  );
+};
+
+const NoScoreState = ({
+  runStatus,
+  errorLog,
+  onRetry,
+}: {
+  runStatus: string | null;
+  errorLog: string | null;
+  onRetry: () => void;
+}) => {
+  const [retrying, setRetrying] = useState(false);
+  const handleRetry = () => {
+    setRetrying(true);
+    onRetry();
+    // Pause the button briefly so repeated clicks don't dogpile the edge function.
+    setTimeout(() => setRetrying(false), 2000);
+  };
+
+  const failed = runStatus === "error";
+  return (
+    <div className="border border-border p-6 max-w-2xl">
+      <div className="label-eyebrow mb-3">
+        {failed ? "Scoring failed" : "No score yet"}
+      </div>
+      <p className="text-sm text-muted-foreground leading-relaxed mb-4">
+        {failed
+          ? "The scoring agent returned an error on its last run. You can retry below."
+          : runStatus === null
+            ? "Scoring runs via the Claude agent in a Supabase Edge Function. If this page stays empty for more than ~90 seconds, the function may not be deployed or the ANTHROPIC_API_KEY env var may be missing. Retry below to kick off another run."
+            : `Run status: ${runStatus}. Waiting for the agent to write a score row.`}
+      </p>
+      {failed && errorLog && (
+        <pre className="text-mono text-[11px] p-3 border border-danger/30 bg-danger/5 text-muted-foreground mb-4 overflow-auto max-h-32">
+          {errorLog}
+        </pre>
+      )}
+      <button
+        onClick={handleRetry}
+        disabled={retrying}
+        className="border border-border px-4 py-2 text-xs uppercase tracking-[0.16em] hover:bg-secondary transition-colors disabled:opacity-40"
+      >
+        {retrying ? "Retrying…" : "Re-run scoring"}
+      </button>
+    </div>
   );
 };
 
@@ -269,60 +356,395 @@ const ProgressView = ({ run }: { run: any }) => {
   );
 };
 
-const OrgChart = ({ prospect }: { prospect: any }) => {
-  // TODO: replace mock org graph with real data from fetchOrgChart()
-  const { nodes, edges } = useMemo(() => buildMockOrg(prospect), [prospect]);
+const API_BASE: string =
+  (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/+$/, "") ||
+  "http://localhost:8000";
+
+const MIN_PEERS_FOR_CHART = 3;
+
+interface FastApiProspect {
+  _id: string;
+  name: string;
+  role: string;
+  company: string;
+  industry?: string;
+  linkedin_url?: string;
+}
+interface FastApiProspectsResp {
+  prospects: FastApiProspect[];
+}
+
+// Reject placeholder / sentinel names ("Unknown", empty, whitespace-only) so
+// they never end up as peers in the org graph.
+function isMeaningfulName(name: string | null | undefined): boolean {
+  if (!name) return false;
+  const trimmed = name.trim();
+  if (!trimmed) return false;
+  if (/^unknown$/i.test(trimmed)) return false;
+  return true;
+}
+
+function normalizeCompany(s: string | null | undefined): string {
+  return (s ?? "")
+    .toLowerCase()
+    .replace(
+      /\b(corp\.?|corporation|inc\.?|incorporated|limited|ltd\.?|llc|plc|technologies|technology|semiconductor|semiconductors|systems?)\b/g,
+      "",
+    )
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+async function fetchFastApiPeers(
+  company: string,
+  industry: string | undefined,
+  excludeId: string | undefined,
+): Promise<OrgPerson[]> {
+  const target = normalizeCompany(company);
+  if (!target) return [];
+
+  // Our FastAPI `/convex/prospects` filters by industry (ILIKE) — we fetch the
+  // industry's full list once and client-side match on company name, with
+  // normalization to handle "Intel" vs "Intel Corporation" vs "Intel Corp".
+  const industryCandidates = [industry, "semiconductor", "defense"].filter(
+    (v, i, arr): v is string => !!v && arr.indexOf(v) === i,
+  );
+  const seen = new Map<string, OrgPerson>();
+  for (const ind of industryCandidates) {
+    try {
+      const url = `${API_BASE}/convex/prospects?industry=${encodeURIComponent(
+        ind,
+      )}&limit=500`;
+      const resp = await fetch(url);
+      if (!resp.ok) continue;
+      const body = (await resp.json()) as FastApiProspectsResp;
+      for (const p of body.prospects ?? []) {
+        if (!isMeaningfulName(p.name) || !p.role || !p.company) continue;
+        if (excludeId && p._id === excludeId) continue;
+        const pNorm = normalizeCompany(p.company);
+        if (!pNorm) continue;
+        const match =
+          pNorm === target || pNorm.includes(target) || target.includes(pNorm);
+        if (!match) continue;
+        if (!seen.has(p._id)) {
+          seen.set(p._id, {
+            id: p._id,
+            name: p.name,
+            role: p.role,
+            company: p.company,
+            industry: p.industry,
+            linkedin_url: p.linkedin_url,
+            source: "fastapi",
+          });
+        }
+      }
+      if (seen.size >= 10) break;
+    } catch (err) {
+      console.error("[OrgChart] FastAPI fetch failed:", err);
+    }
+  }
+  return Array.from(seen.values());
+}
+
+function useOrgPeers(
+  company: string | undefined,
+  industry: string | undefined,
+  excludeId: string | undefined,
+): {
+  peers: OrgPerson[];
+  loading: boolean;
+  source: "supabase" | "fastapi" | "mixed" | null;
+} {
+  const [peers, setPeers] = useState<OrgPerson[]>([]);
+  const [source, setSource] = useState<"supabase" | "fastapi" | "mixed" | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!company) {
+      setLoading(false);
+      setPeers([]);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+
+    const run = async () => {
+      // 1. Supabase first — cheap, already-ETL'd prospects at that company.
+      let supaPeers: OrgPerson[] = [];
+      if (supabase) {
+        const { data, error } = await supabase
+          .from("prospects")
+          .select("id,name,role,company")
+          .ilike("company", company)
+          .neq("id", excludeId ?? "")
+          .limit(40);
+        if (error) {
+          console.error("[OrgChart] supabase peer fetch failed:", error);
+        } else {
+          supaPeers = (data ?? [])
+            .filter(
+              (row): row is OrgPerson => isMeaningfulName(row.name) && !!row.role,
+            )
+            .map((row) => ({
+              id: row.id,
+              name: row.name,
+              role: row.role,
+              company: row.company,
+              source: "supabase" as const,
+            }));
+        }
+      }
+      if (cancelled) return;
+
+      // 2. If Supabase is sparse, augment from FastAPI (covers all 2059
+      //    lead_scoring.people rows including un-ETL'd Intel/Lockheed/etc.).
+      let merged = supaPeers;
+      let src: "supabase" | "fastapi" | "mixed" = "supabase";
+      if (supaPeers.length < MIN_PEERS_FOR_CHART) {
+        const fastApiPeers = await fetchFastApiPeers(company, industry, excludeId);
+        if (cancelled) return;
+
+        const keyOf = (p: OrgPerson) =>
+          `${p.name.toLowerCase().trim()}|${normalizeCompany(p.company)}`;
+        const seen = new Set(supaPeers.map(keyOf));
+        const extras = fastApiPeers.filter((p) => !seen.has(keyOf(p)));
+        merged = [...supaPeers, ...extras];
+        src = supaPeers.length > 0 ? "mixed" : "fastapi";
+      }
+
+      if (cancelled) return;
+      setPeers(merged);
+      setSource(merged.length > 0 ? src : null);
+      setLoading(false);
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [company, industry, excludeId]);
+
+  return { peers, loading, source };
+}
+
+const OrgChart = ({ prospect }: { prospect: OrgPerson & { industry?: string } }) => {
+  const navigate = useNavigate();
+  const { peers, loading, source } = useOrgPeers(
+    prospect.company,
+    prospect.industry,
+    prospect.id,
+  );
+  const { nodes, edges } = useMemo(
+    () => buildOrgFromData(prospect, peers),
+    [prospect, peers],
+  );
+
+  // Click a peer node → navigate to their /prospect/:id page. Supabase-sourced
+  // peers route directly by id. FastAPI-sourced peers don't exist in
+  // `public.prospects` yet; we upsert them first (so `/prospect/:id` resolves)
+  // and kick off scoring, then route.
+  const [importing, setImporting] = useState<string | null>(null);
+  const onNodeClick = async (_e: React.MouseEvent, node: Node) => {
+    const data = node.data as { person?: OrgPerson; clickable?: boolean };
+    const person = data.person;
+    if (!data.clickable || !person) return;
+    if (person.source === "supabase") {
+      navigate(`/prospect/${person.id}`);
+      return;
+    }
+    // FastAPI peer — import into Supabase, then navigate.
+    if (importing) return;
+    setImporting(person.id);
+    try {
+      const newId = await db.createProspect({
+        name: person.name,
+        company: person.company ?? "",
+        role: person.role,
+        industry: person.industry ?? prospect.industry ?? "Semiconductors",
+        linkedin_url: person.linkedin_url,
+      });
+      void db.runScoring(newId);
+      navigate(`/prospect/${newId}`);
+    } catch (err) {
+      console.error("[OrgChart] failed to import fastapi peer:", err);
+      setImporting(null);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="border border-border h-[520px] flex items-center justify-center text-sm text-muted-foreground">
+        Loading org context…
+      </div>
+    );
+  }
+  if (peers.length === 0) {
+    return (
+      <div className="border border-border h-[520px] flex items-center justify-center text-sm text-muted-foreground text-center px-8">
+        No co-workers found at {prospect.company || "this company"} yet. Run the
+        LinkedIn employee scrape for this company to populate the org graph.
+      </div>
+    );
+  }
   return (
-    <div className="border border-border" style={{ height: 520 }}>
-      <ReactFlow nodes={nodes} edges={edges} fitView proOptions={{ hideAttribution: true }}>
+    <div className="border border-border relative" style={{ height: 520 }}>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        fitView
+        proOptions={{ hideAttribution: true }}
+        onNodeClick={onNodeClick}
+        nodesDraggable={false}
+        nodesConnectable={false}
+      >
         <Background color="hsl(var(--border))" gap={24} />
         <Controls className="!bg-secondary !border-border" />
       </ReactFlow>
+      {source && source !== "supabase" && (
+        <div className="absolute top-2 right-2 text-[10px] uppercase tracking-[0.16em] text-muted-foreground/60 bg-background/80 border border-border px-2 py-1">
+          source: {source}
+        </div>
+      )}
+      {importing && (
+        <div className="absolute bottom-2 left-2 text-[10px] uppercase tracking-[0.16em] text-muted-foreground bg-background/90 border border-border px-2 py-1">
+          importing peer + triggering score…
+        </div>
+      )}
+      <div className="absolute bottom-2 right-2 text-[10px] text-muted-foreground/60 bg-background/80 border border-border px-2 py-1">
+        click a peer to open their profile
+      </div>
     </div>
   );
 };
 
-function buildMockOrg(p: any): { nodes: Node[]; edges: Edge[] } {
-  const center: Node = {
+function buildOrgFromData(
+  prospect: OrgPerson,
+  peers: OrgPerson[],
+): { nodes: Node[]; edges: Edge[] } {
+  const selfRank = seniorityRank(prospect.role);
+  const ranked = peers
+    .map((p) => ({ person: p, rank: seniorityRank(p.role) }))
+    // Bias toward title diversity: stable-sort by |rank - selfRank| ASC so
+    // nearest-seniority peers come first, then managers/reports.
+    .sort((a, b) => Math.abs(a.rank - selfRank) - Math.abs(b.rank - selfRank));
+
+  const managers = ranked.filter((r) => r.rank > selfRank + 8);
+  const reportsPool = ranked.filter((r) => r.rank < selfRank - 8);
+  const peerPool = ranked.filter((r) => Math.abs(r.rank - selfRank) <= 8);
+
+  // Pick up to 1 manager (highest-ranked), up to 4 peers, up to 3 reports.
+  const manager = managers.sort((a, b) => b.rank - a.rank)[0] ?? null;
+  const chosenPeers = peerPool.slice(0, 4);
+  const chosenReports = reportsPool.sort((a, b) => b.rank - a.rank).slice(0, 3);
+
+  const nodes: Node[] = [];
+  const edges: Edge[] = [];
+
+  // Center (the target prospect) — not clickable; user is already on this page.
+  nodes.push({
     id: "center",
     position: { x: 0, y: 0 },
-    data: { label: `${p.name} · ${p.role}` },
-    style: nodeStyle(true),
-  };
-  const peers = [
-    "VP Engineering",
-    "Director Ops",
-    "Principal Architect",
-    "Sr Manager R&D",
-    "Head of Strategy",
-    "VP Finance",
-    "EVP Product",
-  ].map((title, i, arr) => {
-    const a = (i / arr.length) * Math.PI * 2;
-    return {
-      id: `p${i}`,
-      position: { x: Math.cos(a) * 240, y: Math.sin(a) * 180 },
-      data: { label: `${["A. Tan","M. Ortiz","K. Singh","D. Park","J. Liu","R. Schmidt","Y. Brown"][i]} · ${title}` },
-      style: nodeStyle(false),
-    } as Node;
+    data: { label: orgLabel(prospect.name, prospect.role), clickable: false },
+    style: nodeStyle("center"),
   });
-  const edges: Edge[] = peers.map((n) => ({
-    id: `e-${n.id}`,
-    source: "center",
-    target: n.id,
-    style: { stroke: "hsl(var(--border))" },
-  }));
-  return { nodes: [center, ...peers], edges };
+
+  // Manager above — typically a VP/C-level at the same company.
+  if (manager) {
+    nodes.push({
+      id: `m-${manager.person.id}`,
+      position: { x: 0, y: -170 },
+      data: {
+        label: orgLabel(manager.person.name, manager.person.role),
+        person: manager.person,
+        clickable: true,
+      },
+      style: nodeStyle("manager"),
+    });
+    edges.push({
+      id: `em-${manager.person.id}`,
+      source: `m-${manager.person.id}`,
+      target: "center",
+      style: { stroke: "hsl(var(--border))" },
+    });
+  }
+
+  // Peers to the sides (split left/right).
+  const peerSpread = 280;
+  chosenPeers.forEach((pr, i) => {
+    const half = Math.ceil(chosenPeers.length / 2);
+    const side = i < half ? -1 : 1;
+    const indexInSide = i < half ? i : i - half;
+    const countInSide = i < half ? half : chosenPeers.length - half;
+    const yOffset =
+      countInSide === 1 ? 0 : (indexInSide - (countInSide - 1) / 2) * 90;
+    nodes.push({
+      id: `p-${pr.person.id}`,
+      position: { x: side * peerSpread, y: yOffset },
+      data: {
+        label: orgLabel(pr.person.name, pr.person.role),
+        person: pr.person,
+        clickable: true,
+      },
+      style: nodeStyle("peer"),
+    });
+    edges.push({
+      id: `ep-${pr.person.id}`,
+      source: "center",
+      target: `p-${pr.person.id}`,
+      style: { stroke: "hsl(var(--border))", strokeDasharray: "4 4" },
+    });
+  });
+
+  // Reports below.
+  const reportSpread = 180;
+  chosenReports.forEach((rp, i) => {
+    const mid = (chosenReports.length - 1) / 2;
+    nodes.push({
+      id: `r-${rp.person.id}`,
+      position: { x: (i - mid) * reportSpread, y: 170 },
+      data: {
+        label: orgLabel(rp.person.name, rp.person.role),
+        person: rp.person,
+        clickable: true,
+      },
+      style: nodeStyle("report"),
+    });
+    edges.push({
+      id: `er-${rp.person.id}`,
+      source: "center",
+      target: `r-${rp.person.id}`,
+      style: { stroke: "hsl(var(--border))" },
+    });
+  });
+
+  return { nodes, edges };
 }
 
-const nodeStyle = (center: boolean): React.CSSProperties => ({
-  background: center ? "hsl(var(--foreground))" : "hsl(var(--card))",
-  color: center ? "hsl(var(--background))" : "hsl(var(--foreground))",
-  border: "1px solid hsl(var(--border))",
-  borderRadius: 2,
-  fontSize: 11,
-  padding: 8,
-  fontFamily: "Inter",
-});
+function orgLabel(name: string, role: string): string {
+  // Truncate long roles so nodes stay readable.
+  const trimmedRole = role.length > 48 ? role.slice(0, 45) + "…" : role;
+  return `${name}\n${trimmedRole}`;
+}
+
+type NodeKind = "center" | "manager" | "peer" | "report";
+const nodeStyle = (kind: NodeKind): React.CSSProperties => {
+  const isCenter = kind === "center";
+  return {
+    background: isCenter ? "hsl(var(--foreground))" : "hsl(var(--card))",
+    color: isCenter ? "hsl(var(--background))" : "hsl(var(--foreground))",
+    border: `1px solid ${
+      kind === "manager" ? "hsl(var(--accent))" : "hsl(var(--border))"
+    }`,
+    borderRadius: 2,
+    fontSize: 11,
+    padding: 10,
+    fontFamily: "Inter",
+    whiteSpace: "pre-line",
+    textAlign: "center",
+    minWidth: 140,
+    maxWidth: 220,
+    cursor: isCenter ? "default" : "pointer",
+  };
+};
 
 export default ProspectDetail;

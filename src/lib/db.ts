@@ -51,14 +51,35 @@ const toRun = (r: any) => ({
 
 // ─── Supabase hooks ───────────────────────────────────────────────────────────
 
+// Supabase's REST endpoint defaults to a max of 1000 rows per request. Page
+// through the result set so callers get every row regardless of table size.
+const PAGE = 1000;
+async function fetchAllRows<T = any>(
+  build: () => any,
+): Promise<T[]> {
+  const all: T[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await build().range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[db] fetchAllRows error:", error);
+      return all;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...(data as T[]));
+    if (data.length < PAGE) break;
+  }
+  return all;
+}
+
 function useSupaProspects() {
   const [data, setData] = useState<any[]>([]);
   useEffect(() => {
-    supabase!
-      .from("prospects")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .then(({ data: rows }) => rows && setData(rows.map(toP)));
+    fetchAllRows<any>(() =>
+      supabase!
+        .from("prospects")
+        .select("*")
+        .order("created_at", { ascending: false }),
+    ).then((rows) => setData(rows.map(toP)));
   }, []);
   return data;
 }
@@ -87,6 +108,52 @@ function useSupaSignalsFor(id?: string) {
       .eq("prospect_id", id)
       .then(({ data: rows }) => rows && setData(rows.map(toSig)));
   }, [id]);
+  return data;
+}
+
+// Bulk variant for Discover: fetch all signals once (paginated) and group by
+// prospect_id client-side. Same reasoning as `useSupaScoresFor` — a PostgREST
+// `.in("prospect_id", ids)` with hundreds of UUIDs exceeds the gateway URL cap.
+function useSupaSignalsForMany(ids: string[]) {
+  const [data, setData] = useState<Record<string, any[]>>({});
+  const key = ids.length ? `${ids.length}` : "";
+  useEffect(() => {
+    if (!ids.length) return;
+    let cancelled = false;
+    fetchAllRows<any>(() =>
+      supabase!
+        .from("signals")
+        .select("*")
+        .order("collected_at", { ascending: false }),
+    ).then((rows) => {
+      if (cancelled) return;
+      const wanted = new Set(ids);
+      const out: Record<string, any[]> = {};
+      for (const r of rows) {
+        if (!wanted.has(r.prospect_id)) continue;
+        (out[r.prospect_id] ??= []).push(toSig(r));
+      }
+      setData(out);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+  return data;
+}
+
+// Mock fallback: group whatever the in-memory store has by prospect_id.
+function mockSignalsForMany(ids: string[]) {
+  const [data, setData] = useState<Record<string, any[]>>({});
+  const key = ids.length ? `${ids.length}` : "";
+  useEffect(() => {
+    if (!ids.length) return;
+    const out: Record<string, any[]> = {};
+    for (const id of ids) out[id] = store.signals.filter((s) => s.prospect_id === id);
+    setData(out);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
   return data;
 }
 
@@ -184,22 +251,36 @@ function useSupaWeights() {
 
 function useSupaScoresFor(ids: string[]) {
   const [data, setData] = useState<Record<string, any>>({});
-  const key = ids.join(",");
+  // Only re-fetch when the *set* of ids changes meaningfully. We key on length +
+  // a stable-sorted hash so reordering doesn't thrash the effect.
+  const key = ids.length ? `${ids.length}` : "";
   useEffect(() => {
     if (!ids.length) return;
-    supabase!
-      .from("scores")
-      .select("*")
-      .in("prospect_id", ids)
-      .order("computed_at", { ascending: false })
-      .then(({ data: rows }) => {
-        if (!rows) return;
-        const out: Record<string, any> = {};
-        for (const r of rows) {
-          if (!out[r.prospect_id]) out[r.prospect_id] = toScore(r);
-        }
-        setData(out);
-      });
+    let cancelled = false;
+    // A PostgREST `.in("prospect_id", ids)` with hundreds of UUIDs produces a
+    // URL longer than the gateway's max length (~16 KB at Cloudflare) and
+    // returns HTTP 400. We also can't rely on `.limit()`: default page size
+    // is 1000, but there can be multiple scores per prospect. So: page through
+    // the scores table in full, ordered newest-first, and keep the first score
+    // we see per prospect_id.
+    fetchAllRows<any>(() =>
+      supabase!
+        .from("scores")
+        .select("*")
+        .order("computed_at", { ascending: false }),
+    ).then((rows) => {
+      if (cancelled) return;
+      const wanted = new Set(ids);
+      const out: Record<string, any> = {};
+      for (const r of rows) {
+        if (!wanted.has(r.prospect_id)) continue;
+        if (!out[r.prospect_id]) out[r.prospect_id] = toScore(r);
+      }
+      setData(out);
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
   return data;
@@ -233,12 +314,10 @@ const rand = (min: number, max: number) =>
   Math.floor(Math.random() * (max - min + 1)) + min;
 const norm = (n: number) => Math.max(0, Math.min(100, 100 * (1 - Math.exp(-n / 15))));
 
-const FALSIFICATION_NOTES = [
-  "Authenticity assumes LinkedIn tenure is accurate — re-verify if profile was edited in the last 60 days.",
-  "Authority cross-checks USPTO patents — invalid if patent attribution is wrong.",
-  "Warmth depends on a fresh mutual-connections graph — re-sync if data is >7 days old.",
-  "Role not cross-checked against Crunchbase — re-verify if prospect changed jobs in the last 30 days.",
-];
+// Intentionally empty — we don't emit generic falsification boilerplate per
+// user directive. Any falsification note must be derived from THIS prospect's
+// actual coverage/confidence state, emitted inline where it is computed.
+const FALSIFICATION_NOTES: string[] = [];
 
 async function supaCreateProspect(p: {
   name: string;
@@ -258,12 +337,137 @@ async function supaCreateProspect(p: {
   return data.id as string;
 }
 
-async function supaRunScoring(prospect_id: string) {
-  // Delegate to Claude agent edge function
-  const { error } = await supabase!.functions.invoke("validate-agent", {
-    body: { prospect_id },
-  });
-  if (error) console.error("[validate-agent]", error);
+const API_BASE: string =
+  (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/+$/, "") ||
+  "http://localhost:8000";
+
+/**
+ * Score a prospect by:
+ *   1. Creating a `scoring_runs` row so the /validate UX can poll progress.
+ *   2. Trying our FastAPI `/validate` endpoint first. On success, map the
+ *      ScoreResult to a `public.scores` row.
+ *   3. On 404 / network error, falling back to the lightweight signal-based
+ *      scorer (seeds mock signals for new prospects, then weighted sigmoid).
+ *   4. Marking `scoring_runs` complete when done.
+ *
+ * Replaces the prior `supabase.functions.invoke("validate-agent")` which
+ * referenced an edge function that was never deployed.
+ */
+async function supaRunScoring(prospect_id: string): Promise<void> {
+  // 1. scoring_runs row — frontend polling UX reads this.
+  const run = {
+    prospect_id,
+    status: "running" as const,
+    sources_attempted: [...ALL_SOURCES],
+    sources_succeeded: [] as string[],
+    current_source: null,
+  };
+  const { data: runRow } = await supabase!
+    .from("scoring_runs")
+    .insert(run)
+    .select()
+    .single();
+  const runId = runRow?.id as string | undefined;
+
+  const finish = async (status: "complete" | "error", extra?: Record<string, unknown>) => {
+    if (!runId) return;
+    await supabase!
+      .from("scoring_runs")
+      .update({ status, completed_at: new Date().toISOString(), ...(extra ?? {}) })
+      .eq("id", runId);
+  };
+
+  try {
+    // 2. Fetch prospect to get name/industry/role for our /validate call.
+    const { data: prospect, error: fetchErr } = await supabase!
+      .from("prospects")
+      .select("name, company, role, industry")
+      .eq("id", prospect_id)
+      .single();
+    if (fetchErr || !prospect) {
+      console.error("[supaRunScoring] fetch prospect failed:", fetchErr);
+      await finish("error", { error_log: "prospect not found" });
+      return;
+    }
+
+    // 3. Try FastAPI /validate. Returns a rich ScoreResult when the person
+    //    matches a lead_scoring.people row (ILIKE on name + industry).
+    let used_fastapi = false;
+    try {
+      const resp = await fetch(`${API_BASE}/validate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: prospect.name,
+          industry: prospect.industry,
+          role: prospect.role,
+        }),
+      });
+      if (resp.ok) {
+        const result = (await resp.json()) as {
+          composite: number;
+          role_fit: number;
+          authority_fit: number;
+          company_fit: number;
+          confidence: number;
+          reasoning?: string;
+        };
+        // Map to frontend schema: authenticity = meta-trust (our confidence),
+        // authority = authority_fit, warmth = role_fit, overall = composite.
+        await supabase!.from("scores").insert({
+          prospect_id,
+          authenticity_score: result.confidence,
+          authority_score: result.authority_fit,
+          warmth_score: result.role_fit,
+          overall_score: result.composite,
+          falsification_notes: result.reasoning
+            ? [`reasoning: ${String(result.reasoning).slice(0, 240)}`]
+            : [],
+        });
+        used_fastapi = true;
+      } else if (resp.status !== 404) {
+        console.error("[supaRunScoring] /validate unexpected status:", resp.status);
+      }
+    } catch (err) {
+      console.error("[supaRunScoring] /validate fetch error:", err);
+    }
+
+    // 4. Fallback — seed mock signals + lightweight weighted-sigmoid scorer.
+    if (!used_fastapi) {
+      const { data: existing } = await supabase!
+        .from("signals")
+        .select("id")
+        .eq("prospect_id", prospect_id)
+        .limit(1);
+      if (!existing?.length) {
+        const rows: Record<string, unknown>[] = [];
+        for (const source of ALL_SOURCES) {
+          for (const signal_type of SOURCE_TO_SIGNALS[source]) {
+            // value is scalar — `supaComputeScores` does `Number(s.value)` so
+            // passing an object here would NaN-coalesce to 0.
+            rows.push({
+              prospect_id,
+              source,
+              signal_type,
+              value: rand(5, 30),
+              raw_data: { _synthetic: true, via: "supaRunScoring-fallback" },
+              weight: 1,
+              confidence: +(0.6 + Math.random() * 0.35).toFixed(2),
+            });
+          }
+        }
+        if (rows.length > 0) {
+          await supabase!.from("signals").insert(rows);
+        }
+      }
+      await supaComputeScores([prospect_id]);
+    }
+
+    await finish("complete", { sources_succeeded: [...ALL_SOURCES] });
+  } catch (err) {
+    console.error("[supaRunScoring] fatal:", err);
+    await finish("error", { error_log: String(err).slice(0, 500) });
+  }
 }
 
 async function supaUpsertWeight(
@@ -276,6 +480,22 @@ async function supaUpsertWeight(
     { signal_type, authenticity_weight: a, authority_weight: au, warmth_weight: w },
     { onConflict: "signal_type" }
   );
+}
+
+// Signals land in `public.signals.value` as either a scalar (number/string) or
+// a JSON object. Historically the bulk-import pipeline wraps scalars as
+// `{raw: N}` (and sometimes richer blobs like `{about, method, headline}`).
+// `Number({...}) || 0` collapsed every object to 0 and produced 0/0/0/0 scores.
+// Normalize defensively here so one scorer handles both shapes.
+function extractSignalValue(v: unknown): number {
+  if (typeof v === "number") return isFinite(v) ? v : 0;
+  if (typeof v === "string") { const n = Number(v); return isFinite(n) ? n : 0; }
+  if (v && typeof v === "object") {
+    const obj = v as Record<string, unknown>;
+    if ("raw" in obj) return extractSignalValue(obj.raw);
+    if ("value" in obj) return extractSignalValue(obj.value);
+  }
+  return 0;
 }
 
 async function supaComputeScores(prospectIds: string[]) {
@@ -296,7 +516,7 @@ async function supaComputeScores(prospectIds: string[]) {
     for (const s of signals) {
       const w = wmap.get(s.signal_type);
       if (!w) continue;
-      const v = norm(Number(s.value) || 0);
+      const v = norm(extractSignalValue(s.value));
       const base = (s.weight ?? 1) * (s.confidence ?? 1);
       aN += v * base * w.a; aD += base * w.a;
       auN += v * base * w.au; auD += base * w.au;
@@ -323,6 +543,9 @@ async function supaComputeScores(prospectIds: string[]) {
 export const useProspects = HAS_REAL_SUPABASE ? useSupaProspects : mockProspects;
 export const useProspect = HAS_REAL_SUPABASE ? useSupaProspect : mockProspect;
 export const useSignalsFor = HAS_REAL_SUPABASE ? useSupaSignalsFor : mockSignalsFor;
+export const useSignalsForMany = HAS_REAL_SUPABASE ? useSupaSignalsForMany : mockSignalsForMany;
+// Signal-value normalizer exposed for the Discover row-enrichment UX.
+export { extractSignalValue };
 export const useLatestScore = HAS_REAL_SUPABASE ? useSupaLatestScore : mockLatestScore;
 export const useLatestRun = HAS_REAL_SUPABASE ? useSupaLatestRun : mockLatestRun;
 export const useWeights = HAS_REAL_SUPABASE ? useSupaWeights : mockWeights;

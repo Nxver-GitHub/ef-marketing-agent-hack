@@ -2,6 +2,7 @@ import { useState, useRef, KeyboardEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { PageShell } from "@/components/PageShell";
 import { db } from "@/lib/db";
+import { supabase, HAS_REAL_SUPABASE } from "@/lib/supabase";
 
 const INDUSTRIES = ["Semiconductors", "Defense", "Pharma", "Quantum", "Aerospace"];
 
@@ -62,10 +63,35 @@ const Validate = () => {
       : keywords;
     if (finalRoles.length === 0) return;
     setSubmitting(true);
+    const trimmedName = name.trim();
+    const companyTrim = company.trim();
+    const targetRole = finalRoles[0];
+
+    // Flow 1 intent: "you know the company + role, we find the person."
+    // Before creating a stub prospect, search existing `public.prospects`
+    // (895 pre-scored rows) for a best match. Only create a new row if no
+    // existing match — otherwise we'd show the user a Prospect Detail page
+    // with no real name + no LinkedIn URL.
+    const matched = HAS_REAL_SUPABASE
+      ? await lookupExistingProspect({
+          name: trimmedName,
+          company: companyTrim,
+          role: targetRole,
+          industry,
+        })
+      : null;
+    if (matched) {
+      navigate(`/prospect/${matched}`);
+      return;
+    }
+
+    // No match. Fall back to creating a new row — runScoring will try our
+    // FastAPI /validate first, then the lightweight signal-based scorer.
+    const synthesizedName = trimmedName || `${targetRole} at ${companyTrim}`;
     const id = await db.createProspect({
-      name: name.trim() || "Unknown",
-      company,
-      role: finalRoles[0],
+      name: synthesizedName,
+      company: companyTrim,
+      role: targetRole,
       roles: finalRoles,
       keywords: finalKeywords,
       industry,
@@ -73,6 +99,61 @@ const Validate = () => {
     void db.runScoring(id);
     navigate(`/prospect/${id}`);
   };
+
+  // Search `public.prospects` for the best match on (company, role, industry).
+  // Ranking heuristic:
+  //   +4 if name matches (only when user provided a name)
+  //   +3 if role token overlaps prospect.role (case-insensitive)
+  //   +2 if company matches ILIKE
+  //   +1 if industry matches ILIKE
+  // Returns the prospect id of the highest-scoring row, or null when nothing
+  // clears a minimum score threshold (2).
+  async function lookupExistingProspect(q: {
+    name: string;
+    company: string;
+    role: string;
+    industry: string;
+  }): Promise<string | null> {
+    if (!supabase) return null;
+    // Pull candidates constrained by company (fuzzy) AND industry (fuzzy).
+    // This keeps the result set small without requiring exact matches.
+    const { data: rows, error } = await supabase
+      .from("prospects")
+      .select("id, name, company, role, industry, linkedin_url")
+      .ilike("company", `%${q.company}%`)
+      .ilike("industry", `%${q.industry}%`)
+      .limit(50);
+    if (error || !rows || rows.length === 0) return null;
+
+    const roleTokens = new Set(q.role.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+    const nameLower = q.name.toLowerCase();
+    type Cand = {
+      id: string;
+      name: string;
+      company: string;
+      role: string;
+      industry: string;
+      linkedin_url: string | null;
+    };
+    const scored: Array<{ cand: Cand; score: number }> = [];
+    for (const r of rows as Cand[]) {
+      let s = 0;
+      if (q.name && r.name && r.name.toLowerCase().includes(nameLower)) s += 4;
+      const rRoleTokens = new Set(
+        (r.role ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean),
+      );
+      let overlap = 0;
+      for (const t of roleTokens) if (rRoleTokens.has(t)) overlap += 1;
+      if (overlap > 0) s += 3 * (overlap / Math.max(1, roleTokens.size));
+      if ((r.company ?? "").toLowerCase().includes(q.company.toLowerCase())) s += 2;
+      if ((r.industry ?? "").toLowerCase().includes(q.industry.toLowerCase())) s += 1;
+      scored.push({ cand: r, score: s });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored[0];
+    if (!top || top.score < 2) return null;
+    return top.cand.id;
+  }
 
   return (
     <PageShell>
