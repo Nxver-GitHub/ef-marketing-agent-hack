@@ -8,7 +8,7 @@ import {
   useLatestRun,
 } from "@/lib/mockStore";
 import { BigScore, ScoreBar, scoreColor } from "@/components/ScoreBar";
-import { ENABLE_ORG_CHART } from "@/lib/convex";
+import { ENABLE_ORG_CHART } from "@/lib/supabase";
 import ReactFlow, { Background, Controls, type Node, type Edge } from "reactflow";
 import "reactflow/dist/style.css";
 
