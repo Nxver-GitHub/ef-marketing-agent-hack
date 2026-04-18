@@ -1,10 +1,20 @@
 import { Link } from "react-router-dom";
 import { PageShell } from "@/components/PageShell";
 import { HeroMark } from "@/components/HeroMark";
+import { useProspects, useScoresFor } from "@/lib/db";
+import { useMemo } from "react";
+import { scoreColor } from "@/components/ScoreBar";
 
 const Index = () => {
+  const prospects = useProspects();
+  const scores = useScoresFor(prospects.map((p) => p._id));
+  const scored = useMemo(() => prospects.filter((p) => scores[p._id]), [prospects, scores]);
+  const avgScore = scored.length
+    ? scored.reduce((s, p) => s + (scores[p._id]?.overall_score ?? 0), 0) / scored.length
+    : null;
+
   return (
-    <PageShell rightSlot={<div>v0.1 — hackathon build</div>}>
+    <PageShell rightSlot={<div className="text-mono text-[10px] text-muted-foreground">v0.1 — hackathon build</div>}>
       <div className="grid md:grid-cols-12 gap-10 min-h-[70vh]">
         <div className="md:col-span-7 flex flex-col justify-between">
           <HeroMark className="w-full max-w-[640px]" />
@@ -27,13 +37,13 @@ const Index = () => {
             to="/validate"
             className="group block border border-border p-8 hover:bg-secondary transition-colors"
           >
-            <div className="label-eyebrow mb-6">Flow 01</div>
+            <div className="label-eyebrow mb-6">Validate</div>
             <div className="text-2xl md:text-3xl font-light tracking-tight mb-2">
-              Validate a person.
+              Score a prospect.
             </div>
             <div className="text-sm text-muted-foreground mb-10">
-              Enter a name, company, role and industry. Get a transparent trust-and-fit score with
-              every contributing signal exposed.
+              Enter a name, company, role, and industry. Get a transparent trust-and-fit score with
+              every contributing signal exposed and falsifiable.
             </div>
             <div className="flex items-center justify-between text-xs text-mono">
               <span className="text-muted-foreground">→ /validate</span>
@@ -45,16 +55,43 @@ const Index = () => {
             to="/discover"
             className="group block border border-border border-t-0 p-8 hover:bg-secondary transition-colors"
           >
-            <div className="label-eyebrow mb-6">Flow 02</div>
+            <div className="label-eyebrow mb-6">Pipeline</div>
             <div className="text-2xl md:text-3xl font-light tracking-tight mb-2">
-              Find ICP matches.
+              Browse scored prospects.
+            </div>
+            <div className="text-sm text-muted-foreground mb-6">
+              Filter, rank, and compare every prospect that has run through the scoring engine.
+            </div>
+            {scored.length > 0 && (
+              <div className="flex items-center gap-6 mb-6 text-xs text-mono text-muted-foreground">
+                <span>{scored.length} scored</span>
+                {avgScore !== null && (
+                  <span style={{ color: scoreColor(avgScore) }}>
+                    avg {avgScore.toFixed(1)}
+                  </span>
+                )}
+              </div>
+            )}
+            <div className="flex items-center justify-between text-xs text-mono">
+              <span className="text-muted-foreground">→ /pipeline</span>
+              <span className="opacity-0 group-hover:opacity-100 transition-opacity">↗</span>
+            </div>
+          </Link>
+
+          <Link
+            to="/settings"
+            className="group block border border-border border-t-0 p-8 hover:bg-secondary transition-colors"
+          >
+            <div className="label-eyebrow mb-6">Weights</div>
+            <div className="text-2xl md:text-3xl font-light tracking-tight mb-2">
+              Tune the scoring model.
             </div>
             <div className="text-sm text-muted-foreground mb-10">
-              Define an ideal-customer profile. Get a ranked list of prospects, each with its own
-              full breakdown.
+              Adjust how each signal contributes to Authenticity, Authority, and Warmth.
+              Changes recompute all scores immediately.
             </div>
             <div className="flex items-center justify-between text-xs text-mono">
-              <span className="text-muted-foreground">→ /discover</span>
+              <span className="text-muted-foreground">→ /settings</span>
               <span className="opacity-0 group-hover:opacity-100 transition-opacity">↗</span>
             </div>
           </Link>

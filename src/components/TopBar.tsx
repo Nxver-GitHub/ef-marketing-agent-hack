@@ -41,7 +41,7 @@ export const TopBar = () => {
         </div>
         <nav className="flex items-center gap-6 justify-end">
           <NavItem to="/validate" label="Validate" active={pathname === "/validate"} />
-          <NavItem to="/discover" label="Discover" active={pathname.startsWith("/discover")} />
+          <NavItem to="/discover" label="Pipeline" active={pathname.startsWith("/discover") || pathname.startsWith("/prospect")} />
           <NavItem to="/settings" label="Weights" active={pathname === "/settings"} />
         </nav>
       </div>

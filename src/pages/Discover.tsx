@@ -4,138 +4,199 @@ import { PageShell } from "@/components/PageShell";
 import { useProspects, useScoresFor } from "@/lib/db";
 import { scoreColor } from "@/components/ScoreBar";
 
-const ROLES = ["Engineering Lead", "Director", "VP", "Principal", "C-Suite"];
+type SortKey = "overall_score" | "authenticity_score" | "authority_score" | "warmth_score";
+
+const INDUSTRIES = ["All", "Semiconductors", "Defense", "Pharma", "Quantum", "Aerospace"];
 
 const Discover = () => {
   const navigate = useNavigate();
   const prospects = useProspects();
   const scores = useScoresFor(prospects.map((p) => p._id));
 
-  const [industry, setIndustry] = useState("Semiconductors");
-  const [company, setCompany] = useState("");
-  const [role, setRole] = useState("");
-  const [submitted, setSubmitted] = useState(true); // start with results visible
+  const [query, setQuery] = useState("");
+  const [industry, setIndustry] = useState("All");
+  const [sortKey, setSortKey] = useState<SortKey>("overall_score");
 
-  const ranked = useMemo(() => {
-    let list = prospects.filter((p) => p.industry === industry);
-    if (company) list = list.filter((p) => p.company.toLowerCase().includes(company.toLowerCase()));
-    if (role) list = list.filter((p) => p.role.toLowerCase().includes(role.toLowerCase()));
-    return list
-      .map((p) => ({ p, score: scores[p._id] }))
-      .filter((r) => r.score)
-      .sort((a, b) => (b.score?.overall_score ?? 0) - (a.score?.overall_score ?? 0));
-  }, [prospects, scores, industry, company, role]);
+  const scored = useMemo(
+    () => prospects.filter((p) => scores[p._id]),
+    [prospects, scores]
+  );
+  const avgScore = scored.length
+    ? scored.reduce((s, p) => s + (scores[p._id]?.overall_score ?? 0), 0) / scored.length
+    : 0;
+  const topScore = scored.length
+    ? Math.max(...scored.map((p) => scores[p._id]?.overall_score ?? 0))
+    : 0;
+
+  const filtered = useMemo(() => {
+    const q = query.toLowerCase();
+    return prospects
+      .filter((p) => {
+        const matchQ =
+          !q ||
+          p.name.toLowerCase().includes(q) ||
+          p.company.toLowerCase().includes(q) ||
+          p.role.toLowerCase().includes(q);
+        const matchI = industry === "All" || p.industry === industry;
+        return matchQ && matchI && scores[p._id];
+      })
+      .map((p) => ({ p, score: scores[p._id]! }))
+      .sort((a, b) => (b.score[sortKey] ?? 0) - (a.score[sortKey] ?? 0));
+  }, [prospects, scores, query, industry, sortKey]);
+
+  const col = (key: SortKey, label: string, span = 1) => (
+    <button
+      onClick={() => setSortKey(key)}
+      className={`col-span-${span} text-right text-[10px] uppercase tracking-[0.16em] transition-colors ${
+        sortKey === key ? "text-foreground" : "text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      {label}
+      {sortKey === key && <span className="ml-1 text-mono">↓</span>}
+    </button>
+  );
 
   return (
     <PageShell>
-      <div className="grid md:grid-cols-12 gap-10">
-        <div className="md:col-span-4">
-          <div className="label-eyebrow mb-3">Flow 02</div>
-          <h1 className="text-4xl md:text-5xl font-light tracking-tight leading-[1.05] mb-6">
-            Find ICP matches.
-          </h1>
-          <p className="text-sm text-muted-foreground mb-8">
-            Define an ideal-customer profile. Get a ranked list of prospects, scored on the same
-            transparent rubric as Flow 01.
-          </p>
+      {/* Stats */}
+      <div className="grid grid-cols-3 gap-px border border-border mb-8">
+        <Stat label="Total prospects" value={String(prospects.length)} />
+        <Stat
+          label="Avg score"
+          value={scored.length ? avgScore.toFixed(1) : "—"}
+          color={scored.length ? scoreColor(avgScore) : undefined}
+        />
+        <Stat
+          label="Top score"
+          value={scored.length ? String(Math.round(topScore)) : "—"}
+          color={scored.length ? scoreColor(topScore) : undefined}
+        />
+      </div>
 
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              setSubmitted(true);
-            }}
-            className="space-y-px"
-          >
-            <Field label="Industry" value={industry} onChange={setIndustry} />
-            <Field label="Company (optional)" value={company} onChange={setCompany} placeholder="any" />
-            <Field label="Target role" value={role} onChange={setRole} placeholder="VP, Director…" />
-            <button className="w-full text-left border border-border p-4 hover:bg-secondary transition-colors text-sm">
-              Run match →
+      {/* Search + industry filter */}
+      <div className="flex flex-col md:flex-row gap-px mb-px">
+        <label className="border border-border flex-1 flex items-center px-4 gap-3 py-2">
+          <span className="text-muted-foreground text-[10px] uppercase tracking-[0.16em]">
+            Search
+          </span>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Name, company, or role…"
+            className="flex-1 bg-transparent outline-none text-sm placeholder:text-muted-foreground/40"
+          />
+          {query && (
+            <button
+              onClick={() => setQuery("")}
+              className="text-muted-foreground hover:text-foreground text-xs"
+            >
+              ×
             </button>
-            <div className="pt-2 text-[11px] text-muted-foreground">
-              + Add filter (TODO: extra criteria)
-            </div>
-          </form>
-        </div>
-
-        <div className="md:col-span-8">
-          <div className="flex items-baseline justify-between mb-4">
-            <div className="label-eyebrow">Results</div>
-            <div className="text-mono text-xs text-muted-foreground">
-              {ranked.length} matches
-            </div>
-          </div>
-          <div className="border border-border">
-            <div className="grid grid-cols-12 px-4 py-3 text-[10px] uppercase tracking-[0.16em] text-muted-foreground border-b border-border">
-              <div className="col-span-1">#</div>
-              <div className="col-span-4">Name / Company</div>
-              <div className="col-span-3">Role</div>
-              <div className="col-span-1 text-right">Auth</div>
-              <div className="col-span-1 text-right">Athy</div>
-              <div className="col-span-1 text-right">Wrm</div>
-              <div className="col-span-1 text-right">Score</div>
-            </div>
-            {submitted && ranked.length === 0 && (
-              <div className="p-6 text-sm text-muted-foreground">No matches.</div>
-            )}
-            {ranked.map(({ p, score }, i) => (
-              <button
-                key={p._id}
-                onClick={() => navigate(`/prospect/${p._id}`)}
-                className="w-full grid grid-cols-12 items-center px-4 py-4 border-b border-border/60 last:border-0 text-left hover:bg-secondary transition-colors"
-              >
-                <div className="col-span-1 text-mono text-xs text-muted-foreground">
-                  {String(i + 1).padStart(2, "0")}
-                </div>
-                <div className="col-span-4">
-                  <div className="text-sm">{p.name}</div>
-                  <div className="text-xs text-muted-foreground">{p.company}</div>
-                </div>
-                <div className="col-span-3 text-xs text-muted-foreground">{p.role}</div>
-                <Pill v={score!.authenticity_score} />
-                <Pill v={score!.authority_score} />
-                <Pill v={score!.warmth_score} />
-                <div
-                  className="col-span-1 text-right text-mono text-base"
-                  style={{ color: scoreColor(score!.overall_score) }}
-                >
-                  {Math.round(score!.overall_score)}
-                </div>
-              </button>
-            ))}
-          </div>
+          )}
+        </label>
+        <div className="border border-border md:border-l-0 flex items-center px-4 gap-1.5 flex-wrap py-2">
+          {INDUSTRIES.map((i) => (
+            <button
+              key={i}
+              onClick={() => setIndustry(i)}
+              className={`text-[10px] px-2.5 py-1 border transition-colors ${
+                industry === i
+                  ? "border-foreground bg-foreground text-background"
+                  : "border-transparent text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {i}
+            </button>
+          ))}
         </div>
       </div>
+
+      {/* Table */}
+      <div className="border border-border border-t-0">
+        <div className="grid grid-cols-12 px-4 py-3 text-[10px] uppercase tracking-[0.16em] text-muted-foreground border-b border-border items-center">
+          <div className="col-span-1">#</div>
+          <div className="col-span-3">Name / Company</div>
+          <div className="col-span-3">Role</div>
+          {col("authenticity_score", "Auth")}
+          {col("authority_score", "Athy")}
+          {col("warmth_score", "Wrm")}
+          {col("overall_score", "Score", 2)}
+        </div>
+
+        {filtered.length === 0 && (
+          <div className="px-4 py-12 text-sm text-muted-foreground">
+            {prospects.length === 0
+              ? "No prospects yet — validate one to get started."
+              : "No matches for this filter."}
+          </div>
+        )}
+
+        {filtered.map(({ p, score }, i) => (
+          <button
+            key={p._id}
+            onClick={() => navigate(`/prospect/${p._id}`)}
+            className="w-full grid grid-cols-12 items-center px-4 py-4 border-b border-border/60 last:border-0 text-left hover:bg-secondary transition-colors"
+          >
+            <div className="col-span-1 text-mono text-xs text-muted-foreground">
+              {String(i + 1).padStart(2, "0")}
+            </div>
+            <div className="col-span-3">
+              <div className="text-sm">{p.name}</div>
+              <div className="text-xs text-muted-foreground">{p.company}</div>
+            </div>
+            <div className="col-span-3 text-xs text-muted-foreground truncate pr-4">
+              {p.role}
+            </div>
+            <Pill v={score.authenticity_score} />
+            <Pill v={score.authority_score} />
+            <Pill v={score.warmth_score} />
+            <div
+              className="col-span-2 text-right text-mono text-base"
+              style={{ color: scoreColor(score.overall_score) }}
+            >
+              {Math.round(score.overall_score)}
+            </div>
+          </button>
+        ))}
+      </div>
+
+      {filtered.length > 0 && (
+        <div className="pt-3 text-[11px] text-muted-foreground text-mono">
+          {filtered.length} prospect{filtered.length !== 1 ? "s" : ""} · sorted by{" "}
+          {sortKey.replace("_score", "").replace("_", " ")}
+        </div>
+      )}
     </PageShell>
   );
 };
 
-const Pill = ({ v }: { v: number }) => (
-  <div className="col-span-1 text-right text-mono text-xs" style={{ color: scoreColor(v) }}>
-    {Math.round(v)}
-  </div>
-);
-
-const Field = ({
+const Stat = ({
   label,
   value,
-  onChange,
-  placeholder,
+  color,
 }: {
   label: string;
   value: string;
-  onChange: (v: string) => void;
-  placeholder?: string;
+  color?: string;
 }) => (
-  <label className="block border border-border p-4">
-    <div className="label-eyebrow mb-1.5">{label}</div>
-    <input
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      placeholder={placeholder}
-      className="w-full bg-transparent outline-none text-lg font-light tracking-tight placeholder:text-muted-foreground/40"
-    />
-  </label>
+  <div className="p-5">
+    <div className="label-eyebrow mb-2">{label}</div>
+    <div
+      className="text-3xl font-light tracking-tight text-mono"
+      style={color ? { color } : undefined}
+    >
+      {value}
+    </div>
+  </div>
+);
+
+const Pill = ({ v }: { v: number }) => (
+  <div
+    className="col-span-1 text-right text-mono text-xs"
+    style={{ color: scoreColor(v) }}
+  >
+    {Math.round(v)}
+  </div>
 );
 
 export default Discover;
