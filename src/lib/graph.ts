@@ -159,6 +159,37 @@ function normalizeKey(s: string): string {
 }
 
 /**
+ * Canonicalize a prospect's free-text role string into a short, dedupe-able
+ * label. Source values are messy LinkedIn titles like
+ *   "Senior Software Engineer | Design Systems | Custom Compute at Cadence Design Systems"
+ * which would each spawn their own role node and break the canvas.
+ *
+ * Rules (applied in order):
+ *  1. Drop the "at <company>" suffix — companies are already separate nodes.
+ *  2. Truncate at the first separator (`|`, en-dash, em-dash, " - ", " · ").
+ *  3. Collapse whitespace and drop trailing punctuation.
+ *  4. Hard-cap at 28 chars with a trailing ellipsis.
+ *
+ * Two prospects with the same canonical role end up sharing one role node.
+ */
+export function canonicalizeRole(raw: string): string {
+  if (!raw) return "";
+  let s = raw.trim();
+  // 1. Strip "at <company>" tail (case-insensitive).
+  s = s.replace(/\s+at\s+.+$/i, "");
+  // 2. Cut at the first separator. Tests for: |, em-dash, en-dash, " - ",
+  //    " · ", " / ". Plain hyphens inside a single word ("Co-founder") are
+  //    preserved because we only split on space-flanked variants.
+  const sepIdx = s.search(/\s+[|·/]\s+|\s+[—–-]\s+/);
+  if (sepIdx >= 0) s = s.slice(0, sepIdx);
+  // 3. Collapse whitespace + strip trailing punctuation.
+  s = s.replace(/\s+/g, " ").replace(/[,;:.]+$/, "").trim();
+  // 4. Length cap.
+  if (s.length > 28) s = s.slice(0, 27).trimEnd() + "…";
+  return s;
+}
+
+/**
  * Resolve COMPANY_META entry by normalized name. Returns null if the company
  * isn't in our metadata table — callers skip the city/industry edge for
  * unknown companies rather than fall back to Unknown placeholder hubs (those
@@ -186,10 +217,13 @@ function resolvePartnerships(rawName: string): string[] {
   return [];
 }
 
-// ─── Optional Prospect fields injected by the mock_enrichment subagent ───────
-// `past_companies`, `education`, `talks` are being added in parallel; treat
-// every entry as defensively-optional. Define a local widened type rather
-// than touching mockStore.ts.
+// ─── Optional Prospect enrichment fields ─────────────────────────────────────
+// `past_companies` / `education` / `talks` are populated by the backend ETL
+// (scripts/etl_to_public.py) into denormalized JSONB columns on
+// public.prospects per migration 20260426_prospect_enrichment.sql. Mock-mode
+// prospects also expose them. Treat every entry as defensively-optional —
+// a Supabase row whose ETL hasn't run yet will still return undefined for
+// these fields, and graph.ts must not crash on that.
 
 interface EducationEntry {
   school: string;
@@ -351,18 +385,24 @@ export function buildGraph(args: BuildGraphArgs): {
       addEdge(personId, confId, "scope_signal");
     }
 
-    // Role node — exact-match clustering on lowercased role string. Every
-    // person with the same role string ends up sharing one role node.
+    // Role node — clustered by canonicalized role string (short, dedupe-able
+    // form). "Senior Software Engineer | Design Systems at Cadence" and
+    // "Senior Software Engineer at Intel" both collapse to "Senior Software
+    // Engineer", so we end up with ~tens of role nodes instead of thousands.
     if (raw.role) {
-      const roleId = `role:${normalizeKey(raw.role)}`;
-      addNode({ id: roleId, kind: "role", name: raw.role });
-      addEdge(personId, roleId, "scope_signal");
-      // Track which industry a role's holders work in, so we can later wire
-      // role → industry edges (puts roles at the same DAG level as companies).
-      if (industryId) {
-        const set = roleIndustries.get(roleId) ?? new Set<string>();
-        set.add(industryId);
-        roleIndustries.set(roleId, set);
+      const canonical = canonicalizeRole(raw.role);
+      if (canonical) {
+        const roleId = `role:${normalizeKey(canonical)}`;
+        addNode({ id: roleId, kind: "role", name: canonical });
+        addEdge(personId, roleId, "scope_signal");
+        // Track which industry a role's holders work in, so we can later
+        // wire role → industry edges (puts roles at the same DAG level as
+        // companies).
+        if (industryId) {
+          const set = roleIndustries.get(roleId) ?? new Set<string>();
+          set.add(industryId);
+          roleIndustries.set(roleId, set);
+        }
       }
     }
   }

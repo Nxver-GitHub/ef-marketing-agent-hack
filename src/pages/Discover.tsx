@@ -232,14 +232,21 @@ const DEFAULT_EDGE_KINDS: EdgeKind[] = [
   "past_employer",
 ];
 
-// Cap how many prospects we let into the force-directed canvas. ForceGraph2D
-// stops being legible (and starts hitching) past ~500 nodes; with 10k
-// prospects the colleague edges alone would balloon past 100k. The chat
-// copilot still operates on the full set via AgentContext.nodes/edges
-// (rebuilt from the un-sliced array) so "find me X" queries don't lose
-// recall. v1 strategy: top-N by overall_score, falling back to insertion
-// order if score is missing.
-const MAX_PROSPECTS_RENDERED = 500;
+// Cap how many prospects we let into the force-directed canvas at the
+// "wide" (no focus) view. We're after an Obsidian-style web — readable at
+// first glance, with focusable clusters, not a 500-node hairball. Once the
+// user clicks a node, we drill into a focal subgraph that's bounded
+// separately by FOCAL_PEOPLE_CAP. Chat copilot operates on the full
+// 10k-prospect graph via AgentContext.
+const MAX_PROSPECTS_RENDERED = 120;
+// When drilled into a focal node, we never expand more than this many
+// person-neighbors. (e.g., clicking TSMC with 1500 employees still reads
+// as a clean cluster, top-scored.)
+const FOCAL_PEOPLE_CAP = 20;
+// Singleton root id (mirrors graph.ts). We pin this in every focal
+// subgraph so the user has a click-to-home anchor without needing a back
+// button.
+const TECH_ROOT_ID = "industry:technology";
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
@@ -315,13 +322,21 @@ const Discover = () => {
     [nodeColorByKind, edgeColorByKind],
   );
 
+  // Theme-aware label palette. Uses --foreground / --muted-foreground so
+  // the labels flip light automatically in dark mode. The "stroke" colour is
+  // the canvas background, drawn behind the fill text to give every label a
+  // 1px halo and keep it readable against busy edges.
+  const labelStrong = useMemo(() => hslFromVar("--foreground"), []);
+  const labelMuted = useMemo(() => hslFromVar("--muted-foreground"), []);
+  const labelHalo = useMemo(() => hslFromVar("--background"), []);
+
   // Build graph (memoized). Pre-bakes color on every node + edge.
   const { nodes, edges } = useMemo(
     () => buildGraph({ prospects, scores, signalsById, theme }),
     [prospects, scores, signalsById, theme],
   );
 
-  // ─── URL-synced local state (?edges=…&selected=…) ──────────────────────────
+  // ─── URL-synced local state (?edges=…&focus=…) ─────────────────────────────
   const [searchParams, setSearchParams] = useSearchParams();
   const initialEdgeKinds = useMemo(
     () =>
@@ -332,23 +347,32 @@ const Discover = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
-  const [selectedId, setSelectedId] = useState<string | null>(
-    () => searchParams.get("selected"),
+  // `focusId` is the current "you are here" — clicking any node makes it the
+  // new focus and the graph re-flows around it. There's no back button by
+  // design (Obsidian-style endless traversal), but the Technology root is
+  // always present in every focal subgraph as a click-to-home anchor.
+  const [focusId, setFocusId] = useState<string | null>(
+    () => searchParams.get("focus") ?? searchParams.get("selected"),
   );
+  // selectedId mirrors focusId for inspector wiring. Kept as its own piece
+  // of state in case we later want "selection without re-focusing" (e.g.
+  // hover-preview). For now, click = focus = select.
+  const [selectedId, setSelectedId] = useState<string | null>(focusId);
   const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string> | null>(null);
   const [edgeKindsActive, setEdgeKindsActive] = useState<Set<EdgeKind>>(initialEdgeKinds);
 
-  // Push state -> URL (replace, not push, so the back button stays clean).
+  // Push state -> URL (replace, not push — the user said no back-button feel,
+  // and we don't want focus changes piling into the browser history stack).
   useEffect(() => {
     const next = new URLSearchParams(searchParams);
-    if (selectedId) next.set("selected", selectedId);
-    else next.delete("selected");
+    if (focusId) next.set("focus", focusId);
+    else next.delete("focus");
+    next.delete("selected"); // legacy — focus is the source of truth now
     next.set("edges", encodeEdgeKinds(edgeKindsActive));
-    // Avoid identity churn — only update if something actually changed.
     if (next.toString() !== searchParams.toString()) {
       setSearchParams(next, { replace: true });
     }
-  }, [selectedId, edgeKindsActive, searchParams, setSearchParams]);
+  }, [focusId, edgeKindsActive, searchParams, setSearchParams]);
 
   // Derived: neighbor map for halo / fade.
   const neighborByNode = useMemo(() => {
@@ -368,14 +392,65 @@ const Discover = () => {
     [nodes, selectedId],
   );
 
-  // Build the graphData ForceGraph2D consumes (nodes + links). `color` is
-  // pre-baked by buildGraph(); `width` is set here from the base width and
-  // mutated in place on selection (see effect below) so the simulation
-  // doesn't reset every time you click a node.
+  // ─── Focal subgraph — the local universe around `focusId` ──────────────────
+  // When focusId is null we're in "wide view": show the whole rendered set.
+  // When it's set we keep the focal node + its 1-hop neighborhood + the
+  // Technology root (always available as a click-to-home anchor). Person
+  // neighbors are score-capped to keep big-company drill-downs legible.
+  const nodeById = useMemo(() => {
+    const m = new Map<string, GraphNode>();
+    for (const n of nodes) m.set(n.id, n);
+    return m;
+  }, [nodes]);
+
+  const focalNodes = useMemo<GraphNode[]>(() => {
+    if (!focusId) return nodes;
+    const focal = nodeById.get(focusId);
+    if (!focal) return nodes; // stale focus id (e.g. from URL) — show all
+    const visible = new Set<string>([focusId]);
+    if (nodeById.has(TECH_ROOT_ID)) visible.add(TECH_ROOT_ID);
+    const neighbors = neighborByNode.get(focusId);
+    if (neighbors) {
+      // Split neighbors by kind so we can apply person-only capping.
+      const persons: string[] = [];
+      const others: string[] = [];
+      for (const id of neighbors) {
+        const n = nodeById.get(id);
+        if (!n) continue;
+        if (n.kind === "person") persons.push(id);
+        else others.push(id);
+      }
+      // Sort persons by score desc, take the top N. Roles, companies,
+      // industries, cities, schools, conferences are all kept.
+      persons.sort((a, b) => {
+        const sa = (nodeById.get(a) as Extract<GraphNode, { kind: "person" }> | undefined)?.score ?? -1;
+        const sb = (nodeById.get(b) as Extract<GraphNode, { kind: "person" }> | undefined)?.score ?? -1;
+        return sb - sa;
+      });
+      for (const id of persons.slice(0, FOCAL_PEOPLE_CAP)) visible.add(id);
+      for (const id of others) visible.add(id);
+    }
+    const out: GraphNode[] = [];
+    for (const n of nodes) if (visible.has(n.id)) out.push(n);
+    return out;
+  }, [focusId, nodes, nodeById, neighborByNode]);
+
+  const focalEdges = useMemo(() => {
+    if (!focusId) return edges;
+    const visible = new Set(focalNodes.map((n) => n.id));
+    return edges.filter((e) => visible.has(e.source) && visible.has(e.target));
+  }, [focusId, edges, focalNodes]);
+
+  // Build the graphData ForceGraph2D consumes (nodes + links). When the
+  // focal subgraph changes (focusId click), graphData identity changes and
+  // ForceGraph2D re-runs the simulation from scratch — that's the
+  // "rearranging around the new universe" feel. `color` is pre-baked by
+  // buildGraph(); `width` is mutated in place on selection (see effect
+  // below) so the simulation doesn't reset on every selection click.
   const graphData = useMemo(
     () => ({
-      nodes: nodes as FGNode[],
-      links: edges.map<FGLink>((e) => ({
+      nodes: focalNodes as FGNode[],
+      links: focalEdges.map<FGLink>((e) => ({
         source: e.source,
         target: e.target,
         kind: e.kind,
@@ -384,7 +459,7 @@ const Discover = () => {
         width: 0.6,
       })),
     }),
-    [nodes, edges],
+    [focalNodes, focalEdges],
   );
 
   // Mutate link widths in place when selection changes. Avoids re-creating
@@ -420,14 +495,27 @@ const Discover = () => {
   // ─── Engine-running flag — drives the warmup skeleton overlay (U4) ─────────
   const [engineRunning, setEngineRunning] = useState(true);
   useEffect(() => {
-    if (nodes.length) setEngineRunning(true);
-  }, [nodes, edges]);
+    if (focalNodes.length) setEngineRunning(true);
+  }, [focalNodes, focalEdges]);
   const onEngineStop = useCallback(() => {
     setEngineRunning(false);
-    // Fit on settle rather than via timer — guarantees we frame the final
-    // layout, not a half-cooled one.
-    fgRef.current?.zoomToFit(400, 60);
-  }, []);
+    const fg = fgRef.current;
+    if (!fg) return;
+    // If the user has drilled into a focal node, center the camera on it
+    // (now that the simulation has settled around the new local universe).
+    // Otherwise, frame the whole view.
+    if (focusId) {
+      const focal = focalNodes.find((n) => n.id === focusId) as
+        | (GraphNode & { x?: number; y?: number })
+        | undefined;
+      if (focal && typeof focal.x === "number" && typeof focal.y === "number") {
+        fg.centerAt(focal.x, focal.y, 600);
+        fg.zoom(2.0, 600);
+        return;
+      }
+    }
+    fg.zoomToFit(400, 60);
+  }, [focusId, focalNodes]);
 
   // ─── Agent context ─────────────────────────────────────────────────────────
   // Built off the FULL prospect set, not the rendered slice — so the chat
@@ -503,40 +591,51 @@ const Discover = () => {
     [visibleNodeIds, selectedId],
   );
 
-  const onNodeClickStable = useCallback(
-    (node: FGNode) => setSelectedId(node.id as string),
-    [],
-  );
-  const onBackgroundClickStable = useCallback(() => setSelectedId(null), []);
+  // Endless-traversal click handler. Clicking a node makes it the new
+  // focus — the graph data swaps to its 1-hop universe, ForceGraph re-runs
+  // the layout, and onEngineStop centers/zooms the camera once the new
+  // arrangement settles. No back button by design: the user navigates
+  // forward by clicking, and the Technology root is always reachable as
+  // a "click home" anchor.
+  const onNodeClickStable = useCallback((node: FGNode) => {
+    const id = node.id as string;
+    setFocusId(id);
+    setSelectedId(id);
+    setEngineRunning(true);
+  }, []);
+  // Background click is a no-op — preserves the current focal universe.
+  // Resetting to the wide view is intentional here: the user clicks the
+  // Technology root (always present in the focal subgraph) to "go home".
+  const onBackgroundClickStable = useCallback(() => undefined, []);
 
   const nodeCanvasObject = useCallback(
     (node: FGNode, ctx2d: CanvasRenderingContext2D, globalScale: number) => {
       const gn = node as unknown as GraphNode;
       const x = node.x ?? 0;
       const y = node.y ?? 0;
-      // Visual rank — bigger nodes for higher levels in the hierarchy so
-      // the eye lands on Technology → Industry/City → Company/Role → Person
-      // top-down. Selected gets a small bump.
+      // Node radius — slight rank by kind so the eye lands on the bigger
+      // hubs (Technology root, industries, cities) before the leaves.
       const isRoot = gn.id === "industry:technology";
       const isSelected = gn.id === selectedId;
       const baseR = isRoot
-        ? 11
+        ? 9
         : gn.kind === "industry" || gn.kind === "city"
-          ? 7.5
+          ? 6
           : gn.kind === "company" || gn.kind === "role"
-            ? 6
+            ? 5
             : gn.kind === "school" || gn.kind === "conference"
-              ? 5
-              : 4.5; // person
+              ? 4
+              : 3.5; // person
       const r = isSelected ? baseR + 1.5 : baseR;
 
-      // Neighborhood-fade: when nothing's filtered AND a node is
-      // selected, dim non-neighbors so the focal cluster pops.
+      // Obsidian-style neighborhood fade: when something's selected, dim
+      // every non-neighbor so the focal cluster reads cleanly.
+      const isNeighbor = selectedId
+        ? (neighborByNode.get(selectedId)?.has(gn.id) ?? false)
+        : false;
       let alpha = 1;
       if (selectedId && visibleNodeIds === null) {
-        const isSelf = gn.id === selectedId;
-        const isNeighbor = neighborByNode.get(selectedId)?.has(gn.id) ?? false;
-        if (!isSelf && !isNeighbor) alpha = 0.2;
+        if (!isSelected && !isNeighbor) alpha = 0.18;
       }
 
       ctx2d.save();
@@ -555,26 +654,58 @@ const Discover = () => {
 
       paintShape(ctx2d, gn.kind, x, y, r, nodeColorByKind[gn.kind]);
 
-      // Always-visible labels, with size keyed off the hierarchy. The font
-      // size is in px — divide by globalScale so it stays readable across
-      // zoom levels. We DON'T gate by globalScale anymore; user wants all
-      // titles visible.
-      const labelPx = isRoot ? 14 : gn.kind === "industry" || gn.kind === "city" ? 11 : gn.kind === "company" || gn.kind === "role" ? 10 : 9;
-      ctx2d.font = `${isRoot || isSelected ? "600 " : ""}${labelPx / globalScale}px ui-sans-serif, system-ui, sans-serif`;
-      ctx2d.fillStyle = isRoot
-        ? "hsl(0 0% 15%)"
-        : isSelected
-          ? "hsl(0 0% 20%)"
-          : gn.kind === "person"
-            ? "hsl(0 0% 35%)"
-            : "hsl(0 0% 28%)";
-      ctx2d.textAlign = "center";
-      ctx2d.textBaseline = "top";
-      ctx2d.fillText(gn.name, x, y + r + 2);
+      // Label policy — Obsidian-style. Labels only render when:
+      //  • the node is the technology root (anchor reference)
+      //  • OR it's an industry / city — always visible (level-1 anchors)
+      //  • OR something is selected and this node is the selection or a
+      //    direct neighbor
+      //  • OR the user has zoomed in past 1.4x (then everyone is labeled)
+      const isAnchor =
+        isRoot || gn.kind === "industry" || gn.kind === "city";
+      const inFocus = isSelected || isNeighbor;
+      const zoomedIn = globalScale >= 1.4;
+      if (isAnchor || inFocus || zoomedIn) {
+        const labelPx = isRoot
+          ? 13
+          : gn.kind === "industry" || gn.kind === "city"
+            ? 10
+            : gn.kind === "company" || gn.kind === "role"
+              ? 9
+              : 8;
+        // Use Inter (self-hosted via @fontsource) so canvas labels match
+        // the rest of the UI, with weight bumped on selected/root for hub
+        // emphasis and slight negative tracking for an editorial feel.
+        const weight = isRoot ? 600 : isSelected ? 600 : isAnchor ? 500 : 400;
+        ctx2d.font = `${weight} ${labelPx / globalScale}px Inter, ui-sans-serif, system-ui, sans-serif`;
+        // Modern Chrome / Safari respect this; older engines just ignore.
+        // -1.5% tightens long labels (industry / role names) without
+        // overcrowding short ones.
+        (ctx2d as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing = "-0.015em";
+        ctx2d.textAlign = "center";
+        ctx2d.textBaseline = "top";
+        const fill = isRoot || isSelected || isAnchor ? labelStrong : labelMuted;
+        // Halo: stroke the text in the bg color before filling, so labels
+        // stay readable against any cluster of edges crossing them.
+        ctx2d.lineWidth = 4 / globalScale;
+        ctx2d.strokeStyle = labelHalo;
+        ctx2d.lineJoin = "round";
+        ctx2d.miterLimit = 2;
+        ctx2d.strokeText(gn.name, x, y + r + 2);
+        ctx2d.fillStyle = fill;
+        ctx2d.fillText(gn.name, x, y + r + 2);
+      }
 
       ctx2d.restore();
     },
-    [selectedId, visibleNodeIds, neighborByNode, nodeColorByKind],
+    [
+      selectedId,
+      visibleNodeIds,
+      neighborByNode,
+      nodeColorByKind,
+      labelStrong,
+      labelMuted,
+      labelHalo,
+    ],
   );
 
   // ─── Render ────────────────────────────────────────────────────────────────
@@ -712,24 +843,14 @@ const Discover = () => {
                   height={canvasSize.h}
                   nodeId="id"
                   nodeRelSize={4}
-                  // DAG layout: bottom-up so source nodes (children) sit BELOW
-                  // target nodes (parents). The edge direction Person → Role →
-                  // Industry → Technology reads as a top-down hierarchy on
-                  // screen.
-                  dagMode="td"
-                  dagLevelDistance={70}
-                  // colleague + partnership are symmetric and may form cycles;
-                  // ForceGraph throws by default. Swallow it — non-DAG nodes
-                  // just fall back to standard force layout.
-                  onDagError={() => undefined}
-                  // Perf: shorter sim + faster cooldown. Audit (FrostyOtter)
-                  // measured 3.6s warmup with the defaults; these knobs cut it
-                  // to ~700ms while still settling visually.
+                  // Pure organic force-directed (Obsidian-style). DAG mode
+                  // collapses every level into a horizontal stripe with this
+                  // many nodes — wrong shape for what we want.
                   cooldownTime={1500}
                   cooldownTicks={90}
                   warmupTicks={20}
-                  d3AlphaDecay={0.04}
-                  d3VelocityDecay={0.3}
+                  d3AlphaDecay={0.045}
+                  d3VelocityDecay={0.32}
                   linkDirectionalParticles={0}
                   backgroundColor="transparent"
                   linkColor="color"

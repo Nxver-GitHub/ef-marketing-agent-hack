@@ -2,18 +2,27 @@
 -- Run via: supabase db push  or paste into the Supabase SQL editor
 
 -- prospects
+-- past_companies / education / talks are denormalized JSONB arrays populated
+-- by scripts/etl_to_public.py from lead_scoring.evidence rows (see migration
+-- 20260426_prospect_enrichment.sql for shapes). Frontend's Discover graph
+-- reads these flat instead of joining 67k+ evidence rows in the browser.
 CREATE TABLE IF NOT EXISTS prospects (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name        TEXT NOT NULL,
-  company     TEXT NOT NULL,
-  role        TEXT NOT NULL,
-  industry    TEXT NOT NULL,
-  linkedin_url TEXT,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name           TEXT NOT NULL,
+  company        TEXT NOT NULL,
+  role           TEXT NOT NULL,
+  industry       TEXT NOT NULL,
+  linkedin_url   TEXT,
+  past_companies JSONB NOT NULL DEFAULT '[]'::jsonb,
+  education      JSONB NOT NULL DEFAULT '[]'::jsonb,
+  talks          JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_prospects_industry ON prospects(industry);
-CREATE INDEX IF NOT EXISTS idx_prospects_company  ON prospects(company);
+CREATE INDEX IF NOT EXISTS idx_prospects_industry           ON prospects(industry);
+CREATE INDEX IF NOT EXISTS idx_prospects_company            ON prospects(company);
+CREATE INDEX IF NOT EXISTS idx_prospects_past_companies_gin ON prospects USING GIN (past_companies);
+CREATE INDEX IF NOT EXISTS idx_prospects_education_gin      ON prospects USING GIN (education);
 
 -- signals — one row per source per signal type per prospect
 CREATE TABLE IF NOT EXISTS signals (
