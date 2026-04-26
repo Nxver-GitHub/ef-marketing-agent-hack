@@ -173,6 +173,15 @@ function subLabelFor(node: GraphNode, byId: Map<string, GraphNode>): string | nu
   }
 }
 
+// ─── Score → node color for person nodes ────────────────────────────────────
+
+function scoreToNodeColor(score: number | undefined): string {
+  if (score === undefined || score <= 0) return "hsl(224 80% 68%)";
+  if (score >= 75) return "hsl(142 71% 58%)";  // strong — green
+  if (score >= 50) return "hsl(38 92% 58%)";   // plausible — amber
+  return "hsl(0 72% 62%)";                      // weak — red
+}
+
 // ─── Small per-node-kind shape painter ───────────────────────────────────────
 
 function paintShape(
@@ -307,14 +316,43 @@ const DEFAULT_EDGE_KINDS: EdgeKind[] = [
 // separately by FOCAL_PEOPLE_CAP. Chat copilot operates on the full
 // 10k-prospect graph via AgentContext.
 const MAX_PROSPECTS_RENDERED = 120;
-// When drilled into a focal node, we never expand more than this many
-// person-neighbors. (e.g., clicking TSMC with 1500 employees still reads
-// as a clean cluster, top-scored.)
+// When drilled into a person focal node, we cap to the immediate
+// 1-hop neighborhood (still bounded — direct neighbors only).
 const FOCAL_PEOPLE_CAP = 20;
+// When the focal node is an aggregation (company / industry / role / city /
+// school / conference) the user wants to see *who's there* — every prospect.
+// No cap: ForceGraph2D handles a few thousand nodes, and a silently-truncated
+// org chart hides the answer the user came for.
+const FOCAL_AGG_PEOPLE_CAP = Number.POSITIVE_INFINITY;
 // Singleton root id (mirrors graph.ts). We pin this in every focal
 // subgraph so the user has a click-to-home anchor without needing a back
 // button.
 const TECH_ROOT_ID = "industry:technology";
+
+// Seniority ranking. Lower number = higher in the org. Used to order the
+// focal-company subgraph from CEO down. Free-text role strings are messy, so
+// we match against word-boundary keywords in priority order.
+const SENIORITY_TIERS: ReadonlyArray<{ rank: number; pattern: RegExp }> = [
+  { rank: 0,  pattern: /\b(?:ceo|chief executive|founder & ceo|co[- ]?founder & ceo)\b/i },
+  { rank: 5,  pattern: /\b(?:president|coo|cfo|cto|cmo|cpo|ciso|cdo|chief\b[^,]+officer)\b/i },
+  { rank: 10, pattern: /\b(?:founder|co[- ]?founder|board|chairman|chairwoman)\b/i },
+  { rank: 15, pattern: /\b(?:evp|executive vice president|svp|senior vice president)\b/i },
+  { rank: 20, pattern: /\bvice president\b|\bvp\b/i },
+  { rank: 25, pattern: /\b(?:senior director|sr\.? director|head of)\b/i },
+  { rank: 30, pattern: /\bdirector\b/i },
+  { rank: 35, pattern: /\b(?:principal|distinguished|fellow|architect|staff)\b/i },
+  { rank: 40, pattern: /\b(?:senior manager|sr\.? manager|group manager)\b/i },
+  { rank: 45, pattern: /\bmanager\b/i },
+  { rank: 50, pattern: /\b(?:senior|sr\.?|lead)\b/i },
+];
+
+function seniorityRank(role: string | undefined): number {
+  if (!role) return 100;
+  for (const { rank, pattern } of SENIORITY_TIERS) {
+    if (pattern.test(role)) return rank;
+  }
+  return 60; // unranked individual contributor
+}
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
@@ -408,14 +446,56 @@ const Discover = () => {
       const matched = allProspects.filter((p) => chatPromotedIds.has(p._id));
       if (matched.length > 0) return matched;
     }
-    if (allProspects.length <= MAX_PROSPECTS_RENDERED) return allProspects;
+    // When the user focuses on any aggregation node (company / industry / role
+    // / city / school / conference) the user wants to see the *full* set of
+    // prospects under that node, not the global top-N. Without this, top-120-
+    // by-score wins the slot fight and large clusters show 2 people. We layer
+    // matches on top of the global top-N so surrounding context still renders.
+    const colonIdx = focusId?.indexOf(":") ?? -1;
+    const focusKind = focusId && colonIdx > 0 ? focusId.slice(0, colonIdx) : null;
+    const focusName = focusId && colonIdx > 0 ? focusId.slice(colonIdx + 1) : null;
+
+    const focusMatches: typeof allProspects = (() => {
+      if (!focusKind || !focusName || focusKind === "person") return [];
+      const norm = (s: string) => s.trim().toLowerCase();
+      switch (focusKind) {
+        case "company":
+          return allProspects.filter((p) => norm(p.company) === focusName);
+        case "industry":
+          return allProspects.filter((p) => norm(p.industry) === focusName);
+        case "role":
+          // Free-text roles vary; substring match against normalized role.
+          // Roles come into the graph via canonicalizeRole, so the focusName
+          // is one of a small set of canonical buckets.
+          return allProspects.filter((p) => norm(p.role).includes(focusName));
+        // For city / school / conference, the underlying mock/Supabase
+        // prospect rows don't carry a flat field; we still want a non-empty
+        // graph, so fall through and ride on the wide-view top-N (the focal
+        // edge expansion in `focalNodes` will then surface the cluster).
+        default:
+          return [];
+      }
+    })();
+
+    if (allProspects.length <= MAX_PROSPECTS_RENDERED && focusMatches.length === 0) {
+      return allProspects;
+    }
     const ranked = [...allProspects].sort((a, b) => {
       const sa = scores[a._id]?.overall_score ?? -1;
       const sb = scores[b._id]?.overall_score ?? -1;
       return sb - sa;
     });
-    return ranked.slice(0, MAX_PROSPECTS_RENDERED);
-  }, [allProspects, scores, chatPromotedIds]);
+    const baseTopN = ranked.slice(0, MAX_PROSPECTS_RENDERED);
+    if (focusMatches.length === 0) return baseTopN;
+    const seen = new Set(baseTopN.map((p) => p._id));
+    for (const p of focusMatches) {
+      if (!seen.has(p._id)) {
+        baseTopN.push(p);
+        seen.add(p._id);
+      }
+    }
+    return baseTopN;
+  }, [allProspects, scores, chatPromotedIds, focusId]);
 
   const prospectIds = useMemo(() => prospects.map((p) => p._id), [prospects]);
   const signalsById = useSignalsForMany(prospectIds);
@@ -515,14 +595,22 @@ const Discover = () => {
         if (n.kind === "person") persons.push(id);
         else others.push(id);
       }
-      // Sort persons by score desc, take the top N. Roles, companies,
-      // industries, cities, schools, conferences are all kept.
+      const focalIsAggregation = focal.kind !== "person";
+      const focalIsCompany = focal.kind === "company";
+      // For company focus, sort by org-chart seniority (CEO → C-suite → VP …),
+      // tiebroken by overall_score; for any other focus, score-desc.
       persons.sort((a, b) => {
-        const sa = (nodeById.get(a) as Extract<GraphNode, { kind: "person" }> | undefined)?.score ?? -1;
-        const sb = (nodeById.get(b) as Extract<GraphNode, { kind: "person" }> | undefined)?.score ?? -1;
-        return sb - sa;
+        const pa = nodeById.get(a) as Extract<GraphNode, { kind: "person" }> | undefined;
+        const pb = nodeById.get(b) as Extract<GraphNode, { kind: "person" }> | undefined;
+        if (focalIsCompany) {
+          const ra = seniorityRank(pa?.role);
+          const rb = seniorityRank(pb?.role);
+          if (ra !== rb) return ra - rb;
+        }
+        return (pb?.score ?? -1) - (pa?.score ?? -1);
       });
-      for (const id of persons.slice(0, FOCAL_PEOPLE_CAP)) visible.add(id);
+      const cap = focalIsAggregation ? FOCAL_AGG_PEOPLE_CAP : FOCAL_PEOPLE_CAP;
+      for (const id of persons.slice(0, cap)) visible.add(id);
       for (const id of others) visible.add(id);
     }
     const out: GraphNode[] = [];
@@ -589,7 +677,7 @@ const Discover = () => {
         kind: e.kind,
         id: e.id,
         color: e.color,
-        width: 0.6,
+        width: 0.8,
       })),
     };
   }, [focalNodes, focalEdges, focusId]);
@@ -608,7 +696,7 @@ const Discover = () => {
       const tId = linkEndpointId(link.target);
       const focal =
         selectedId !== null && (sId === selectedId || tId === selectedId);
-      link.width = focal ? 1.6 : 0.6;
+      link.width = focal ? 2.5 : 0.8;
     }
   }, [selectedId, graphData]);
 
@@ -643,8 +731,8 @@ const Discover = () => {
     const chargeF = fg.d3Force("charge") as unknown as
       | { strength: (n: number) => unknown }
       | undefined;
-    linkF?.distance(55);
-    chargeF?.strength(-220);
+    linkF?.distance(75);
+    chargeF?.strength(-400);
     fg.d3ReheatSimulation();
   }, [graphData]);
 
@@ -699,12 +787,12 @@ const Discover = () => {
         | (GraphNode & { x?: number; y?: number })
         | undefined;
       if (focal && typeof focal.x === "number" && typeof focal.y === "number") {
-        fg.centerAt(focal.x, focal.y, 900);
-        fg.zoom(2.0, 900);
+        fg.centerAt(focal.x, focal.y, 1400);
+        fg.zoom(2.0, 1400);
         return;
       }
     }
-    fg.zoomToFit(700, 80);
+    fg.zoomToFit(1200, 80);
   }, [focusId, focalNodes]);
 
   // ─── Agent context ─────────────────────────────────────────────────────────
@@ -749,7 +837,10 @@ const Discover = () => {
     accent: string;
   } | null>(() => {
     if (!selectedNode) return null;
-    const accent = nodeColorByKind[selectedNode.kind];
+    const accent =
+      selectedNode.kind === "person"
+        ? scoreToNodeColor((selectedNode as Extract<GraphNode, { kind: "person" }>).score)
+        : nodeColorByKind[selectedNode.kind];
     const name = selectedNode.name;
     if (selectedNode.kind === "person") {
       const role = selectedNode.role ? canonicalizeRole(selectedNode.role) : "";
@@ -882,15 +973,21 @@ const Discover = () => {
       const isRoot = gn.id === "industry:technology";
       const isSelected = gn.id === selectedId;
       const baseR = isRoot
-        ? 9
+        ? 12
         : gn.kind === "industry" || gn.kind === "city"
-          ? 6
+          ? 8
           : gn.kind === "company" || gn.kind === "role"
-            ? 5
+            ? 7
             : gn.kind === "school" || gn.kind === "conference"
-              ? 4
-              : 3.5; // person
-      const r = isSelected ? baseR + 1.5 : baseR;
+              ? 5.5
+              : 5; // person
+      const r = isSelected ? baseR + 2 : baseR;
+
+      // Score-based color for persons; kind color for all other node types.
+      const nodeColor =
+        gn.kind === "person"
+          ? scoreToNodeColor((gn as Extract<GraphNode, { kind: "person" }>).score)
+          : nodeColorByKind[gn.kind];
 
       // Obsidian-style neighborhood fade: when something's selected, dim
       // every non-neighbor so the focal cluster reads cleanly.
@@ -910,26 +1007,37 @@ const Discover = () => {
       // selected (the halo below is more prominent).
       if (gn.id === hoveredId && !isSelected) {
         ctx2d.beginPath();
-        ctx2d.arc(x, y, r + 3, 0, Math.PI * 2);
-        ctx2d.strokeStyle = nodeColorByKind[gn.kind];
-        ctx2d.lineWidth = 1;
-        ctx2d.globalAlpha = alpha * 0.45;
+        ctx2d.arc(x, y, r + 4, 0, Math.PI * 2);
+        ctx2d.strokeStyle = nodeColor;
+        ctx2d.lineWidth = 1.5;
+        ctx2d.globalAlpha = alpha * 0.5;
         ctx2d.stroke();
         ctx2d.globalAlpha = alpha;
       }
 
-      // Selected halo
+      // Selected halo — double ring for more presence
       if (isSelected) {
         ctx2d.beginPath();
-        ctx2d.arc(x, y, r + 4, 0, Math.PI * 2);
-        ctx2d.strokeStyle = nodeColorByKind[gn.kind];
-        ctx2d.lineWidth = 1.5;
-        ctx2d.globalAlpha = alpha * 0.6;
+        ctx2d.arc(x, y, r + 6, 0, Math.PI * 2);
+        ctx2d.strokeStyle = nodeColor;
+        ctx2d.lineWidth = 1;
+        ctx2d.globalAlpha = alpha * 0.3;
+        ctx2d.stroke();
+        ctx2d.beginPath();
+        ctx2d.arc(x, y, r + 3, 0, Math.PI * 2);
+        ctx2d.strokeStyle = nodeColor;
+        ctx2d.lineWidth = 2;
+        ctx2d.globalAlpha = alpha * 0.7;
         ctx2d.stroke();
         ctx2d.globalAlpha = alpha;
       }
 
-      paintShape(ctx2d, gn.kind, x, y, r, nodeColorByKind[gn.kind]);
+      // Glow — drawn as a blurred shadow behind the shape.
+      ctx2d.shadowBlur = isSelected ? 24 : isNeighbor ? 14 : 10;
+      ctx2d.shadowColor = nodeColor;
+      paintShape(ctx2d, gn.kind, x, y, r, nodeColor);
+      ctx2d.shadowBlur = 0;
+      ctx2d.shadowColor = "transparent";
 
       // Label policy — Obsidian-style. Labels only render when:
       //  • the node is the technology root (anchor reference)
@@ -1149,17 +1257,18 @@ const Discover = () => {
                   // many nodes — wrong shape for what we want.
                   // Smoother cool-down: longer warmup with slower velocity
                   // decay so motion fades instead of slamming to a halt.
-                  cooldownTime={2000}
-                  cooldownTicks={110}
-                  warmupTicks={30}
-                  d3AlphaDecay={0.035}
-                  d3VelocityDecay={0.22}
+                  cooldownTime={2500}
+                  cooldownTicks={120}
+                  warmupTicks={50}
+                  d3AlphaDecay={0.028}
+                  d3VelocityDecay={0.35}
                   // Curved edges — subtle arc gives the canvas a spider-web
                   // feel instead of the rigid hub-and-spoke that straight
-                  // lines produce. 0.18 is light enough that short edges
-                  // still read as direct.
-                  linkCurvature={0.18}
-                  linkDirectionalParticles={0}
+                  // lines produce. 0.22 gives a more organic web feel.
+                  linkCurvature={0.22}
+                  linkDirectionalParticles={2}
+                  linkDirectionalParticleWidth={2}
+                  linkDirectionalParticleSpeed={0.004}
                   backgroundColor="transparent"
                   linkColor="color"
                   linkWidth="width"
