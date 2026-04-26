@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Session End Policy
+
+At the end of every Claude Code session in this repo, push committed work on `main` to `origin/main` so the GitHub mirror stays in sync.
+
+- Only push if there is at least one outbound commit (`git log origin/main..HEAD` non-empty).
+- Never push uncommitted or partially-implemented work — commit cleanly first, or leave it for the next session.
+- Never force-push. If `git push` is rejected as non-fast-forward, stop and surface it; do not rewrite history to make it land.
+- Skip the push if `npm run lint` or `npm test` is failing on touched code — broken `main` is worse than a delayed push.
+
 ## What This Is
 
 **Credence** — a trust-and-fit scoring tool for B2B prospects in sensitive industries (starting with semiconductors). Triangulates functional scope across multiple evidence sources and produces a score with a full evidence trail.
