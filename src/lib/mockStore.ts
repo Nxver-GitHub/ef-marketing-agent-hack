@@ -4,7 +4,7 @@
  * deployment is connected. Replace by wiring ConvexProvider once
  * VITE_CONVEX_URL is set.
  */
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 
 type Prospect = {
   _id: string;
@@ -101,6 +101,7 @@ class Store {
   scores: Score[] = [];
   signal_weights: SignalWeight[] = [];
   scoring_runs: ScoringRun[] = [];
+  version = 0;
   private listeners = new Set<() => void>();
 
   constructor() {
@@ -111,7 +112,10 @@ class Store {
     this.listeners.add(cb);
     return () => this.listeners.delete(cb);
   };
-  emit = () => this.listeners.forEach((l) => l());
+  emit = () => {
+    this.version++;
+    this.listeners.forEach((l) => l());
+  };
 
   seedWeights() {
     if (this.signal_weights.length) return;
@@ -278,11 +282,12 @@ class Store {
 export const store = new Store();
 
 function useStore<T>(selector: (s: Store) => T): T {
-  return useSyncExternalStore(
+  const version = useSyncExternalStore(
     store.subscribe,
-    () => selector(store),
-    () => selector(store)
+    () => store.version,
+    () => store.version
   );
+  return useMemo(() => selector(store), [selector, version]);
 }
 
 export const useProspects = () => useStore((s) => [...s.prospects]);
