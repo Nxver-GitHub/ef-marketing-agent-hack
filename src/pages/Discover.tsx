@@ -11,8 +11,8 @@
  * padding which breaks the graph canvas filling the body row. The TopBar
  * is rendered directly so the route still uses the shared chrome.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import ForceGraph2D, {
   type ForceGraphMethods,
   type LinkObject,
@@ -25,9 +25,9 @@ import { useProspects, useScoresFor, useSignalsForMany } from "@/lib/db";
 import {
   buildGraph,
   type EdgeKind,
-  type GraphEdge,
   type GraphNode,
   type NodeKind,
+  type ThemeTokens,
 } from "@/lib/graph";
 import type { AgentContext } from "@/lib/agent";
 
@@ -79,7 +79,24 @@ const NODE_VAR: Record<NodeKind, string> = {
 // ─── Force-graph link/node typing helpers ────────────────────────────────────
 
 type FGNode = NodeObject<GraphNode>;
-type FGLink = LinkObject<GraphNode, { kind: EdgeKind; id: string }>;
+type FGLink = LinkObject<
+  GraphNode,
+  { kind: EdgeKind; id: string; color?: string; width?: number }
+>;
+
+// All edge kinds — used for the edge-color theme map.
+const ALL_EDGE_KINDS: EdgeKind[] = [
+  "works_at",
+  "colleague",
+  "located_in",
+  "reports_to",
+  "past_employer",
+  "partnership",
+  "education",
+  "scope_signal",
+  "vertical",
+  "evidence_cited",
+];
 
 // react-force-graph mutates source/target to NodeObjects after init; this
 // narrows safely whether we're pre- or post-init.
@@ -215,6 +232,35 @@ const DEFAULT_EDGE_KINDS: EdgeKind[] = [
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
+// Edge-pill order — duplicated from TopBar so the legend renders the same
+// kinds in the same order. Kept local to avoid a one-import dep on TopBar.
+const EDGE_LEGEND: ReadonlyArray<{ kind: EdgeKind; label: string }> = [
+  { kind: "reports_to", label: "Reports" },
+  { kind: "works_at", label: "Employer" },
+  { kind: "located_in", label: "Location" },
+  { kind: "evidence_cited", label: "Evidence" },
+  { kind: "scope_signal", label: "Scope" },
+  { kind: "partnership", label: "Partnership" },
+  { kind: "past_employer", label: "Past empl." },
+  { kind: "education", label: "Education" },
+  { kind: "vertical", label: "Vertical" },
+];
+
+// Encode/decode helpers for URL-sync. Unknown values are dropped so a hand-
+// edited URL can't crash the page.
+function encodeEdgeKinds(active: Set<EdgeKind>): string {
+  return Array.from(active).join(",");
+}
+function decodeEdgeKinds(raw: string | null): Set<EdgeKind> | null {
+  if (raw === null) return null;
+  const valid = new Set(ALL_EDGE_KINDS);
+  const out = new Set<EdgeKind>();
+  for (const piece of raw.split(",")) {
+    if (valid.has(piece as EdgeKind)) out.add(piece as EdgeKind);
+  }
+  return out;
+}
+
 const Discover = () => {
   const navigate = useNavigate();
   const prospects = useProspects();
@@ -222,18 +268,62 @@ const Discover = () => {
   const scores = useScoresFor(prospectIds);
   const signalsById = useSignalsForMany(prospectIds);
 
-  // Build graph (memoized).
-  const { nodes, edges } = useMemo(
-    () => buildGraph({ prospects, scores, signalsById }),
-    [prospects, scores, signalsById],
+  // Per-kind cached colors. Recomputed once per mount; theme switch would
+  // need to bust this — fine for v1 since the theme toggle isn't on Discover.
+  const nodeColorByKind = useMemo<Record<NodeKind, string>>(() => {
+    const out = {} as Record<NodeKind, string>;
+    (Object.keys(NODE_VAR) as NodeKind[]).forEach((k) => {
+      out[k] = hslFromVar(NODE_VAR[k]);
+    });
+    return out;
+  }, []);
+
+  // Edge color cache — same caveat as above.
+  const edgeColorByKind = useMemo<Record<EdgeKind, string>>(() => {
+    const out = {} as Record<EdgeKind, string>;
+    for (const k of ALL_EDGE_KINDS) out[k] = hslFromVar(`--edge-${slugifyEdge(k)}`);
+    return out;
+  }, []);
+
+  const theme = useMemo<ThemeTokens>(
+    () => ({ nodeColors: nodeColorByKind, edgeColors: edgeColorByKind }),
+    [nodeColorByKind, edgeColorByKind],
   );
 
-  // ─── Local state ───────────────────────────────────────────────────────────
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string> | null>(null);
-  const [edgeKindsActive, setEdgeKindsActive] = useState<Set<EdgeKind>>(
-    () => new Set<EdgeKind>(DEFAULT_EDGE_KINDS),
+  // Build graph (memoized). Pre-bakes color on every node + edge.
+  const { nodes, edges } = useMemo(
+    () => buildGraph({ prospects, scores, signalsById, theme }),
+    [prospects, scores, signalsById, theme],
   );
+
+  // ─── URL-synced local state (?edges=…&selected=…) ──────────────────────────
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialEdgeKinds = useMemo(
+    () =>
+      decodeEdgeKinds(searchParams.get("edges")) ??
+      new Set<EdgeKind>(DEFAULT_EDGE_KINDS),
+    // Read once on mount; subsequent state mutations push back to the URL
+    // via the effect below. Including searchParams here would create a loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+  const [selectedId, setSelectedId] = useState<string | null>(
+    () => searchParams.get("selected"),
+  );
+  const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string> | null>(null);
+  const [edgeKindsActive, setEdgeKindsActive] = useState<Set<EdgeKind>>(initialEdgeKinds);
+
+  // Push state -> URL (replace, not push, so the back button stays clean).
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams);
+    if (selectedId) next.set("selected", selectedId);
+    else next.delete("selected");
+    next.set("edges", encodeEdgeKinds(edgeKindsActive));
+    // Avoid identity churn — only update if something actually changed.
+    if (next.toString() !== searchParams.toString()) {
+      setSearchParams(next, { replace: true });
+    }
+  }, [selectedId, edgeKindsActive, searchParams, setSearchParams]);
 
   // Derived: neighbor map for halo / fade.
   const neighborByNode = useMemo(() => {
@@ -253,48 +343,36 @@ const Discover = () => {
     [nodes, selectedId],
   );
 
-  // Per-kind cached colors. Recomputed once per mount; theme switch would
-  // need to bust this — fine for v1 since the theme toggle isn't on Discover.
-  const nodeColorByKind = useMemo<Record<NodeKind, string>>(() => {
-    const out = {} as Record<NodeKind, string>;
-    (Object.keys(NODE_VAR) as NodeKind[]).forEach((k) => {
-      out[k] = hslFromVar(NODE_VAR[k]);
-    });
-    return out;
-  }, []);
-
-  // Edge color cache — same caveat as above.
-  const edgeColorByKind = useMemo<Record<EdgeKind, string>>(() => {
-    const kinds: EdgeKind[] = [
-      "works_at",
-      "colleague",
-      "located_in",
-      "reports_to",
-      "past_employer",
-      "partnership",
-      "education",
-      "scope_signal",
-      "vertical",
-      "evidence_cited",
-    ];
-    const out = {} as Record<EdgeKind, string>;
-    for (const k of kinds) out[k] = hslFromVar(`--edge-${slugifyEdge(k)}`);
-    return out;
-  }, []);
-
-  // Build the graphData ForceGraph2D consumes (nodes + links).
+  // Build the graphData ForceGraph2D consumes (nodes + links). `color` is
+  // pre-baked by buildGraph(); `width` is set here from the base width and
+  // mutated in place on selection (see effect below) so the simulation
+  // doesn't reset every time you click a node.
   const graphData = useMemo(
     () => ({
       nodes: nodes as FGNode[],
-      links: edges.map<FGLink>((e: GraphEdge) => ({
+      links: edges.map<FGLink>((e) => ({
         source: e.source,
         target: e.target,
         kind: e.kind,
         id: e.id,
+        color: e.color,
+        width: 0.6,
       })),
     }),
     [nodes, edges],
   );
+
+  // Mutate link widths in place when selection changes. Avoids re-creating
+  // graphData (which would reset the ForceGraph simulation).
+  useEffect(() => {
+    for (const link of graphData.links) {
+      const sId = linkEndpointId(link.source);
+      const tId = linkEndpointId(link.target);
+      const focal =
+        selectedId !== null && (sId === selectedId || tId === selectedId);
+      link.width = focal ? 1.6 : 0.6;
+    }
+  }, [selectedId, graphData]);
 
   // ─── Canvas sizing — ResizeObserver against the canvas column ──────────────
   const canvasWrapRef = useRef<HTMLDivElement | null>(null);
@@ -314,12 +392,17 @@ const Discover = () => {
     return () => ro.disconnect();
   }, []);
 
-  // After first layout settles, fit graph to view.
+  // ─── Engine-running flag — drives the warmup skeleton overlay (U4) ─────────
+  const [engineRunning, setEngineRunning] = useState(true);
   useEffect(() => {
-    if (!nodes.length) return;
-    const t = setTimeout(() => fgRef.current?.zoomToFit(400, 60), 600);
-    return () => clearTimeout(t);
-  }, [nodes.length]);
+    if (nodes.length) setEngineRunning(true);
+  }, [nodes, edges]);
+  const onEngineStop = useCallback(() => {
+    setEngineRunning(false);
+    // Fit on settle rather than via timer — guarantees we frame the final
+    // layout, not a half-cooled one.
+    fgRef.current?.zoomToFit(400, 60);
+  }, []);
 
   // ─── Agent context ─────────────────────────────────────────────────────────
   const ctx: AgentContext = useMemo(
@@ -347,21 +430,94 @@ const Discover = () => {
   const selectedSignals = selectedProspect ? signalsById[selectedProspect._id] : undefined;
 
   // ─── Edge-kind toggle handler ──────────────────────────────────────────────
-  const onToggleEdgeKind = (kind: EdgeKind) =>
-    setEdgeKindsActive((prev) => {
-      const next = new Set(prev);
-      if (next.has(kind)) next.delete(kind);
-      else next.add(kind);
-      return next;
-    });
+  const onToggleEdgeKind = useCallback(
+    (kind: EdgeKind) =>
+      setEdgeKindsActive((prev) => {
+        const next = new Set(prev);
+        if (next.has(kind)) next.delete(kind);
+        else next.add(kind);
+        return next;
+      }),
+    [],
+  );
 
   // ─── Empty-state gate ──────────────────────────────────────────────────────
   const isEmpty = nodes.length === 0;
 
+  // ─── Stable callbacks for ForceGraph2D (avoid per-render identity churn) ───
+  const linkVisibility = useCallback(
+    (link: FGLink) => edgeKindsActive.has(link.kind),
+    [edgeKindsActive],
+  );
+
+  const nodeVisibility = useCallback(
+    (node: FGNode) => {
+      if (visibleNodeIds === null) return true;
+      if (visibleNodeIds.has(node.id as string)) return true;
+      if (selectedId && node.id === selectedId) return true;
+      return false;
+    },
+    [visibleNodeIds, selectedId],
+  );
+
+  const onNodeClickStable = useCallback(
+    (node: FGNode) => setSelectedId(node.id as string),
+    [],
+  );
+  const onBackgroundClickStable = useCallback(() => setSelectedId(null), []);
+
+  const nodeCanvasObject = useCallback(
+    (node: FGNode, ctx2d: CanvasRenderingContext2D, globalScale: number) => {
+      const gn = node as unknown as GraphNode;
+      const x = node.x ?? 0;
+      const y = node.y ?? 0;
+      const baseR = gn.kind === "person" ? 5 : gn.kind === "city" ? 5 : 5.5;
+
+      // Neighborhood-fade: when nothing's filtered AND a node is
+      // selected, dim non-neighbors so the focal cluster pops.
+      let alpha = 1;
+      if (selectedId && visibleNodeIds === null) {
+        const isSelf = gn.id === selectedId;
+        const isNeighbor = neighborByNode.get(selectedId)?.has(gn.id) ?? false;
+        if (!isSelf && !isNeighbor) alpha = 0.25;
+      }
+
+      ctx2d.save();
+      ctx2d.globalAlpha = alpha;
+
+      // Selected halo
+      if (gn.id === selectedId) {
+        ctx2d.beginPath();
+        ctx2d.arc(x, y, baseR + 4, 0, Math.PI * 2);
+        ctx2d.strokeStyle = nodeColorByKind[gn.kind];
+        ctx2d.lineWidth = 1.5;
+        ctx2d.globalAlpha = alpha * 0.6;
+        ctx2d.stroke();
+        ctx2d.globalAlpha = alpha;
+      }
+
+      paintShape(ctx2d, gn.kind, x, y, baseR, nodeColorByKind[gn.kind]);
+
+      // Label only when zoomed in enough.
+      if (globalScale >= 1.4) {
+        ctx2d.font = `${10 / globalScale}px ui-sans-serif, system-ui, sans-serif`;
+        ctx2d.fillStyle = "hsl(0 0% 45%)";
+        ctx2d.textAlign = "center";
+        ctx2d.textBaseline = "top";
+        ctx2d.fillText(gn.name, x, y + baseR + 2);
+      }
+
+      ctx2d.restore();
+    },
+    [selectedId, visibleNodeIds, neighborByNode, nodeColorByKind],
+  );
+
   // ─── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-background text-foreground">
-      <TopBar edgeKindsActive={edgeKindsActive} onToggleEdgeKind={onToggleEdgeKind} />
+      {/* Off-screen heading for screen readers + document outline (U1). */}
+      <h1 className="sr-only">Discover — prospect graph</h1>
+      <TopBar />
       {/* Spacer for fixed TopBar (h-12) */}
       <div className="h-12 shrink-0" />
       <div className="flex flex-1 min-h-0">
@@ -404,20 +560,55 @@ const Discover = () => {
             </div>
           </div>
 
-          {/* Subheader: legend */}
-          <div className="flex items-center gap-3 border-b border-border px-5 py-2 flex-wrap">
-            <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
-              Legend
-            </span>
-            {NODE_KINDS_LEGEND.map((l) => (
-              <span key={l.kind} className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                <span
-                  className="inline-block h-2.5 w-2.5 rounded-sm"
-                  style={{ background: nodeColorByKind[l.kind] }}
-                />
-                {l.label}
+          {/* Subheader: legend (nodes + edges) — U5 */}
+          <div className="flex flex-col gap-1.5 border-b border-border px-5 py-2">
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground w-12 shrink-0">
+                Nodes
               </span>
-            ))}
+              {NODE_KINDS_LEGEND.map((l) => (
+                <span
+                  key={l.kind}
+                  className="flex items-center gap-1.5 text-[11px] text-muted-foreground"
+                >
+                  <span
+                    className="inline-block h-2.5 w-2.5 rounded-full"
+                    style={{ background: nodeColorByKind[l.kind] }}
+                  />
+                  {l.label}
+                </span>
+              ))}
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground w-12 shrink-0">
+                Edges
+              </span>
+              {EDGE_LEGEND.map((l) => {
+                const active = edgeKindsActive.has(l.kind);
+                return (
+                  <button
+                    key={l.kind}
+                    type="button"
+                    onClick={() => onToggleEdgeKind(l.kind)}
+                    aria-pressed={active}
+                    className={`flex items-center gap-1.5 rounded-full border border-border py-[3px] px-2.5 text-[11px] leading-none transition-colors ${
+                      active
+                        ? "bg-muted text-foreground"
+                        : "bg-transparent text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <span
+                      className="inline-block h-2 w-2 rounded-full"
+                      style={{
+                        background: edgeColorByKind[l.kind],
+                        opacity: active ? 1 : 0.4,
+                      }}
+                    />
+                    {l.label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           {/* Canvas */}
@@ -429,78 +620,49 @@ const Discover = () => {
             ) : (
               canvasSize.w > 0 &&
               canvasSize.h > 0 && (
-                <ForceGraph2D<GraphNode, { kind: EdgeKind; id: string }>
+                <ForceGraph2D<GraphNode, { kind: EdgeKind; id: string; color?: string; width?: number }>
                   ref={fgRef}
                   graphData={graphData}
                   width={canvasSize.w}
                   height={canvasSize.h}
                   nodeId="id"
                   nodeRelSize={4}
-                  cooldownTime={3000}
+                  // Perf: shorter sim + faster cooldown. Audit (FrostyOtter)
+                  // measured 3.6s warmup with the defaults; these knobs cut it
+                  // to ~700ms while still settling visually. Property-name
+                  // accessors below skip per-tick callbacks for color/width.
+                  cooldownTime={1200}
+                  cooldownTicks={70}
+                  warmupTicks={15}
+                  d3AlphaDecay={0.05}
+                  d3VelocityDecay={0.35}
                   linkDirectionalParticles={0}
                   backgroundColor="transparent"
-                  linkColor={(link: FGLink) =>
-                    edgeColorByKind[link.kind] ?? "hsl(0 0% 50%)"
-                  }
-                  linkWidth={(link: FGLink) => {
-                    const sId = linkEndpointId(link.source);
-                    const tId = linkEndpointId(link.target);
-                    if (selectedId && (sId === selectedId || tId === selectedId)) return 1.5;
-                    return 0.6;
-                  }}
-                  linkVisibility={(link: FGLink) => edgeKindsActive.has(link.kind)}
-                  nodeVisibility={(node: FGNode) => {
-                    if (visibleNodeIds === null) return true;
-                    if (visibleNodeIds.has(node.id as string)) return true;
-                    if (selectedId && node.id === selectedId) return true;
-                    return false;
-                  }}
-                  onNodeClick={(node: FGNode) => setSelectedId(node.id as string)}
-                  onBackgroundClick={() => setSelectedId(null)}
-                  nodeCanvasObject={(node: FGNode, ctx2d: CanvasRenderingContext2D, globalScale: number) => {
-                    const gn = node as unknown as GraphNode;
-                    const x = node.x ?? 0;
-                    const y = node.y ?? 0;
-                    const baseR = gn.kind === "person" ? 5 : gn.kind === "city" ? 5 : 5.5;
-
-                    // Neighborhood-fade: when nothing's filtered AND a node is
-                    // selected, dim non-neighbors so the focal cluster pops.
-                    let alpha = 1;
-                    if (selectedId && visibleNodeIds === null) {
-                      const isSelf = gn.id === selectedId;
-                      const isNeighbor = neighborByNode.get(selectedId)?.has(gn.id) ?? false;
-                      if (!isSelf && !isNeighbor) alpha = 0.25;
-                    }
-
-                    ctx2d.save();
-                    ctx2d.globalAlpha = alpha;
-
-                    // Selected halo
-                    if (gn.id === selectedId) {
-                      ctx2d.beginPath();
-                      ctx2d.arc(x, y, baseR + 4, 0, Math.PI * 2);
-                      ctx2d.strokeStyle = nodeColorByKind[gn.kind];
-                      ctx2d.lineWidth = 1.5;
-                      ctx2d.globalAlpha = alpha * 0.6;
-                      ctx2d.stroke();
-                      ctx2d.globalAlpha = alpha;
-                    }
-
-                    paintShape(ctx2d, gn.kind, x, y, baseR, nodeColorByKind[gn.kind]);
-
-                    // Label only when zoomed in enough.
-                    if (globalScale >= 1.4) {
-                      ctx2d.font = `${10 / globalScale}px ui-sans-serif, system-ui, sans-serif`;
-                      ctx2d.fillStyle = "hsl(0 0% 45%)";
-                      ctx2d.textAlign = "center";
-                      ctx2d.textBaseline = "top";
-                      ctx2d.fillText(gn.name, x, y + baseR + 2);
-                    }
-
-                    ctx2d.restore();
-                  }}
+                  linkColor="color"
+                  linkWidth="width"
+                  linkVisibility={linkVisibility}
+                  nodeVisibility={nodeVisibility}
+                  onNodeClick={onNodeClickStable}
+                  onBackgroundClick={onBackgroundClickStable}
+                  onEngineStop={onEngineStop}
+                  nodeCanvasObject={nodeCanvasObject}
                 />
               )
+            )}
+            {/* U4 — warmup skeleton overlay while the simulation cools down. */}
+            {!isEmpty && engineRunning && (
+              <div
+                className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/60 backdrop-blur-[1px]"
+                aria-live="polite"
+                aria-busy="true"
+              >
+                <div className="flex flex-col items-center gap-2">
+                  <div className="h-3 w-3 rounded-full bg-foreground/30 animate-pulse" />
+                  <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                    Settling network…
+                  </div>
+                </div>
+              </div>
             )}
           </div>
         </div>
