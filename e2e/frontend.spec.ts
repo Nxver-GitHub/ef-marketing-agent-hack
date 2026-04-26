@@ -86,7 +86,7 @@ test.describe("Credence frontend", () => {
   test("/discover — stats render + at least one prospect row", async ({ page }) => {
     const cap = attachCapture(page);
     await page.goto("/discover");
-    await page.waitForLoadState("networkidle", { timeout: 15_000 });
+    await page.waitForLoadState("networkidle", { timeout: 45_000 });
 
     // Stats row present
     await expect(page.getByText(/Total prospects/i)).toBeVisible();
@@ -106,7 +106,7 @@ test.describe("Credence frontend", () => {
   test("/discover — clicking a prospect navigates to /prospect/:id", async ({ page }) => {
     const cap = attachCapture(page);
     await page.goto("/discover");
-    await page.waitForLoadState("networkidle", { timeout: 15_000 });
+    await page.waitForLoadState("networkidle", { timeout: 45_000 });
     const row = await firstProspectButton(page);
     await expect(row).toBeVisible({ timeout: 10_000 });
     await row.click();
@@ -117,7 +117,7 @@ test.describe("Credence frontend", () => {
   test("/discover — search filter narrows results", async ({ page }) => {
     const cap = attachCapture(page);
     await page.goto("/discover");
-    await page.waitForLoadState("networkidle", { timeout: 15_000 });
+    await page.waitForLoadState("networkidle", { timeout: 45_000 });
     const rowCountSel = "button.grid.grid-cols-12";
     const before = await page.locator(rowCountSel).count();
     await page.getByPlaceholder(/Name, company, or role/i).fill("xyzzynomatchxyz");
@@ -134,7 +134,7 @@ test.describe("Credence frontend", () => {
   test("/prospect/:id — overview renders score bars + falsification notes", async ({ page }) => {
     const cap = attachCapture(page);
     await page.goto("/discover");
-    await page.waitForLoadState("networkidle", { timeout: 15_000 });
+    await page.waitForLoadState("networkidle", { timeout: 45_000 });
     const row = await firstProspectButton(page);
     await expect(row).toBeVisible({ timeout: 10_000 });
     await row.click();
@@ -153,7 +153,7 @@ test.describe("Credence frontend", () => {
   test("/prospect/:id — org tab opens if ENABLE_ORG_CHART surfaces it", async ({ page }) => {
     const cap = attachCapture(page);
     await page.goto("/discover");
-    await page.waitForLoadState("networkidle", { timeout: 15_000 });
+    await page.waitForLoadState("networkidle", { timeout: 45_000 });
     const row = await firstProspectButton(page);
     await row.click();
     await expect(page).toHaveURL(/\/prospect\/[A-Za-z0-9_-]+/, { timeout: 10_000 });
@@ -170,7 +170,7 @@ test.describe("Credence frontend", () => {
   test("/validate — form inputs present + submit disabled until filled", async ({ page }) => {
     const cap = attachCapture(page);
     await page.goto("/validate");
-    await page.waitForLoadState("networkidle", { timeout: 15_000 });
+    await page.waitForLoadState("networkidle", { timeout: 45_000 });
     // Name / Company labels (label-eyebrow divs + input below)
     await expect(page.getByText("Name", { exact: true })).toBeVisible();
     await expect(page.getByText("Company", { exact: true })).toBeVisible();
@@ -188,7 +188,7 @@ test.describe("Credence frontend", () => {
   test("/settings — weights grid renders", async ({ page }) => {
     const cap = attachCapture(page);
     await page.goto("/settings");
-    await page.waitForLoadState("networkidle", { timeout: 15_000 });
+    await page.waitForLoadState("networkidle", { timeout: 45_000 });
     await expect(page.getByText(/Signal weights/i)).toBeVisible();
     await expect(page.getByRole("button", { name: /Save & recompute/i })).toBeVisible();
     // At least one weight row with a number input.

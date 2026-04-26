@@ -1,12 +1,57 @@
-import { useState, useRef, KeyboardEvent } from "react";
+import { useState, useRef, KeyboardEvent, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { PageShell } from "@/components/PageShell";
 import { db } from "@/lib/db";
 import { supabase, HAS_REAL_SUPABASE } from "@/lib/supabase";
+import { useAutocompleteSources, rankSuggestions } from "@/lib/autocompleteSources";
+import { scoreColor } from "@/components/ScoreBar";
+import { useDocumentTitle } from "@/lib/useDocumentTitle";
 
-const INDUSTRIES = ["Semiconductors", "Defense", "Pharma", "Quantum", "Aerospace"];
+// Scorer tier precedence. Must match src/lib/db.ts::MODEL_PRECEDENCE so the
+// Validate results page surfaces the same "best" row as ProspectDetail.
+const MODEL_PRECEDENCE: Record<string, number> = {
+  chartreuse_llm_v1: 1,
+  chartreuse_deterministic_v1: 2,
+  lightweight_v1: 3,
+};
+type ScoreRow = {
+  overall_score: number;
+  authenticity_score: number;
+  authority_score: number;
+  warmth_score: number;
+  model_version: string | null;
+  computed_at: string;
+};
+function pickBest(rows: ScoreRow[] | null | undefined): ScoreRow | null {
+  if (!rows || rows.length === 0) return null;
+  const sorted = [...rows].sort((a, b) => {
+    const ta = MODEL_PRECEDENCE[a.model_version ?? ""] ?? 9;
+    const tb = MODEL_PRECEDENCE[b.model_version ?? ""] ?? 9;
+    if (ta !== tb) return ta - tb;
+    return +new Date(b.computed_at) - +new Date(a.computed_at);
+  });
+  return sorted[0] ?? null;
+}
+
+type ValidateRanked = {
+  id: string;
+  name: string;
+  company: string;
+  role: string;
+  industry: string;
+  linkedin_url: string | null;
+  match_score: number;
+  overall_score: number;
+  authenticity_score: number;
+  authority_score: number;
+  warmth_score: number;
+  blended: number;
+};
+
+const INDUSTRIES = ["Semiconductors", "Defense", "Aerospace", "Health Tech", "Quantum", "Pharma"];
 
 const Validate = () => {
+  useDocumentTitle("Validate");
   const navigate = useNavigate();
   const [name, setName] = useState("");
   const [company, setCompany] = useState("");
@@ -18,6 +63,14 @@ const Validate = () => {
   const [submitting, setSubmitting] = useState(false);
   const roleInputRef = useRef<HTMLInputElement>(null);
   const keywordInputRef = useRef<HTMLInputElement>(null);
+  const [results, setResults] = useState<ValidateRanked[] | null>(null);
+  const [resultsQuery, setResultsQuery] = useState<{
+    name: string;
+    company: string;
+    roles: string[];
+    keywords: string[];
+    industry: string;
+  } | null>(null);
 
   const makeTagHandlers = (
     items: string[],
@@ -50,6 +103,20 @@ const Validate = () => {
   const roleHandlers = makeTagHandlers(roles, setRoles, roleInput, setRoleInput);
   const keywordHandlers = makeTagHandlers(keywords, setKeywords, keywordInput, setKeywordInput);
 
+  const { roles: roleSource, keywords: keywordSource, companies: companySource } = useAutocompleteSources();
+  const roleSuggestions = useMemo(
+    () => rankSuggestions(roleSource, roleInput, 8).filter((s) => !roles.includes(s)),
+    [roleSource, roleInput, roles],
+  );
+  const keywordSuggestions = useMemo(
+    () => rankSuggestions(keywordSource, keywordInput, 8).filter((s) => !keywords.includes(s)),
+    [keywordSource, keywordInput, keywords],
+  );
+  const companySuggestions = useMemo(
+    () => rankSuggestions(companySource, company, 8),
+    [companySource, company],
+  );
+
   const canSubmit = !submitting && company.trim() && roles.length > 0;
 
   const onSubmit = async (e: React.FormEvent) => {
@@ -65,68 +132,86 @@ const Validate = () => {
     setSubmitting(true);
     const trimmedName = name.trim();
     const companyTrim = company.trim();
-    const targetRole = finalRoles[0];
 
-    // Flow 1 intent: "you know the company + role, we find the person."
-    // Before creating a stub prospect, search existing `public.prospects`
-    // (895 pre-scored rows) for a best match. Only create a new row if no
-    // existing match — otherwise we'd show the user a Prospect Detail page
-    // with no real name + no LinkedIn URL.
-    const matched = HAS_REAL_SUPABASE
-      ? await lookupExistingProspect({
-          name: trimmedName,
-          company: companyTrim,
-          role: targetRole,
-          industry,
-        })
-      : null;
-    if (matched) {
-      navigate(`/prospect/${matched}`);
-      return;
-    }
-
-    // No match. Fall back to creating a new row — runScoring will try our
-    // FastAPI /validate first, then the lightweight signal-based scorer.
-    const synthesizedName = trimmedName || `${targetRole} at ${companyTrim}`;
-    const id = await db.createProspect({
-      name: synthesizedName,
+    setResultsQuery({
+      name: trimmedName,
       company: companyTrim,
-      role: targetRole,
       roles: finalRoles,
       keywords: finalKeywords,
       industry,
+    });
+
+    const top10 = HAS_REAL_SUPABASE
+      ? await lookupTopProspects({
+          name: trimmedName,
+          company: companyTrim,
+          roles: finalRoles,
+          keywords: finalKeywords,
+          industry,
+        })
+      : [];
+    setResults(top10);
+    setSubmitting(false);
+  };
+
+  const resetToForm = () => {
+    setResults(null);
+    setResultsQuery(null);
+  };
+
+  const createStubFromQuery = async () => {
+    if (!resultsQuery) return;
+    setSubmitting(true);
+    const { name: n, company: c, roles: rs, keywords: kw, industry: ind } = resultsQuery;
+    const synthesizedName = n || `${rs[0]} at ${c}`;
+    const id = await db.createProspect({
+      name: synthesizedName,
+      company: c,
+      role: rs[0],
+      roles: rs,
+      keywords: kw,
+      industry: ind,
     });
     void db.runScoring(id);
     navigate(`/prospect/${id}`);
   };
 
-  // Search `public.prospects` for the best match on (company, role, industry).
-  // Ranking heuristic:
+  // Rank top-10 prospects matching (name?, company, roles[], keywords[], industry).
+  // Rubric (out of ~10):
   //   +4 if name matches (only when user provided a name)
-  //   +3 if role token overlaps prospect.role (case-insensitive)
+  //   +3 weighted by role-token overlap ratio (union of all role tags)
   //   +2 if company matches ILIKE
-  //   +1 if industry matches ILIKE
-  // Returns the prospect id of the highest-scoring row, or null when nothing
-  // clears a minimum score threshold (2).
-  async function lookupExistingProspect(q: {
+  //   +1 if industry matches
+  //   +0.5 per keyword that appears in prospect.role (up to +2)
+  // Blended rank = 0.6 * match_score + 0.4 * (overall_score / 10)
+  async function lookupTopProspects(q: {
     name: string;
     company: string;
-    role: string;
+    roles: string[];
+    keywords: string[];
     industry: string;
-  }): Promise<string | null> {
-    if (!supabase) return null;
+  }): Promise<ValidateRanked[]> {
+    if (!supabase) return [];
     // Pull candidates constrained by company (fuzzy) AND industry (fuzzy).
-    // This keeps the result set small without requiring exact matches.
+    // Include nested scores so we can rank by overall_score too.
     const { data: rows, error } = await supabase
       .from("prospects")
-      .select("id, name, company, role, industry, linkedin_url")
+      .select(
+        "id, name, company, role, industry, linkedin_url, scores(overall_score, authenticity_score, authority_score, warmth_score, model_version, computed_at)",
+      )
       .ilike("company", `%${q.company}%`)
       .ilike("industry", `%${q.industry}%`)
-      .limit(50);
-    if (error || !rows || rows.length === 0) return null;
+      .limit(200);
+    if (error || !rows || rows.length === 0) return [];
 
-    const roleTokens = new Set(q.role.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+    // Merge every role's tokens into one set — any overlap scores.
+    const roleTokens = new Set<string>();
+    for (const rl of q.roles) {
+      for (const t of rl.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)) roleTokens.add(t);
+    }
     const nameLower = q.name.toLowerCase();
+    const kwLowers = q.keywords.map((k) => k.toLowerCase()).filter(Boolean);
+
     type Cand = {
       id: string;
       name: string;
@@ -134,8 +219,10 @@ const Validate = () => {
       role: string;
       industry: string;
       linkedin_url: string | null;
+      scores: ScoreRow[] | null;
     };
-    const scored: Array<{ cand: Cand; score: number }> = [];
+
+    const ranked: ValidateRanked[] = [];
     for (const r of rows as Cand[]) {
       let s = 0;
       if (q.name && r.name && r.name.toLowerCase().includes(nameLower)) s += 4;
@@ -147,12 +234,127 @@ const Validate = () => {
       if (overlap > 0) s += 3 * (overlap / Math.max(1, roleTokens.size));
       if ((r.company ?? "").toLowerCase().includes(q.company.toLowerCase())) s += 2;
       if ((r.industry ?? "").toLowerCase().includes(q.industry.toLowerCase())) s += 1;
-      scored.push({ cand: r, score: s });
+      // Keyword hits in role text — up to +2
+      const roleLower = (r.role ?? "").toLowerCase();
+      let kwHits = 0;
+      for (const kw of kwLowers) if (kw && roleLower.includes(kw)) kwHits += 1;
+      s += Math.min(2, kwHits * 0.5);
+
+      const best = pickBest(r.scores);
+      const overall = best?.overall_score ?? 0;
+      const blended = 0.6 * s + 0.4 * (overall / 10);
+
+      ranked.push({
+        id: r.id,
+        name: r.name,
+        company: r.company,
+        role: r.role,
+        industry: r.industry,
+        linkedin_url: r.linkedin_url,
+        match_score: Math.round(s * 10) / 10,
+        overall_score: overall,
+        authenticity_score: best?.authenticity_score ?? 0,
+        authority_score: best?.authority_score ?? 0,
+        warmth_score: best?.warmth_score ?? 0,
+        blended,
+      });
     }
-    scored.sort((a, b) => b.score - a.score);
-    const top = scored[0];
-    if (!top || top.score < 2) return null;
-    return top.cand.id;
+    ranked.sort((a, b) => b.blended - a.blended);
+    // Minimum match-fit gate: don't show candidates scored purely on overall
+    // while they have zero input-match. Requires at least company OR role overlap.
+    return ranked.filter((r) => r.match_score >= 2).slice(0, 10);
+  }
+
+  if (results !== null && resultsQuery) {
+    return (
+      <PageShell>
+        <div className="mb-8 flex items-end justify-between">
+          <div>
+            <div className="label-eyebrow mb-2">Flow 01 · Results</div>
+            <h1 className="text-4xl md:text-5xl font-light tracking-tight leading-[1.05]">
+              Top {results.length} candidate{results.length === 1 ? "" : "s"}
+            </h1>
+            <div className="text-sm text-muted-foreground mt-3 flex flex-wrap gap-x-3 gap-y-1">
+              <span>{resultsQuery.industry}</span>
+              <span className="text-muted-foreground/40">·</span>
+              <span>{resultsQuery.company || "any company"}</span>
+              <span className="text-muted-foreground/40">·</span>
+              <span>{resultsQuery.roles.join(" / ") || "any role"}</span>
+              {resultsQuery.keywords.length > 0 && (
+                <>
+                  <span className="text-muted-foreground/40">·</span>
+                  <span>{resultsQuery.keywords.join(", ")}</span>
+                </>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={resetToForm}
+            className="text-xs text-mono text-muted-foreground hover:text-foreground border border-border px-3 py-2 transition-colors"
+          >
+            ← Refine search
+          </button>
+        </div>
+
+        {results.length === 0 ? (
+          <div className="border border-border p-8 text-center space-y-4">
+            <div className="text-sm text-muted-foreground">
+              No existing prospects match this query.
+            </div>
+            <button
+              onClick={createStubFromQuery}
+              disabled={submitting}
+              className="border border-foreground bg-foreground text-background px-5 py-2.5 text-sm hover:opacity-80 transition-opacity disabled:opacity-40"
+            >
+              {submitting ? "Creating…" : "Create new prospect & score"}
+            </button>
+          </div>
+        ) : (
+          <div className="border border-border">
+            <div className="grid grid-cols-12 px-4 py-3 text-[10px] uppercase tracking-[0.16em] text-muted-foreground border-b border-border items-center">
+              <div className="col-span-1">#</div>
+              <div className="col-span-3">Name / Company</div>
+              <div className="col-span-3">Role</div>
+              <div className="col-span-1 text-right">Match</div>
+              <div className="col-span-1 text-right">Auth</div>
+              <div className="col-span-1 text-right">Athy</div>
+              <div className="col-span-1 text-right">Wrm</div>
+              <div className="col-span-1 text-right">Score</div>
+            </div>
+            {results.map((r, i) => (
+              <button
+                key={r.id}
+                onClick={() => navigate(`/prospect/${r.id}`)}
+                className="w-full grid grid-cols-12 items-center px-4 py-4 border-b border-border/60 last:border-0 text-left hover:bg-secondary transition-colors"
+              >
+                <div className="col-span-1 text-mono text-xs text-muted-foreground">
+                  {String(i + 1).padStart(2, "0")}
+                </div>
+                <div className="col-span-3">
+                  <div className="text-sm">{r.name}</div>
+                  <div className="text-xs text-muted-foreground">{r.company}</div>
+                </div>
+                <div className="col-span-3 text-xs text-muted-foreground truncate pr-4">
+                  {r.role}
+                </div>
+                <div className="col-span-1 text-right text-mono text-xs text-muted-foreground">
+                  {r.match_score.toFixed(1)}
+                </div>
+                <Pill v={r.authenticity_score} />
+                <Pill v={r.authority_score} />
+                <Pill v={r.warmth_score} />
+                <div
+                  className="col-span-1 text-right text-mono text-base"
+                  style={{ color: scoreColor(r.overall_score) }}
+                >
+                  {Math.round(r.overall_score)}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </PageShell>
+    );
   }
 
   return (
@@ -176,7 +378,14 @@ const Validate = () => {
             onChange={setName}
             placeholder="Jane Chen (optional)"
           />
-          <Field label="Company" value={company} onChange={setCompany} placeholder="ASML" />
+          <SuggestField
+            label="Company"
+            value={company}
+            onChange={setCompany}
+            placeholder="ASML"
+            suggestions={companySuggestions}
+            onPickSuggestion={setCompany}
+          />
 
           {/* Multi-role tag input */}
           <TagInputField
@@ -190,6 +399,8 @@ const Validate = () => {
             onRemove={roleHandlers.remove}
             placeholder={roles.length === 0 ? "VP Lithography" : "Add another role…"}
             hint="Press Enter or comma to add. Multiple roles narrow the search."
+            suggestions={roleSuggestions}
+            onPickSuggestion={(s) => roleHandlers.add(s)}
           />
 
           {/* Keywords / descriptors */}
@@ -205,6 +416,8 @@ const Validate = () => {
             placeholder={keywords.length === 0 ? "chip manufacturing, NPI, wafer fab…" : "Add keyword…"}
             hint="Domain terms, team focus, or product areas that describe this person's work."
             tagStyle="secondary"
+            suggestions={keywordSuggestions}
+            onPickSuggestion={(s) => keywordHandlers.add(s)}
           />
 
           <div className="border border-border p-5">
@@ -230,18 +443,31 @@ const Validate = () => {
           <button
             type="submit"
             disabled={!canSubmit}
-            className="w-full text-left border border-border p-5 mt-px hover:bg-secondary transition-colors disabled:opacity-40 disabled:cursor-not-allowed group"
+            aria-busy={submitting}
+            className="relative w-full text-left border border-border p-5 mt-px hover:bg-secondary transition-colors disabled:opacity-40 disabled:cursor-not-allowed group overflow-hidden"
           >
             <div className="flex items-center justify-between">
               <div>
-                <div className="label-eyebrow mb-1.5">Submit</div>
-                <div className="text-2xl font-light tracking-tight">Find &amp; score the lead →</div>
+                <div className="label-eyebrow mb-1.5">
+                  {submitting ? "Scoring…" : "Submit"}
+                </div>
+                <div className="text-2xl font-light tracking-tight">
+                  {submitting ? "Searching evidence sources…" : "Find & score the lead →"}
+                </div>
               </div>
               <div
-                className="w-10 h-10 rounded-full"
+                className={`w-10 h-10 rounded-full ${submitting ? "animate-pulse" : ""}`}
                 style={{ background: "hsl(var(--accent))" }}
               />
             </div>
+            {submitting && (
+              <div
+                aria-hidden="true"
+                className="absolute left-0 bottom-0 h-0.5 w-full bg-foreground/30 overflow-hidden"
+              >
+                <div className="h-full w-1/3 bg-foreground/80 animate-pulse" />
+              </div>
+            )}
           </button>
         </form>
       </div>
@@ -261,6 +487,8 @@ interface TagInputFieldProps {
   placeholder?: string;
   hint?: string;
   tagStyle?: "primary" | "secondary";
+  suggestions?: string[];
+  onPickSuggestion?: (value: string) => void;
 }
 
 const TagInputField = ({
@@ -275,48 +503,130 @@ const TagInputField = ({
   placeholder,
   hint,
   tagStyle = "primary",
-}: TagInputFieldProps) => (
-  <div
-    className="border border-border p-5 cursor-text"
-    onClick={() => inputRef.current?.focus()}
-  >
-    <div className="label-eyebrow mb-3">{label}</div>
-    <div className="flex flex-wrap gap-2 mb-2">
-      {items.map((item) => (
-        <span
-          key={item}
-          className={`flex items-center gap-1.5 text-xs px-3 py-1.5 border transition-colors ${
-            tagStyle === "primary"
-              ? "border-foreground bg-foreground text-background"
-              : "border-border text-foreground bg-secondary"
-          }`}
-        >
-          {item}
-          <button
-            type="button"
-            onClick={(e) => { e.stopPropagation(); onRemove(item); }}
-            className="opacity-60 hover:opacity-100 transition-opacity leading-none"
-            aria-label={`Remove ${item}`}
+  suggestions = [],
+  onPickSuggestion,
+}: TagInputFieldProps) => {
+  const [focused, setFocused] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  // Trigger suggestions when: input focused + user is actively typing (not
+  // just-dismissed) AND there's something to show. `dismissed` resets whenever
+  // the input value changes so suggestions re-open on the next keystroke.
+  const showSuggestions =
+    focused && !dismissed && suggestions.length > 0 && !!onPickSuggestion;
+
+  // Enter/Tab priority: if suggestions are showing AND user's raw input doesn't
+  // match any existing tag AND first suggestion starts-with the input, inject
+  // it instead of the raw input. Wraps the original onKeyDown.
+  const handleKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (
+      showSuggestions &&
+      (e.key === "Enter" || e.key === "Tab") &&
+      inputValue.trim() &&
+      suggestions[0]?.toLowerCase().startsWith(inputValue.trim().toLowerCase()) &&
+      onPickSuggestion
+    ) {
+      e.preventDefault();
+      onPickSuggestion(suggestions[0]);
+      setDismissed(true);
+      return;
+    }
+    if (e.key === "Escape") {
+      setDismissed(true);
+      return;
+    }
+    onKeyDown(e);
+  };
+
+  return (
+    <div
+      className="border border-border p-5 cursor-text relative"
+      onClick={() => inputRef.current?.focus()}
+    >
+      <div className="label-eyebrow mb-3">{label}</div>
+      <div className="flex flex-wrap gap-2 mb-2">
+        {items.map((item) => (
+          <span
+            key={item}
+            className={`flex items-center gap-1.5 text-xs px-3 py-1.5 border transition-colors ${
+              tagStyle === "primary"
+                ? "border-foreground bg-foreground text-background"
+                : "border-border text-foreground bg-secondary"
+            }`}
           >
-            ×
-          </button>
-        </span>
-      ))}
-      <input
-        ref={inputRef}
-        value={inputValue}
-        onChange={(e) => onInputChange(e.target.value)}
-        onKeyDown={onKeyDown}
-        onBlur={onBlur}
-        placeholder={placeholder}
-        className="bg-transparent outline-none text-2xl font-light tracking-tight placeholder:text-muted-foreground/40 flex-1 min-w-[180px]"
-      />
+            {item}
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onRemove(item); }}
+              className="opacity-60 hover:opacity-100 transition-opacity leading-none"
+              aria-label={`Remove ${item}`}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+        <input
+          ref={inputRef}
+          value={inputValue}
+          onChange={(e) => {
+            onInputChange(e.target.value);
+            setDismissed(false);
+          }}
+          onKeyDown={handleKey}
+          onFocus={() => {
+            setFocused(true);
+            setDismissed(false);
+          }}
+          onBlur={() => {
+            // Delay so click on a suggestion row fires before blur hides the menu.
+            setTimeout(() => setFocused(false), 120);
+            onBlur();
+          }}
+          placeholder={placeholder}
+          className="bg-transparent outline-none text-2xl font-light tracking-tight placeholder:text-muted-foreground/40 flex-1 min-w-[180px]"
+        />
+      </div>
+      {items.length === 0 && hint && (
+        <p className="text-xs text-muted-foreground/50 mt-1">{hint}</p>
+      )}
+      {showSuggestions && (
+        <div
+          className="absolute left-0 right-0 top-full z-20 border border-t-0 border-border bg-background shadow-lg"
+          // prevent the input blur from firing before our click registers
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          {suggestions.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => {
+                onPickSuggestion?.(s);
+                setDismissed(true);
+              }}
+              className="w-full text-left px-5 py-2.5 text-sm hover:bg-secondary transition-colors border-b border-border/40 last:border-b-0"
+            >
+              <Highlight text={s} query={inputValue} />
+            </button>
+          ))}
+        </div>
+      )}
     </div>
-    {items.length === 0 && hint && (
-      <p className="text-xs text-muted-foreground/50 mt-1">{hint}</p>
-    )}
-  </div>
-);
+  );
+};
+
+const Highlight = ({ text, query }: { text: string; query: string }) => {
+  const q = query.trim();
+  if (!q) return <>{text}</>;
+  const lower = text.toLowerCase();
+  const idx = lower.indexOf(q.toLowerCase());
+  if (idx === -1) return <>{text}</>;
+  return (
+    <>
+      {text.slice(0, idx)}
+      <span className="text-foreground font-medium">{text.slice(idx, idx + q.length)}</span>
+      {text.slice(idx + q.length)}
+    </>
+  );
+};
 
 const Field = ({
   label,
@@ -339,5 +649,66 @@ const Field = ({
     />
   </label>
 );
+
+const Pill = ({ v }: { v: number }) => (
+  <div
+    className="col-span-1 text-right text-mono text-xs"
+    style={{ color: scoreColor(v) }}
+  >
+    {Math.round(v)}
+  </div>
+);
+
+const SuggestField = ({
+  label,
+  value,
+  onChange,
+  placeholder,
+  suggestions = [],
+  onPickSuggestion,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  suggestions?: string[];
+  onPickSuggestion?: (v: string) => void;
+}) => {
+  const [focused, setFocused] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  const showSuggestions = focused && !dismissed && suggestions.length > 0 && !!value.trim();
+
+  return (
+    <div className="relative border border-border p-5">
+      <div className="label-eyebrow mb-2">{label}</div>
+      <input
+        value={value}
+        onChange={(e) => { onChange(e.target.value); setDismissed(false); }}
+        onFocus={() => { setFocused(true); setDismissed(false); }}
+        onBlur={() => setTimeout(() => setFocused(false), 120)}
+        onKeyDown={(e) => { if (e.key === "Escape") setDismissed(true); }}
+        placeholder={placeholder}
+        className="w-full bg-transparent outline-none text-2xl font-light tracking-tight placeholder:text-muted-foreground/40"
+      />
+      {showSuggestions && (
+        <div
+          className="absolute left-0 right-0 top-full z-20 border border-t-0 border-border bg-background shadow-lg"
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          {suggestions.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => { onPickSuggestion?.(s); setDismissed(true); }}
+              className="w-full text-left px-5 py-2.5 text-sm hover:bg-secondary transition-colors border-b border-border/40 last:border-b-0"
+            >
+              <Highlight text={s} query={value} />
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
 
 export default Validate;

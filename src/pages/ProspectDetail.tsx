@@ -8,6 +8,7 @@ import {
   useLatestScore,
   useLatestRun,
 } from "@/lib/db";
+import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { BigScore, ScoreBar, scoreColor } from "@/components/ScoreBar";
 import { ENABLE_ORG_CHART, supabase } from "@/lib/supabase";
 import { WebPresence } from "@/components/WebPresence";
@@ -56,12 +57,40 @@ const ALL_SOURCES = [
 const ProspectDetail = () => {
   const { id } = useParams();
   const prospect = useProspect(id);
+  useDocumentTitle(prospect?.name ?? "Prospect");
   const signals = useSignalsFor(id);
   const score = useLatestScore(id);
   const run = useLatestRun(id);
   const [tab, setTab] = useState<"overview" | "org">("overview");
   const [showRaw, setShowRaw] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [signalQuery, setSignalQuery] = useState("");
+
+  // Client-side substring filter over signal source / signal_type / value /
+  // raw_data. Kept purely local — no DB round-trips.
+  const filteredSignals = useMemo(() => {
+    const q = signalQuery.trim().toLowerCase();
+    if (!q) return signals;
+    return signals.filter((s) => {
+      const hay = [
+        s.source,
+        s.signal_type,
+        String(s.value ?? ""),
+        (() => {
+          try {
+            return typeof s.raw_data === "string"
+              ? s.raw_data
+              : JSON.stringify(s.raw_data ?? "");
+          } catch {
+            return "";
+          }
+        })(),
+      ]
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(q);
+    });
+  }, [signals, signalQuery]);
 
   if (!prospect) {
     return (
@@ -174,6 +203,24 @@ const ProspectDetail = () => {
                   </button>
                   {expanded && (
                     <div className="border-t border-border">
+                      <label className="border-b border-border flex items-center px-4 gap-3 py-2">
+                        <span className="text-muted-foreground text-[10px] uppercase tracking-[0.16em]">
+                          Search
+                        </span>
+                        <input
+                          type="text"
+                          value={signalQuery}
+                          onChange={(e) => setSignalQuery(e.target.value)}
+                          placeholder="filter by source, type, value, raw…"
+                          aria-label="Filter signals"
+                          className="flex-1 bg-transparent outline-none text-xs placeholder:text-muted-foreground/50"
+                        />
+                        {signalQuery && (
+                          <span className="text-[10px] text-muted-foreground text-mono">
+                            {filteredSignals.length}/{signals.length}
+                          </span>
+                        )}
+                      </label>
                       <table className="w-full text-xs">
                         <thead className="text-muted-foreground">
                           <tr className="border-b border-border">
@@ -185,7 +232,7 @@ const ProspectDetail = () => {
                           </tr>
                         </thead>
                         <tbody>
-                          {signals.map((s) => (
+                          {filteredSignals.map((s) => (
                             <tr key={s._id} className="border-b border-border/60">
                               <td className="p-3 text-mono text-muted-foreground">{s.source}</td>
                               <td className="p-3">{s.signal_type}</td>
@@ -196,6 +243,16 @@ const ProspectDetail = () => {
                               </td>
                             </tr>
                           ))}
+                          {filteredSignals.length === 0 && (
+                            <tr>
+                              <td
+                                colSpan={5}
+                                className="p-4 text-center text-muted-foreground text-xs"
+                              >
+                                No signals match "{signalQuery}".
+                              </td>
+                            </tr>
+                          )}
                         </tbody>
                       </table>
                     </div>

@@ -59,7 +59,7 @@ function getClient(): OpenAI {
   return _client;
 }
 
-const MODEL = "glm-5.1";
+const MODEL = "glm-4.6";
 const MAX_ITERATIONS = 5;
 
 // ─── Tool schemas (OpenAI function-calling format) ───────────────────────────

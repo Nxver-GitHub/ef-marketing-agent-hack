@@ -32,6 +32,10 @@ export type EdgeKind =
   | "vertical"
   | "evidence_cited";
 
+// `color` is pre-baked per node/edge when a `theme` is passed to buildGraph().
+// Render hot-paths (ForceGraph2D linkColor/nodeColor accessors) read it as a
+// plain property instead of invoking a callback per-tick — eliminates the
+// linkColor/linkWidth main-thread overhead flagged in the v2 perf audit.
 export type GraphNode =
   | {
       id: string;
@@ -40,26 +44,47 @@ export type GraphNode =
       role: string;
       companyId: string;
       score?: number;
+      color?: string;
       raw: Prospect;
     }
-  | { id: string; kind: "company"; name: string; locationId?: string; industryId?: string }
-  | { id: string; kind: "role"; name: string; description?: string }
-  | { id: string; kind: "city"; name: string; country?: string }
-  | { id: string; kind: "school"; name: string }
-  | { id: string; kind: "conference"; name: string; year?: number }
-  | { id: string; kind: "industry"; name: string };
+  | {
+      id: string;
+      kind: "company";
+      name: string;
+      locationId?: string;
+      industryId?: string;
+      color?: string;
+    }
+  | { id: string; kind: "role"; name: string; description?: string; color?: string }
+  | { id: string; kind: "city"; name: string; country?: string; color?: string }
+  | { id: string; kind: "school"; name: string; color?: string }
+  | { id: string; kind: "conference"; name: string; year?: number; color?: string }
+  | { id: string; kind: "industry"; name: string; color?: string };
 
 export type GraphEdge = {
   id: string;
   source: string;
   target: string;
   kind: EdgeKind;
+  color?: string;
+  width?: number;
 };
+
+export interface ThemeTokens {
+  nodeColors: Record<NodeKind, string>;
+  edgeColors: Record<EdgeKind, string>;
+}
 
 export interface BuildGraphArgs {
   prospects: Prospect[];
   scores: Record<string, Score>;
   signalsById?: Record<string, Signal[]>;
+  /**
+   * Optional theme tokens. When supplied, every node gets `color` and every
+   * edge gets `color` set so the consumer can use property-name accessors
+   * ("color") instead of per-tick callbacks.
+   */
+  theme?: ThemeTokens;
 }
 
 // ─── Company metadata ────────────────────────────────────────────────────────
@@ -102,6 +127,8 @@ const COMPANY_META: Record<string, CompanyMeta> = {
   "Carl Zeiss": { country: "Germany", industry: "Semiconductors", partnerships: ["ASML"] },
   Google: { country: "USA", state: "California", industry: "Internet" },
   Broadcom: { country: "USA", state: "California", industry: "Semiconductors" },
+  Micron: { country: "USA", state: "Idaho", industry: "Semiconductors" },
+  "Micron Technology": { country: "USA", state: "Idaho", industry: "Semiconductors" },
   Bosch: { country: "Germany", industry: "Industrial" },
   Lockheed: { country: "USA", state: "Maryland", industry: "Defense" },
   "Lockheed Martin": { country: "USA", state: "Maryland", industry: "Defense" },
@@ -374,8 +401,15 @@ export function buildGraph(args: BuildGraphArgs): {
     }
   }
 
-  return {
-    nodes: Array.from(nodes.values()),
-    edges: Array.from(edges.values()),
-  };
+  // Pre-bake colors so ForceGraph2D can read them as property names instead
+  // of invoking a callback per-tick per-element.
+  const nodeArr = Array.from(nodes.values());
+  const edgeArr = Array.from(edges.values());
+  if (args.theme) {
+    const { nodeColors, edgeColors } = args.theme;
+    for (const n of nodeArr) n.color = nodeColors[n.kind];
+    for (const e of edgeArr) e.color = edgeColors[e.kind];
+  }
+
+  return { nodes: nodeArr, edges: edgeArr };
 }

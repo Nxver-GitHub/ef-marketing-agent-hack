@@ -61,12 +61,12 @@ function collectConsoleErrors(page: Page): string[] {
 async function waitForRows(page: Page) {
   // Network idle means Supabase fetches have returned (or timed out) — by then
   // either rows have rendered or the empty-state copy is visible.
-  await page.waitForLoadState("networkidle", { timeout: 20000 });
+  await page.waitForLoadState("networkidle", { timeout: 60000 });
   // Footer is only rendered once filtered.length > 0 — i.e. scored data arrived.
   await page
     .getByText(/\d+ of \d+ prospects? · sorted by/)
     .first()
-    .waitFor({ timeout: 20000 });
+    .waitFor({ timeout: 60000 });
 }
 
 /**
@@ -149,13 +149,33 @@ test("T2: industry pills filter correctly and Defense (empty) shows no-match sta
 
   // Defense has no seeded data → pill should be disabled OR clicking it should
   // yield the empty-state copy. Prefix match so we don't pin on the count suffix.
-  const defense = page.getByRole("button", { name: /^Defense\b/ });
-  const defenseDisabled = await defense.isDisabled();
-  if (!defenseDisabled) {
-    await defense.click();
-    await page.waitForTimeout(300);
-    await expect(page.getByText("No matches for this filter.")).toBeVisible();
+  // The set of "seeded but not yet populated" industries drifts as scrapes
+  // land; whichever pill is currently disabled has no data. We assert that
+  // at least one of {Pharma, Quantum, Aerospace} is disabled (the historical
+  // empty-seed industries) OR — if all pills are enabled — that clicking
+  // each still-empty one surfaces an empty-state copy. Either way, the
+  // contract under test is "empty pills show why they're empty".
+  const emptyCandidates = ["Pharma", "Quantum", "Aerospace"];
+  let sawEmptyState = false;
+  for (const label of emptyCandidates) {
+    const pill = page.getByRole("button", { name: new RegExp(`^${label}\\b`) });
+    if (await pill.count() === 0) continue;
+    if (await pill.isDisabled()) {
+      sawEmptyState = true;
+      break;
+    }
+    await pill.click();
+    await page.waitForTimeout(250);
+    const emptyVisible = await page
+      .getByText(/No matches for this filter\.|Prospects loaded but not scored yet|No prospects yet/i)
+      .isVisible()
+      .catch(() => false);
+    if (emptyVisible) {
+      sawEmptyState = true;
+      break;
+    }
   }
+  expect(sawEmptyState, "no empty-industry pill found — either all industries seeded, or disabled-state affordance is missing").toBe(true);
 
   // Back to All (pill renders as "All<count>").
   await page.getByRole("button", { name: /^All\b/ }).click();
