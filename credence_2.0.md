@@ -1,18 +1,36 @@
 ---
-name: graph chat pivot
-overview: "Pivot Credence into a LinkedIn-meets-Obsidian experience: a full-bleed force-directed network graph of People, Companies, and Locations as the new home, with an AI chat dock that drives the graph via tool-calls. Existing scoring (Authenticity/Authority/Warmth) becomes a node overlay (size/color), and clicking a person routes to the existing `/prospect/:id` page."
+name: graph chat pivot (v2 — replaces Discover)
+overview: "Pivot Credence into a LinkedIn-meets-Obsidian experience. The new Discover view is a full-page force-directed graph triangulating people across multiple node types (Person, Company, Role, City, Past employer, Partnership, School, Conference, Industry vertical). Three rails: left chat sidebar drives the graph via tool-calls; center is the canvas with edge-type filter pills + halo on selected + neighborhood fade; right is a node-aware inspector panel showing identity, sub-scores, and an evidence trail. Click a person -> still routes to `/prospect/:id` for the deep dive. Figma: https://www.figma.com/design/UTO07RPawGlBolyJrNUQb6"
 todos:
   - id: deps_env
     content: Add react-force-graph-2d + openai SDK; mirror ZAI_API_KEY/ZAI_BASE_URL as VITE_-prefixed in .env.local; update .env.example
     status: pending
+  - id: design_tokens
+    content: "Add CSS variables to src/index.css for new node-type colors (person, company, role, city, school, conference, industry) and edge-type colors (reports, employer, location, evidence, scope, partnership, past-employer, education, vertical) + score-strong/plausible/weak. Mirror the Figma `Credence Tokens` collection."
+    status: pending
+  - id: mock_enrichment
+    content: "Extend src/lib/mockStore.ts with seed data for past_employers, education, partnerships, conferences. New shapes derived (not separate tables): per-prospect `past_companies: string[]`, `education: {school, degree, year}[]`, `talks: {venue, year}[]`; per-company `partnerships: string[]`, `industry: string`. Bias toward 5–10 prospects so the graph is dense enough to demo."
+    status: pending
   - id: graph_lib
-    content: "Build src/lib/graph.ts: buildGraph(), inline COMPANY_META, types"
+    content: "Build src/lib/graph.ts: full type union (person | company | role | city | school | conference | industry) + edge kinds (works_at | colleague | located_in | reports_to | past_employer | partnership | education | scope_signal | vertical | evidence_cited). buildGraph() reads useProspects() + useScoresFor() + the new mock fields and emits {nodes, edges}. Inline COMPANY_META for HQ city/country and industry."
+    status: pending
+  - id: inspector_panel
+    content: "Build src/components/NodeInspector.tsx: right rail (~380w) with per-node-type variants. Person: identity card (avatar/name/role/company), score breakdown (4 sub-scores incl. confidence), evidence trail rows (type pill, source, quote, timestamp, confidence dot). Company: firmographics (size, stage, industry), ICP-fit/hiring-velocity/tech-maturity/org-density, evidence (Greenhouse, SEC, press, LinkedIn density). Role: definition + holders count + avg tenure + scope-signal evidence. City: candidate count + company count + avg score + density signals."
+    status: pending
+  - id: chat_sidebar
+    content: "Build src/components/GraphChat.tsx: left rail (~360w) with conversation history (user + assistant turns), hint chips (sample queries), pinned input bar at bottom. Renders tool-call traces inline above assistant text. Uses agent.ts."
     status: pending
   - id: agent_lib
-    content: "Build src/lib/agent.ts: OpenAI SDK pointed at Z.AI (glm-5.1) + 3 tools (focus_node, filter, explain) + tool loop"
+    content: "Build src/lib/agent.ts: OpenAI SDK pointed at Z.AI (glm-5.1) + tool loop. Tools: focus_node(query) -> sets selectedId; filter(criteria: {company?, role?, city?, industry?, edgeKinds?, minScore?}) -> sets visible-set; explain(id) -> returns rich data bundle for the inspector + lets the model write prose; expand_node(id) -> adds neighborhood to visible-set."
     status: pending
-  - id: graph_page
-    content: "Build src/pages/Graph.tsx: react-force-graph-2d + inline chat dock; useState for selected/filters; route in App.tsx; TopBar link"
+  - id: top_bar_filters
+    content: "Update src/components/TopBar.tsx: when on /discover, render edge-type filter pills (Reports, Employer, Location, Evidence, Scope, Partnership, Past empl., Education, Vertical) with color dots. Pills toggle visible edge kinds. Active state mirrors the Figma."
+    status: pending
+  - id: discover_replace
+    content: "Replace src/pages/Discover.tsx: full-page layout with TopBar + 3-column body (chat sidebar | graph canvas with subheader | inspector panel). useState for selectedId, edgeKindsVisible, filters, messages. Composes <GraphChat />, <ForceGraph2D />, <NodeInspector />. Subheader shows live stats (nodes/edges/candidates/selected) + legend + zoom controls."
+    status: pending
+  - id: integration_polish
+    content: "End-to-end wiring: chat tools mutate Discover.tsx state; node-click opens inspector with the right variant for that node type; halo + neighborhood-fade rendered via ForceGraph2D nodeCanvasObject; clicking a person inside the inspector still routes to /prospect/:id. Verify with `npm run lint` + `npm test` + manual run of `npm run dev`."
     status: pending
 isProject: false
 ---
