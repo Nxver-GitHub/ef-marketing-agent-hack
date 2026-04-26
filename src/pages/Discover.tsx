@@ -26,6 +26,7 @@ import { useProspects, useScoresFor, useSignalsForMany } from "@/lib/db";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import {
   buildGraph,
+  canonicalizeRole,
   type EdgeKind,
   type GraphNode,
   type NodeKind,
@@ -107,6 +108,69 @@ function linkEndpointId(end: string | number | FGNode | undefined): string | und
   if (typeof end === "string") return end;
   if (typeof end === "number") return String(end);
   return end.id as string | undefined;
+}
+
+// ─── Label helpers — Figma-style 2-line labels ───────────────────────────────
+// Each visible node gets a primary name (line 1) + a tiny uppercase tracked
+// sub-label (line 2). The sub-label is kind-aware:
+//   person     → abbreviated current title ("VP ENG", "STAFF ENG")
+//   company    → "INDUSTRY · CITY" when both resolve, else either alone
+//   role       → "ROLE"
+//   city       → country name (uppercased) — orients the metro inside a region
+//   school     → "SCHOOL"
+//   conference → "CONFERENCE · YYYY" when year is known
+//   industry   → "VERTICAL", or "ROOT" for the Technology anchor
+
+const ROLE_ABBREV: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\bvice\s+president\b/gi, "VP"],
+  [/\bsenior\b/gi, "Sr"],
+  [/\bprincipal\b/gi, "Principal"],
+  [/\bdirector\b/gi, "Dir"],
+  [/\bmanager\b/gi, "Mgr"],
+  [/\bsoftware\s+engineer\b/gi, "SWE"],
+  [/\bsoftware\s+engineering\b/gi, "Eng"],
+  [/\bengineering\b/gi, "Eng"],
+  [/\bengineer\b/gi, "Eng"],
+  [/\boperations\b/gi, "Ops"],
+  [/\bbusiness\s+development\b/gi, "BD"],
+];
+
+function abbreviateRole(canonical: string): string {
+  let s = canonicalizeRole(canonical);
+  for (const [re, rep] of ROLE_ABBREV) s = s.replace(re, rep);
+  s = s.replace(/\s+/g, " ").trim();
+  if (s.length > 16) s = `${s.slice(0, 15).trimEnd()}…`;
+  return s;
+}
+
+function subLabelFor(node: GraphNode, byId: Map<string, GraphNode>): string | null {
+  if (node.id === "industry:technology") return "ROOT";
+  switch (node.kind) {
+    case "person": {
+      if (!node.role) return null;
+      return abbreviateRole(node.role).toUpperCase();
+    }
+    case "company": {
+      const ind = node.industryId ? byId.get(node.industryId) : undefined;
+      const city = node.locationId ? byId.get(node.locationId) : undefined;
+      const indName = ind?.kind === "industry" ? ind.name : null;
+      const cityName = city?.kind === "city" ? city.name : null;
+      if (indName && cityName) return `${indName} · ${cityName}`.toUpperCase();
+      if (indName) return indName.toUpperCase();
+      if (cityName) return cityName.toUpperCase();
+      return null;
+    }
+    case "role":
+      return "ROLE";
+    case "city":
+      return (node.country ?? "CITY").toUpperCase();
+    case "school":
+      return "SCHOOL";
+    case "conference":
+      return node.year ? `CONFERENCE · ${node.year}` : "CONFERENCE";
+    case "industry":
+      return "VERTICAL";
+  }
 }
 
 // ─── Small per-node-kind shape painter ───────────────────────────────────────
@@ -230,6 +294,10 @@ const DEFAULT_EDGE_KINDS: EdgeKind[] = [
   "scope_signal",
   "partnership",
   "past_employer",
+  // vertical (industry rollup) is the largest single edge family — without it
+  // the "see structure" view degenerates to a sparse hub-and-spoke. On by
+  // default; user toggles off if it's too noisy.
+  "vertical",
 ];
 
 // Cap how many prospects we let into the force-directed canvas at the
@@ -309,6 +377,7 @@ const Discover = () => {
   // of state in case we later want "selection without re-focusing" (e.g.
   // hover-preview). For now, click = focus = select.
   const [selectedId, setSelectedId] = useState<string | null>(focusId);
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string> | null>(null);
   const [edgeKindsActive, setEdgeKindsActive] = useState<Set<EdgeKind>>(initialEdgeKinds);
 
@@ -467,15 +536,53 @@ const Discover = () => {
     return edges.filter((e) => visible.has(e.source) && visible.has(e.target));
   }, [focusId, edges, focalNodes]);
 
-  // Build the graphData ForceGraph2D consumes (nodes + links). When the
-  // focal subgraph changes (focusId click), graphData identity changes and
-  // ForceGraph2D re-runs the simulation from scratch — that's the
-  // "rearranging around the new universe" feel. `color` is pre-baked by
-  // buildGraph(); `width` is mutated in place on selection (see effect
-  // below) so the simulation doesn't reset on every selection click.
-  const graphData = useMemo(
-    () => ({
-      nodes: focalNodes as FGNode[],
+  // Build the graphData ForceGraph2D consumes (nodes + links).
+  //
+  // SMOOTHNESS — node-position persistence across focal swaps:
+  // When the user clicks a node, the focal subgraph rebuilds and ForceGraph
+  // would normally reset every node's position to random. That makes the
+  // graph "teleport" mid-click. Instead we snapshot positions from the
+  // previous render (d3 mutates x/y on the live node objects) and re-seed
+  // the new ones. Nodes that survive the swap keep their position; new
+  // entrants are spawned in a small ring around the focal node so they
+  // "expand outward" rather than scatter.
+  const prevGraphDataRef = useRef<{ nodes: FGNode[]; links: FGLink[] } | null>(null);
+  const graphData = useMemo(() => {
+    const cache = new Map<string, { x: number; y: number }>();
+    const prev = prevGraphDataRef.current;
+    if (prev) {
+      for (const n of prev.nodes) {
+        if (typeof n.x === "number" && typeof n.y === "number") {
+          cache.set(n.id as string, { x: n.x, y: n.y });
+        }
+      }
+    }
+    const focalPos = focusId ? (cache.get(focusId) ?? null) : null;
+
+    const seeded = focalNodes.map((n) => {
+      const c = cache.get(n.id);
+      if (c) {
+        // Survives the swap — keep the existing position so the user's eye
+        // tracks it through the rearrange.
+        return Object.assign({}, n, { x: c.x, y: c.y, vx: 0, vy: 0 }) as FGNode;
+      }
+      if (focalPos) {
+        // New entrant — seed in a small ring around the focal node so the
+        // expansion feels organic instead of teleporting in from nowhere.
+        const angle = Math.random() * Math.PI * 2;
+        const radius = 50 + Math.random() * 35;
+        return Object.assign({}, n, {
+          x: focalPos.x + Math.cos(angle) * radius,
+          y: focalPos.y + Math.sin(angle) * radius,
+          vx: 0,
+          vy: 0,
+        }) as FGNode;
+      }
+      return n as FGNode;
+    });
+
+    return {
+      nodes: seeded,
       links: focalEdges.map<FGLink>((e) => ({
         source: e.source,
         target: e.target,
@@ -484,9 +591,14 @@ const Discover = () => {
         color: e.color,
         width: 0.6,
       })),
-    }),
-    [focalNodes, focalEdges],
-  );
+    };
+  }, [focalNodes, focalEdges, focusId]);
+
+  // Keep the previous-graph ref in sync after each render, so the next
+  // graphData computation can read fresh positions from the live sim.
+  useEffect(() => {
+    prevGraphDataRef.current = graphData;
+  }, [graphData]);
 
   // Mutate link widths in place when selection changes. Avoids re-creating
   // graphData (which would reset the ForceGraph simulation).
@@ -518,6 +630,60 @@ const Discover = () => {
     return () => ro.disconnect();
   }, []);
 
+  // Spread the simulation a bit so sub-labels don't collide. ForceGraph
+  // recreates the d3 forces on every graphData identity change, so we apply
+  // these every time the focal subgraph swaps. Larger link.distance + a
+  // stronger negative charge gives each node a wider personal-space bubble.
+  useEffect(() => {
+    const fg = fgRef.current;
+    if (!fg) return;
+    const linkF = fg.d3Force("link") as unknown as
+      | { distance: (n: number) => unknown }
+      | undefined;
+    const chargeF = fg.d3Force("charge") as unknown as
+      | { strength: (n: number) => unknown }
+      | undefined;
+    linkF?.distance(55);
+    chargeF?.strength(-220);
+    fg.d3ReheatSimulation();
+  }, [graphData]);
+
+  // ── Floating selected-node tooltip card ────────────────────────────────
+  // Positioned absolutely over the canvas via a ref-only rAF loop so it
+  // tracks the focal node every frame without triggering React re-renders.
+  // The card itself stays mounted (opacity transitions handle visibility);
+  // only its transform updates each tick.
+  const tooltipDivRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!selectedId) return;
+    let raf = 0;
+    const tick = () => {
+      const fg = fgRef.current;
+      const div = tooltipDivRef.current;
+      if (!fg || !div) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      const focal = graphData.nodes.find(
+        (n) => n.id === selectedId,
+      ) as (FGNode & { x?: number; y?: number }) | undefined;
+      if (focal && typeof focal.x === "number" && typeof focal.y === "number") {
+        const fgWithCoords = fg as unknown as {
+          graph2ScreenCoords?: (x: number, y: number) => { x: number; y: number };
+        };
+        const screen = fgWithCoords.graph2ScreenCoords?.(focal.x, focal.y);
+        if (screen) {
+          // Centered horizontally on the node, sitting ~52px above it.
+          div.style.transform = `translate3d(${screen.x}px, ${screen.y - 52}px, 0) translate(-50%, -100%)`;
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [selectedId, graphData]);
+
+
   // ─── Engine-running flag — drives the warmup skeleton overlay (U4) ─────────
   const [engineRunning, setEngineRunning] = useState(true);
   useEffect(() => {
@@ -527,20 +693,18 @@ const Discover = () => {
     setEngineRunning(false);
     const fg = fgRef.current;
     if (!fg) return;
-    // If the user has drilled into a focal node, center the camera on it
-    // (now that the simulation has settled around the new local universe).
-    // Otherwise, frame the whole view.
+    // Longer camera animations than the previous 600ms — feels less abrupt.
     if (focusId) {
       const focal = focalNodes.find((n) => n.id === focusId) as
         | (GraphNode & { x?: number; y?: number })
         | undefined;
       if (focal && typeof focal.x === "number" && typeof focal.y === "number") {
-        fg.centerAt(focal.x, focal.y, 600);
-        fg.zoom(2.0, 600);
+        fg.centerAt(focal.x, focal.y, 900);
+        fg.zoom(2.0, 900);
         return;
       }
     }
-    fg.zoomToFit(400, 60);
+    fg.zoomToFit(700, 80);
   }, [focusId, focalNodes]);
 
   // ─── Agent context ─────────────────────────────────────────────────────────
@@ -575,6 +739,61 @@ const Discover = () => {
   }, [selectedNode, prospects]);
   const selectedScore = selectedProspect ? scores[selectedProspect._id] : undefined;
   const selectedSignals = selectedProspect ? signalsById[selectedProspect._id] : undefined;
+
+  // Tooltip body — kind-aware sub-line + optional score chip. Lives down
+  // here so it can read selectedScore (declared just above).
+  const tooltipMeta = useMemo<{
+    name: string;
+    sub: string;
+    score?: number;
+    accent: string;
+  } | null>(() => {
+    if (!selectedNode) return null;
+    const accent = nodeColorByKind[selectedNode.kind];
+    const name = selectedNode.name;
+    if (selectedNode.kind === "person") {
+      const role = selectedNode.role ? canonicalizeRole(selectedNode.role) : "";
+      const company = nodeById.get(selectedNode.companyId);
+      const companyName = company?.kind === "company" ? company.name : "";
+      const cityNode =
+        company?.kind === "company" && company.locationId
+          ? nodeById.get(company.locationId)
+          : undefined;
+      const cityName = cityNode?.kind === "city" ? cityNode.name : "";
+      const sub = [role, companyName, cityName].filter(Boolean).join(" · ");
+      return {
+        name,
+        sub: sub || "Person",
+        score: selectedScore?.overall_score,
+        accent,
+      };
+    }
+    if (selectedNode.kind === "company") {
+      const ind = selectedNode.industryId ? nodeById.get(selectedNode.industryId) : undefined;
+      const city = selectedNode.locationId ? nodeById.get(selectedNode.locationId) : undefined;
+      const indName = ind?.kind === "industry" ? ind.name : "";
+      const cityName = city?.kind === "city" ? city.name : "";
+      const sub = [indName, cityName].filter(Boolean).join(" · ") || "Company";
+      return { name, sub, accent };
+    }
+    if (selectedNode.kind === "role") return { name, sub: "Target role", accent };
+    if (selectedNode.kind === "city")
+      return { name, sub: selectedNode.country ?? "City", accent };
+    if (selectedNode.kind === "school") return { name, sub: "School", accent };
+    if (selectedNode.kind === "conference")
+      return {
+        name,
+        sub: selectedNode.year ? `Conference · ${selectedNode.year}` : "Conference",
+        accent,
+      };
+    if (selectedNode.kind === "industry")
+      return {
+        name,
+        sub: selectedNode.id === TECH_ROOT_ID ? "Root" : "Vertical",
+        accent,
+      };
+    return null;
+  }, [selectedNode, selectedScore, nodeColorByKind, nodeById]);
 
   // ─── Edge-kind toggle handler ──────────────────────────────────────────────
   const onToggleEdgeKind = useCallback(
@@ -621,14 +840,33 @@ const Discover = () => {
   // focus — the graph data swaps to its 1-hop universe, ForceGraph re-runs
   // the layout, and onEngineStop centers/zooms the camera once the new
   // arrangement settles. No back button by design: the user navigates
-  // forward by clicking, and the Technology root is always reachable as
-  // a "click home" anchor.
+  // forward by clicking.
+  //
+  // Special case: clicking the Technology root resets to the wide view
+  // (focusId = null) — that's the "go home" gesture. Drilling into
+  // Technology's 1-hop neighborhood is just industries + cities, which is
+  // a uselessly sparse hub-and-spoke. Wide view gives the rich web.
   const onNodeClickStable = useCallback((node: FGNode) => {
     const id = node.id as string;
+    if (id === TECH_ROOT_ID) {
+      setFocusId(null);
+      setSelectedId(null);
+      setHoveredId(null);
+      setEngineRunning(true);
+      return;
+    }
     setFocusId(id);
     setSelectedId(id);
+    setHoveredId(null);
     setEngineRunning(true);
   }, []);
+  const onNodeHoverStable = useCallback((node: FGNode | null) => {
+    setHoveredId(node ? (node.id as string) : null);
+  }, []);
+  const nodeLabelStable = useCallback(
+    (node: FGNode) => (node as unknown as GraphNode).name,
+    [],
+  );
   // Background click is a no-op — preserves the current focal universe.
   // Resetting to the wide view is intentional here: the user clicks the
   // Technology root (always present in the focal subgraph) to "go home".
@@ -667,6 +905,19 @@ const Discover = () => {
       ctx2d.save();
       ctx2d.globalAlpha = alpha;
 
+      // Hover ring — drawn before the selected halo so a hovered-but-
+      // not-selected node still gets feedback. Skip when the node is
+      // selected (the halo below is more prominent).
+      if (gn.id === hoveredId && !isSelected) {
+        ctx2d.beginPath();
+        ctx2d.arc(x, y, r + 3, 0, Math.PI * 2);
+        ctx2d.strokeStyle = nodeColorByKind[gn.kind];
+        ctx2d.lineWidth = 1;
+        ctx2d.globalAlpha = alpha * 0.45;
+        ctx2d.stroke();
+        ctx2d.globalAlpha = alpha;
+      }
+
       // Selected halo
       if (isSelected) {
         ctx2d.beginPath();
@@ -698,36 +949,57 @@ const Discover = () => {
             : gn.kind === "company" || gn.kind === "role"
               ? 9
               : 8;
-        // Use Inter (self-hosted via @fontsource) so canvas labels match
-        // the rest of the UI, with weight bumped on selected/root for hub
-        // emphasis and slight negative tracking for an editorial feel.
         const weight = isRoot ? 600 : isSelected ? 600 : isAnchor ? 500 : 400;
-        ctx2d.font = `${weight} ${labelPx / globalScale}px Inter, ui-sans-serif, system-ui, sans-serif`;
-        // Modern Chrome / Safari respect this; older engines just ignore.
-        // -1.5% tightens long labels (industry / role names) without
-        // overcrowding short ones.
-        (ctx2d as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing = "-0.015em";
-        ctx2d.textAlign = "center";
-        ctx2d.textBaseline = "top";
-        const fill = isRoot || isSelected || isAnchor ? labelStrong : labelMuted;
-        // Halo: stroke the text in the bg color before filling, so labels
-        // stay readable against any cluster of edges crossing them.
-        ctx2d.lineWidth = 4 / globalScale;
-        ctx2d.strokeStyle = labelHalo;
+        const labelY = y + r + 3;
+
+        // Common stroke setup — used to halo both the main label and the
+        // sub-label so each line stays readable against busy edges.
         ctx2d.lineJoin = "round";
         ctx2d.miterLimit = 2;
-        ctx2d.strokeText(gn.name, x, y + r + 2);
-        ctx2d.fillStyle = fill;
-        ctx2d.fillText(gn.name, x, y + r + 2);
+        ctx2d.lineWidth = 5 / globalScale;
+        ctx2d.strokeStyle = labelHalo;
+        ctx2d.textAlign = "center";
+
+        // ── Main label (line 1) ────────────────────────────────────────
+        ctx2d.font = `${weight} ${labelPx / globalScale}px Inter, ui-sans-serif, system-ui, sans-serif`;
+        // Modern Chrome / Safari respect this; older engines just ignore.
+        (ctx2d as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing =
+          "-0.015em";
+        ctx2d.textBaseline = "top";
+        const mainFill = isRoot || isSelected || isAnchor ? labelStrong : labelMuted;
+        ctx2d.strokeText(gn.name, x, labelY);
+        ctx2d.fillStyle = mainFill;
+        ctx2d.fillText(gn.name, x, labelY);
+
+        // ── Sub-label (line 2) — kind-aware tracked uppercase ──────────
+        // Skip on schools/conferences when zoomed out (low value, more
+        // chance of overlap). Always show for the focal node + anchors.
+        const showSub = isAnchor || isSelected || isNeighbor || zoomedIn;
+        if (showSub) {
+          const sub = subLabelFor(gn, nodeById);
+          if (sub) {
+            const subPx = Math.max(6.5, labelPx - 3);
+            ctx2d.font = `500 ${subPx / globalScale}px Inter, ui-sans-serif, system-ui, sans-serif`;
+            (ctx2d as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing =
+              "0.06em"; // tracked uppercase reads cleaner with positive spacing
+            ctx2d.lineWidth = 4 / globalScale;
+            const subY = labelY + (labelPx + 1) / globalScale;
+            ctx2d.strokeText(sub, x, subY);
+            ctx2d.fillStyle = labelMuted;
+            ctx2d.fillText(sub, x, subY);
+          }
+        }
       }
 
       ctx2d.restore();
     },
     [
       selectedId,
+      hoveredId,
       visibleNodeIds,
       neighborByNode,
       nodeColorByKind,
+      nodeById,
       labelStrong,
       labelMuted,
       labelHalo,
@@ -748,18 +1020,21 @@ const Discover = () => {
 
         {/* Center: subheader + canvas */}
         <div className="flex-1 min-w-0 flex flex-col">
-          {/* Subheader: stats row */}
+          {/* Subheader: stats row — counts reflect what's actually painted
+              (the focal subgraph when drilled in, the wide rendered set
+              otherwise). Total prospect pool is also surfaced so the
+              top-N truncation is honest. */}
           <div className="flex items-center justify-between gap-4 border-b border-border px-5 py-3">
             <div className="flex items-center gap-5 text-[11px] text-muted-foreground text-mono">
               <span>
-                <span className="text-foreground">{nodes.length}</span> nodes
+                <span className="text-foreground">{focalNodes.length}</span> nodes
               </span>
               <span>
-                <span className="text-foreground">{edges.length}</span> edges
+                <span className="text-foreground">{focalEdges.length}</span> edges
               </span>
               <span>
                 <span className="text-foreground">
-                  {nodes.filter((n) => n.kind === "person").length}
+                  {focalNodes.filter((n) => n.kind === "person").length}
                 </span>{" "}
                 {allProspects.length > MAX_PROSPECTS_RENDERED
                   ? `of ${allProspects.length} candidates (top by score)`
@@ -872,11 +1147,18 @@ const Discover = () => {
                   // Pure organic force-directed (Obsidian-style). DAG mode
                   // collapses every level into a horizontal stripe with this
                   // many nodes — wrong shape for what we want.
-                  cooldownTime={1500}
-                  cooldownTicks={90}
-                  warmupTicks={20}
-                  d3AlphaDecay={0.045}
-                  d3VelocityDecay={0.32}
+                  // Smoother cool-down: longer warmup with slower velocity
+                  // decay so motion fades instead of slamming to a halt.
+                  cooldownTime={2000}
+                  cooldownTicks={110}
+                  warmupTicks={30}
+                  d3AlphaDecay={0.035}
+                  d3VelocityDecay={0.22}
+                  // Curved edges — subtle arc gives the canvas a spider-web
+                  // feel instead of the rigid hub-and-spoke that straight
+                  // lines produce. 0.18 is light enough that short edges
+                  // still read as direct.
+                  linkCurvature={0.18}
                   linkDirectionalParticles={0}
                   backgroundColor="transparent"
                   linkColor="color"
@@ -884,18 +1166,23 @@ const Discover = () => {
                   linkVisibility={linkVisibility}
                   nodeVisibility={nodeVisibility}
                   onNodeClick={onNodeClickStable}
+                  onNodeHover={onNodeHoverStable}
                   onBackgroundClick={onBackgroundClickStable}
                   onEngineStop={onEngineStop}
+                  nodeLabel={nodeLabelStable}
                   nodeCanvasObject={nodeCanvasObject}
                 />
               )
             )}
-            {/* U4 — warmup skeleton overlay while the simulation cools down. */}
-            {!isEmpty && engineRunning && (
+            {/* U4 — warmup overlay. Crossfaded via opacity transition so it
+                doesn't pop in/out on every focal swap. */}
+            {!isEmpty && (
               <div
-                className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/60 backdrop-blur-[1px]"
+                className={`pointer-events-none absolute inset-0 flex items-center justify-center bg-background/60 backdrop-blur-[1px] transition-opacity duration-300 ${
+                  engineRunning ? "opacity-100" : "opacity-0"
+                }`}
                 aria-live="polite"
-                aria-busy="true"
+                aria-busy={engineRunning}
               >
                 <div className="flex flex-col items-center gap-2">
                   <div className="h-3 w-3 rounded-full bg-foreground/30 animate-pulse" />
@@ -905,6 +1192,52 @@ const Discover = () => {
                 </div>
               </div>
             )}
+
+            {/* Floating selected-node tooltip card. Position is updated on
+                every frame via the rAF loop above (writes directly to
+                style.transform — no React re-renders). The card itself
+                stays mounted; opacity flips on selection. */}
+            <div
+              ref={tooltipDivRef}
+              className={`pointer-events-none absolute left-0 top-0 z-20 transition-opacity duration-200 ${
+                tooltipMeta ? "opacity-100" : "opacity-0"
+              }`}
+              role="status"
+              aria-live="polite"
+            >
+              {tooltipMeta && (
+                <div className="relative flex items-center gap-3 rounded-lg bg-foreground/95 px-3 py-2 text-background shadow-xl backdrop-blur-sm">
+                  <span
+                    className="block h-2 w-2 shrink-0 rounded-full"
+                    style={{ background: tooltipMeta.accent }}
+                  />
+                  <div className="flex flex-col gap-0.5 min-w-0">
+                    <div className="text-[12px] font-semibold leading-tight whitespace-nowrap">
+                      {tooltipMeta.name}
+                    </div>
+                    <div className="text-[10px] leading-tight opacity-75 whitespace-nowrap">
+                      {tooltipMeta.sub}
+                    </div>
+                  </div>
+                  {typeof tooltipMeta.score === "number" && (
+                    <div className="ml-1 flex items-center gap-1">
+                      <div className="h-3 w-px bg-background/30" />
+                      <div className="text-[12px] font-semibold tabular-nums leading-tight">
+                        {Math.round(tooltipMeta.score)}
+                      </div>
+                      <div className="text-[8px] uppercase tracking-[0.16em] opacity-60 leading-tight">
+                        / 100
+                      </div>
+                    </div>
+                  )}
+                  {/* Pointer arrow at the bottom */}
+                  <div
+                    className="absolute left-1/2 top-full h-2 w-2 -translate-x-1/2 -translate-y-1 rotate-45 bg-foreground/95"
+                    aria-hidden="true"
+                  />
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
