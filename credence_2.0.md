@@ -9,8 +9,8 @@ todos:
     content: "Add CSS variables to src/index.css for new node-type colors (person, company, role, city, school, conference, industry) and edge-type colors (reports, employer, location, evidence, scope, partnership, past-employer, education, vertical) + score-strong/plausible/weak. Mirror the Figma `Credence Tokens` collection."
     status: pending
   - id: mock_enrichment
-    content: "Extend src/lib/mockStore.ts with seed data for past_employers, education, partnerships, conferences. New shapes derived (not separate tables): per-prospect `past_companies: string[]`, `education: {school, degree, year}[]`, `talks: {venue, year}[]`; per-company `partnerships: string[]`, `industry: string`. Bias toward 5–10 prospects so the graph is dense enough to demo."
-    status: pending
+    content: "Extend src/lib/mockStore.ts with seed data for past_employers, education, partnerships, conferences. New shapes derived (not separate tables): per-prospect `past_companies: string[]`, `education: {school, degree, year}[]`, `talks: {venue, year}[]`; per-company `partnerships: string[]`, `industry: string`. Bias toward 5–10 prospects so the graph is dense enough to demo. (Done in 00d156d — Prospect type + 5 seeded demos with past_companies/education/talks. Per-company partnerships still derived in COMPANY_META in graph.ts.)"
+    status: completed
   - id: graph_lib
     content: "Build src/lib/graph.ts: full type union (person | company | role | city | school | conference | industry) + edge kinds (works_at | colleague | located_in | reports_to | past_employer | partnership | education | scope_signal | vertical | evidence_cited). buildGraph() reads useProspects() + useScoresFor() + the new mock fields and emits {nodes, edges}. Inline COMPANY_META for HQ city/country and industry."
     status: pending
