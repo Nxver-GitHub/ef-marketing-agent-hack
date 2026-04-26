@@ -1,11 +1,16 @@
 import { useState } from "react";
+import { toast } from "sonner";
 import { PageShell } from "@/components/PageShell";
 import { useWeights, useProspects, db } from "@/lib/db";
+import { useDocumentTitle } from "@/lib/useDocumentTitle";
 
 const Settings = () => {
+  useDocumentTitle("Settings");
   const weights = useWeights();
   const prospects = useProspects();
   const [draft, setDraft] = useState<Record<string, [number, number, number]>>({});
+  const [saving, setSaving] = useState(false);
+  const dirty = Object.keys(draft).length;
 
   const get = (signal_type: string, idx: 0 | 1 | 2, fallback: number) =>
     draft[signal_type]?.[idx] ?? fallback;
@@ -22,11 +27,24 @@ const Settings = () => {
   };
 
   const save = async () => {
-    for (const [signal_type, vals] of Object.entries(draft)) {
-      await db.upsertWeight(signal_type, vals[0], vals[1], vals[2]);
+    if (!dirty || saving) return;
+    setSaving(true);
+    const changed = Object.keys(draft).length;
+    try {
+      for (const [signal_type, vals] of Object.entries(draft)) {
+        await db.upsertWeight(signal_type, vals[0], vals[1], vals[2]);
+      }
+      await db.computeScores(prospects.map((p) => p._id));
+      setDraft({});
+      toast.success(
+        `Saved ${changed} weight${changed === 1 ? "" : "s"} — recomputed ${prospects.length} prospect${prospects.length === 1 ? "" : "s"}.`,
+      );
+    } catch (err) {
+      console.error("[Settings] save failed:", err);
+      toast.error("Couldn't save weights. Check console for details.");
+    } finally {
+      setSaving(false);
     }
-    await db.computeScores(prospects.map((p) => p._id));
-    setDraft({});
   };
 
   return (
@@ -41,13 +59,25 @@ const Settings = () => {
             Tune how each signal contributes to the three sub-scores. Saving recomputes every
             prospect immediately. Scoring code never hardcodes weights — they live here.
           </p>
-          <button
-            onClick={save}
-            disabled={Object.keys(draft).length === 0}
-            className="border border-foreground bg-foreground text-background px-5 py-2.5 text-xs uppercase tracking-[0.16em] disabled:opacity-30 disabled:cursor-not-allowed"
-          >
-            Save & recompute
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={save}
+              disabled={!dirty || saving}
+              aria-busy={saving}
+              className="border border-foreground bg-foreground text-background px-5 py-2.5 text-xs uppercase tracking-[0.16em] disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              {saving
+                ? "Saving…"
+                : dirty
+                  ? `Save & recompute · ${dirty}`
+                  : "No changes"}
+            </button>
+            {dirty > 0 && !saving && (
+              <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+                {dirty} unsaved
+              </span>
+            )}
+          </div>
         </div>
 
         <div className="md:col-span-8">

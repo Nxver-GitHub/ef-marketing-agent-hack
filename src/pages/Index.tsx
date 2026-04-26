@@ -4,8 +4,10 @@ import { HeroMark } from "@/components/HeroMark";
 import { useProspects, useScoresFor } from "@/lib/db";
 import { useMemo } from "react";
 import { scoreColor } from "@/components/ScoreBar";
+import { useDocumentTitle } from "@/lib/useDocumentTitle";
 
 const Index = () => {
+  useDocumentTitle(null);
   const prospects = useProspects();
   const scores = useScoresFor(prospects.map((p) => p._id));
   const scored = useMemo(() => prospects.filter((p) => scores[p._id]), [prospects, scores]);
@@ -14,7 +16,7 @@ const Index = () => {
     : null;
 
   return (
-    <PageShell rightSlot={<div className="text-mono text-[10px] text-muted-foreground">v0.1 — hackathon build</div>}>
+    <PageShell rightSlot={import.meta.env.DEV ? <div className="text-mono text-[10px] text-muted-foreground">v0.1 — hackathon build</div> : undefined}>
       <div className="grid md:grid-cols-12 gap-10 min-h-[70vh]">
         <div className="md:col-span-7 flex flex-col justify-between">
           <HeroMark className="w-full max-w-[640px]" />
@@ -22,12 +24,12 @@ const Index = () => {
             <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground mb-3">
               (Working Worldwide)
             </p>
-            <h1 className="text-4xl md:text-6xl font-light leading-[1.05] tracking-tight">
-              Credence<sup className="text-xs ml-1 align-super">®</sup> is a
-              <br />
-              trust-and-fit scoring tool
-              <br />
-              for B2B prospects.
+            <h1
+              className="text-4xl md:text-6xl font-light leading-[1.05] tracking-tight"
+              style={{ textWrap: "balance" } as React.CSSProperties}
+            >
+              Credence<sup className="text-xs ml-1 align-super">®</sup> is a trust-and-fit
+              scoring tool for B2B prospects.
             </h1>
           </div>
         </div>

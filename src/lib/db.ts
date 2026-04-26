@@ -8,7 +8,8 @@
  * All exported hooks expose the same shape as mockStore so pages import from
  * here and never need to branch themselves.
  */
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase, HAS_REAL_SUPABASE } from "./supabase";
 import {
   store,
@@ -49,6 +50,11 @@ const toRun = (r: any) => ({
   completed_at: r.completed_at ? +new Date(r.completed_at) : undefined,
 });
 
+// Stable empty references so consumers using `useMemo`/`useEffect` deps don't
+// re-trigger when react-query is still loading.
+const EMPTY_ARRAY: any[] = Object.freeze([]) as any[];
+const EMPTY_RECORD: Record<string, any> = Object.freeze({}) as Record<string, any>;
+
 // ─── Supabase hooks ───────────────────────────────────────────────────────────
 
 // Supabase's REST endpoint defaults to a max of 1000 rows per request. Page
@@ -71,76 +77,105 @@ async function fetchAllRows<T = any>(
   return all;
 }
 
+// All bulk Supabase queries share these defaults so multiple consumers of the
+// same data hit a single in-memory cache instead of refetching independently.
+// staleTime: pages won't refetch on remount within 5 min — kills the
+// fan-out where /, /discover, /settings each paginated `prospects`/`scores`
+// 11–21 times per load.
+const BULK_STALE_MS = 5 * 60 * 1000;
+
 function useSupaProspects() {
-  const [data, setData] = useState<any[]>([]);
-  useEffect(() => {
-    fetchAllRows<any>(() =>
-      supabase!
-        .from("prospects")
-        .select("*")
-        .order("created_at", { ascending: false }),
-    ).then((rows) => setData(rows.map(toP)));
-  }, []);
-  return data;
+  const { data } = useQuery({
+    queryKey: ["prospects"],
+    enabled: HAS_REAL_SUPABASE,
+    staleTime: BULK_STALE_MS,
+    queryFn: async () => {
+      const rows = await fetchAllRows<any>(() =>
+        supabase!
+          .from("prospects")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .order("id", { ascending: true }),
+      );
+      // Dedup by id: offset-pagination can return a boundary row on both
+      // page N and N+1 when many rows share the same created_at.
+      const seen = new Set<string>();
+      const unique: any[] = [];
+      for (const r of rows) {
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        unique.push(r);
+      }
+      return unique.map(toP);
+    },
+  });
+  return data ?? EMPTY_ARRAY;
 }
 
 function useSupaProspect(id?: string) {
-  const [data, setData] = useState<any | null>(null);
-  useEffect(() => {
-    if (!id) return;
-    supabase!
-      .from("prospects")
-      .select("*")
-      .eq("id", id)
-      .single()
-      .then(({ data: row }) => row && setData(toP(row)));
-  }, [id]);
-  return data;
+  const { data } = useQuery({
+    queryKey: ["prospect", id],
+    enabled: HAS_REAL_SUPABASE && !!id,
+    staleTime: BULK_STALE_MS,
+    queryFn: async () => {
+      const { data: row } = await supabase!
+        .from("prospects")
+        .select("*")
+        .eq("id", id!)
+        .single();
+      return row ? toP(row) : null;
+    },
+  });
+  return data ?? null;
 }
 
 function useSupaSignalsFor(id?: string) {
-  const [data, setData] = useState<any[]>([]);
-  useEffect(() => {
-    if (!id) return;
-    supabase!
-      .from("signals")
-      .select("*")
-      .eq("prospect_id", id)
-      .then(({ data: rows }) => rows && setData(rows.map(toSig)));
-  }, [id]);
-  return data;
-}
-
-// Bulk variant for Discover: fetch all signals once (paginated) and group by
-// prospect_id client-side. Same reasoning as `useSupaScoresFor` — a PostgREST
-// `.in("prospect_id", ids)` with hundreds of UUIDs exceeds the gateway URL cap.
-function useSupaSignalsForMany(ids: string[]) {
-  const [data, setData] = useState<Record<string, any[]>>({});
-  const key = ids.length ? `${ids.length}` : "";
-  useEffect(() => {
-    if (!ids.length) return;
-    let cancelled = false;
-    fetchAllRows<any>(() =>
-      supabase!
+  const { data } = useQuery({
+    queryKey: ["signals", id],
+    enabled: HAS_REAL_SUPABASE && !!id,
+    staleTime: BULK_STALE_MS,
+    queryFn: async () => {
+      const { data: rows } = await supabase!
         .from("signals")
         .select("*")
-        .order("collected_at", { ascending: false }),
-    ).then((rows) => {
-      if (cancelled) return;
-      const wanted = new Set(ids);
-      const out: Record<string, any[]> = {};
-      for (const r of rows) {
-        if (!wanted.has(r.prospect_id)) continue;
-        (out[r.prospect_id] ??= []).push(toSig(r));
-      }
-      setData(out);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
-  return data;
+        .eq("prospect_id", id!);
+      return rows ? rows.map(toSig) : [];
+    },
+  });
+  return data ?? EMPTY_ARRAY;
+}
+
+// Shared full-table fetch — every `useSupaSignalsForMany(ids)` consumer reads
+// from this single cached result and just re-derives the per-id grouping
+// in memory. Previously each consumer paginated the entire signals table.
+function useAllSignalsCached() {
+  const { data } = useQuery({
+    queryKey: ["signals", "all"],
+    enabled: HAS_REAL_SUPABASE,
+    staleTime: BULK_STALE_MS,
+    queryFn: () =>
+      fetchAllRows<any>(() =>
+        supabase!
+          .from("signals")
+          .select("*")
+          .order("collected_at", { ascending: false }),
+      ),
+  });
+  return data ?? EMPTY_ARRAY;
+}
+
+function useSupaSignalsForMany(ids: string[]) {
+  const rows = useAllSignalsCached();
+  return useMemo(() => {
+    if (!ids.length) return EMPTY_RECORD;
+    const wanted = new Set(ids);
+    const out: Record<string, any[]> = {};
+    for (const r of rows) {
+      if (!wanted.has(r.prospect_id)) continue;
+      (out[r.prospect_id] ??= []).push(toSig(r));
+    }
+    return out;
+  }, [ids, rows]);
 }
 
 // Mock fallback: group whatever the in-memory store has by prospect_id.
@@ -157,20 +192,41 @@ function mockSignalsForMany(ids: string[]) {
   return data;
 }
 
+// Preference order when multiple scorer variants have written rows for the
+// same prospect. Higher tier wins regardless of `computed_at`.
+const MODEL_PRECEDENCE: Record<string, number> = {
+  chartreuse_llm_v1: 1,
+  chartreuse_deterministic_v1: 2,
+  lightweight_v1: 3,
+};
+const pickBestScoreRow = (rows: any[]): any | null => {
+  if (!rows?.length) return null;
+  const sorted = [...rows].sort((a, b) => {
+    const ta = MODEL_PRECEDENCE[a.model_version] ?? 9;
+    const tb = MODEL_PRECEDENCE[b.model_version] ?? 9;
+    if (ta !== tb) return ta - tb;
+    // same tier → newest first
+    return +new Date(b.computed_at) - +new Date(a.computed_at);
+  });
+  return sorted[0];
+};
+
 function useSupaLatestScore(id?: string) {
   const [data, setData] = useState<any | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetch = useCallback(async () => {
     if (!id) return false;
+    // Pull every score row for this prospect; the in-memory ranker gives us
+    // LLM > deterministic > lightweight precedence without a second query.
     const { data: rows } = await supabase!
       .from("scores")
       .select("*")
       .eq("prospect_id", id)
-      .order("computed_at", { ascending: false })
-      .limit(1);
-    if (rows?.length) {
-      setData(toScore(rows[0]));
+      .order("computed_at", { ascending: false });
+    const best = pickBestScoreRow(rows ?? []);
+    if (best) {
+      setData(toScore(best));
       return true;
     }
     return false;
@@ -239,51 +295,52 @@ function useSupaLatestRun(id?: string) {
 }
 
 function useSupaWeights() {
-  const [data, setData] = useState<any[]>([]);
-  useEffect(() => {
-    supabase!
-      .from("signal_weights")
-      .select("*")
-      .then(({ data: rows }) => rows && setData(rows.map(toWeight)));
-  }, []);
-  return data;
+  const { data } = useQuery({
+    queryKey: ["weights"],
+    enabled: HAS_REAL_SUPABASE,
+    staleTime: BULK_STALE_MS,
+    queryFn: async () => {
+      const { data: rows } = await supabase!.from("signal_weights").select("*");
+      return rows ? rows.map(toWeight) : [];
+    },
+  });
+  return data ?? EMPTY_ARRAY;
+}
+
+// Shared full-table scores cache. Same pattern as useAllSignalsCached.
+function useAllScoresCached() {
+  const { data } = useQuery({
+    queryKey: ["scores", "all"],
+    enabled: HAS_REAL_SUPABASE,
+    staleTime: BULK_STALE_MS,
+    queryFn: () =>
+      fetchAllRows<any>(() =>
+        supabase!
+          .from("scores")
+          .select("*")
+          .order("computed_at", { ascending: false }),
+      ),
+  });
+  return data ?? EMPTY_ARRAY;
 }
 
 function useSupaScoresFor(ids: string[]) {
-  const [data, setData] = useState<Record<string, any>>({});
-  // Only re-fetch when the *set* of ids changes meaningfully. We key on length +
-  // a stable-sorted hash so reordering doesn't thrash the effect.
-  const key = ids.length ? `${ids.length}` : "";
-  useEffect(() => {
-    if (!ids.length) return;
-    let cancelled = false;
-    // A PostgREST `.in("prospect_id", ids)` with hundreds of UUIDs produces a
-    // URL longer than the gateway's max length (~16 KB at Cloudflare) and
-    // returns HTTP 400. We also can't rely on `.limit()`: default page size
-    // is 1000, but there can be multiple scores per prospect. So: page through
-    // the scores table in full, ordered newest-first, and keep the first score
-    // we see per prospect_id.
-    fetchAllRows<any>(() =>
-      supabase!
-        .from("scores")
-        .select("*")
-        .order("computed_at", { ascending: false }),
-    ).then((rows) => {
-      if (cancelled) return;
-      const wanted = new Set(ids);
-      const out: Record<string, any> = {};
-      for (const r of rows) {
-        if (!wanted.has(r.prospect_id)) continue;
-        if (!out[r.prospect_id]) out[r.prospect_id] = toScore(r);
-      }
-      setData(out);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
-  return data;
+  const rows = useAllScoresCached();
+  return useMemo(() => {
+    if (!ids.length) return EMPTY_RECORD;
+    const wanted = new Set(ids);
+    const grouped: Record<string, any[]> = {};
+    for (const r of rows) {
+      if (!wanted.has(r.prospect_id)) continue;
+      (grouped[r.prospect_id] ??= []).push(r);
+    }
+    const out: Record<string, any> = {};
+    for (const [pid, list] of Object.entries(grouped)) {
+      const best = pickBestScoreRow(list);
+      if (best) out[pid] = toScore(best);
+    }
+    return out;
+  }, [ids, rows]);
 }
 
 // ─── Supabase mutations ───────────────────────────────────────────────────────
