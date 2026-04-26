@@ -70,6 +70,20 @@ interface ChatResponse {
  * Mirror server tool results into the page's view state. Skips silently when
  * the result shape isn't recognized (defensive — server can change).
  */
+// Bridge server-side ids → graph-builder ids. The two systems disagree on
+// prefix conventions:
+//   server:   <uuid>           graph:  person:<uuid>
+//   server:   co:nvidia        graph:  company:nvidia
+//   server:   in:semiconductors graph: industry:semiconductors
+// Translating here keeps the rest of the agent stupid about it.
+function toGraphId(id: string, kind?: string): string {
+  if (!id) return id;
+  if (kind === "person") return id.startsWith("person:") ? id : `person:${id}`;
+  if (id.startsWith("co:")) return `company:${id.slice(3)}`;
+  if (id.startsWith("in:")) return `industry:${id.slice(3)}`;
+  return id;
+}
+
 function applyToolResult(tr: ServerToolResult, ctx: AgentContext): void {
   const r = tr.result;
 
@@ -79,10 +93,14 @@ function applyToolResult(tr: ServerToolResult, ctx: AgentContext): void {
       const arr = r.results as { id?: string; kind?: string }[] | undefined;
       const top = arr?.[0];
       if (top?.id) {
-        // Server may return synthetic ids (e.g. "co:nvidia"); only select if
-        // the id exists in the current graph snapshot.
-        if (ctx.nodes.some((n) => n.id === top.id)) {
-          ctx.setSelectedId(top.id);
+        const graphId = toGraphId(top.id, top.kind);
+        ctx.setSelectedId(graphId);
+        // Also promote the focused node into the rendered subgraph so an
+        // out-of-top-N person becomes visible on the canvas. Person ids only:
+        // company / industry hubs are derived from rendered prospects, so
+        // narrowing to a single hub would erase the rest of the world.
+        if (top.kind === "person") {
+          ctx.setVisibleNodeIds(new Set([graphId]));
         }
       }
       break;
@@ -92,26 +110,40 @@ function applyToolResult(tr: ServerToolResult, ctx: AgentContext): void {
       const arr = r.prospects as { id?: string }[] | undefined;
       if (arr) {
         const ids = new Set<string>();
-        for (const p of arr) if (p.id) ids.add(p.id);
+        for (const p of arr) if (p.id) ids.add(toGraphId(p.id, "person"));
         if (ids.size > 0) ctx.setVisibleNodeIds(ids);
       }
       break;
     }
     case "expand_node": {
-      // result: { center: { id, ... }, neighbors: [{ id, ... }] }
-      const center = r.center as { id?: string } | undefined;
-      const neighbors = r.neighbors as { id?: string }[] | undefined;
+      // result: { center: { id, kind, ... }, neighbors: [{ id, kind, ... }] }
+      const center = r.center as { id?: string; kind?: string } | undefined;
+      const neighbors = r.neighbors as { id?: string; kind?: string }[] | undefined;
       if (neighbors) {
         const ids = new Set<string>();
-        if (center?.id) ids.add(center.id);
-        for (const n of neighbors) if (n.id) ids.add(n.id);
+        if (center?.id) ids.add(toGraphId(center.id, center.kind ?? "person"));
+        for (const n of neighbors) {
+          if (n.id) ids.add(toGraphId(n.id, n.kind ?? "person"));
+        }
         if (ids.size > 0) ctx.setVisibleNodeIds(ids);
       }
       break;
     }
-    case "explain":
-      // explain doesn't mutate UI directly — the prose answer carries the info.
+    case "explain": {
+      // result: { node: { id, kind, ... } }. The prose carries the detail,
+      // but selecting the node opens the right-rail inspector with full
+      // sub-scores + signals — strictly additive to the chat answer.
+      const node = r.node as { id?: string; kind?: string } | undefined;
+      if (node?.id) {
+        const graphId = toGraphId(node.id, node.kind ?? "person");
+        ctx.setSelectedId(graphId);
+        // Promote into the rendered set (mirror of focus_node — see above).
+        if ((node.kind ?? "person") === "person") {
+          ctx.setVisibleNodeIds(new Set([graphId]));
+        }
+      }
       break;
+    }
   }
 }
 

@@ -285,10 +285,60 @@ const Discover = () => {
   const allProspects = useProspects();
   const allProspectIds = useMemo(() => allProspects.map((p) => p._id), [allProspects]);
   const scores = useScoresFor(allProspectIds);
-  // Render only the top-N by overall_score. Stable sort: ties resolved by
-  // insertion order. The agent context below still receives the full
-  // nodes/edges so `filter` / `focus_node` retain full recall.
+
+  // ─── URL-synced view state — hoisted so `prospects` below can react to
+  //     chat-driven selection / filtering. (Originally lived further down.) ──
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialEdgeKinds = useMemo(
+    () =>
+      decodeEdgeKinds(searchParams.get("edges")) ??
+      new Set<EdgeKind>(DEFAULT_EDGE_KINDS),
+    // Read once on mount; subsequent state mutations push back to the URL
+    // via the effect below. Including searchParams here would create a loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+  // `focusId` is the current "you are here" — clicking any node makes it the
+  // new focus and the graph re-flows around it. There's no back button by
+  // design (Obsidian-style endless traversal), but the Technology root is
+  // always present in every focal subgraph as a click-to-home anchor.
+  const [focusId, setFocusId] = useState<string | null>(
+    () => searchParams.get("focus") ?? searchParams.get("selected"),
+  );
+  // selectedId mirrors focusId for inspector wiring. Kept as its own piece
+  // of state in case we later want "selection without re-focusing" (e.g.
+  // hover-preview). For now, click = focus = select.
+  const [selectedId, setSelectedId] = useState<string | null>(focusId);
+  const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string> | null>(null);
+  const [edgeKindsActive, setEdgeKindsActive] = useState<Set<EdgeKind>>(initialEdgeKinds);
+
+  // Render top-N by overall_score by default. When the chat copilot has
+  // narrowed the world via `filter` / `focus_node` / `explain` /
+  // `expand_node` (signalled by visibleNodeIds being non-null), render
+  // exactly those prospects instead — regardless of where they sit in the
+  // score distribution. Without this, "MIT engineers" with overall_score=0
+  // returned 6 hits but the canvas kept painting the unrelated top-120
+  // because none of the 6 were in the rendered slice.
+  //
+  // We deliberately do NOT include `selectedId` here: that's set on every
+  // canvas click too, and including it would collapse the graph to a single
+  // node every time the user clicks anything. Chat-driven selection is
+  // bridged separately by also writing into visibleNodeIds (see
+  // applyToolResult in src/lib/agent.ts).
+  const chatPromotedIds = useMemo<Set<string> | null>(() => {
+    if (!visibleNodeIds || visibleNodeIds.size === 0) return null;
+    const out = new Set<string>();
+    for (const id of visibleNodeIds) {
+      out.add(id.startsWith("person:") ? id.slice(7) : id);
+    }
+    return out;
+  }, [visibleNodeIds]);
+
   const prospects = useMemo(() => {
+    if (chatPromotedIds) {
+      const matched = allProspects.filter((p) => chatPromotedIds.has(p._id));
+      if (matched.length > 0) return matched;
+    }
     if (allProspects.length <= MAX_PROSPECTS_RENDERED) return allProspects;
     const ranked = [...allProspects].sort((a, b) => {
       const sa = scores[a._id]?.overall_score ?? -1;
@@ -296,7 +346,8 @@ const Discover = () => {
       return sb - sa;
     });
     return ranked.slice(0, MAX_PROSPECTS_RENDERED);
-  }, [allProspects, scores]);
+  }, [allProspects, scores, chatPromotedIds]);
+
   const prospectIds = useMemo(() => prospects.map((p) => p._id), [prospects]);
   const signalsById = useSignalsForMany(prospectIds);
 
@@ -335,31 +386,6 @@ const Discover = () => {
     () => buildGraph({ prospects, scores, signalsById, theme }),
     [prospects, scores, signalsById, theme],
   );
-
-  // ─── URL-synced local state (?edges=…&focus=…) ─────────────────────────────
-  const [searchParams, setSearchParams] = useSearchParams();
-  const initialEdgeKinds = useMemo(
-    () =>
-      decodeEdgeKinds(searchParams.get("edges")) ??
-      new Set<EdgeKind>(DEFAULT_EDGE_KINDS),
-    // Read once on mount; subsequent state mutations push back to the URL
-    // via the effect below. Including searchParams here would create a loop.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
-  // `focusId` is the current "you are here" — clicking any node makes it the
-  // new focus and the graph re-flows around it. There's no back button by
-  // design (Obsidian-style endless traversal), but the Technology root is
-  // always present in every focal subgraph as a click-to-home anchor.
-  const [focusId, setFocusId] = useState<string | null>(
-    () => searchParams.get("focus") ?? searchParams.get("selected"),
-  );
-  // selectedId mirrors focusId for inspector wiring. Kept as its own piece
-  // of state in case we later want "selection without re-focusing" (e.g.
-  // hover-preview). For now, click = focus = select.
-  const [selectedId, setSelectedId] = useState<string | null>(focusId);
-  const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string> | null>(null);
-  const [edgeKindsActive, setEdgeKindsActive] = useState<Set<EdgeKind>>(initialEdgeKinds);
 
   // Push state -> URL (replace, not push — the user said no back-button feel,
   // and we don't want focus changes piling into the browser history stack).
