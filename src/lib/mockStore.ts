@@ -6,6 +6,8 @@
  */
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 
+type Education = { school: string; degree: string; year: number };
+type Talk = { venue: string; year: number; topic?: string };
 type Prospect = {
   _id: string;
   name: string;
@@ -15,6 +17,9 @@ type Prospect = {
   linkedin_url?: string;
   created_at: number;
   updated_at: number;
+  past_companies?: string[];
+  education?: Education[];
+  talks?: Talk[];
 };
 type Signal = {
   _id: string;
@@ -132,15 +137,86 @@ class Store {
 
   seedDemo() {
     if (this.prospects.length) return;
-    const seed = [
-      { name: "Lin Wei", company: "TSMC", role: "VP Process Engineering" },
-      { name: "Ana Souza", company: "ASML", role: "Director Lithography" },
-      { name: "Marcus Hale", company: "Intel", role: "Principal Engineer" },
-      { name: "Priya Raman", company: "NVIDIA", role: "Director of HW" },
-      { name: "Jonas Berg", company: "Infineon", role: "Head of Power" },
+    const seed: Array<
+      Pick<Prospect, "name" | "company" | "role"> & {
+        past_companies: string[];
+        education: Education[];
+        talks: Talk[];
+      }
+    > = [
+      {
+        name: "Lin Wei",
+        company: "TSMC",
+        role: "VP Process Engineering",
+        past_companies: ["Intel", "Applied Materials"],
+        education: [
+          { school: "Stanford", degree: "Ph.D. EE", year: 2008 },
+          { school: "National Taiwan University", degree: "B.S. EE", year: 2002 },
+        ],
+        talks: [
+          { venue: "IEDM", year: 2023, topic: "3nm yield ramp" },
+          { venue: "VLSI Symposium", year: 2024, topic: "GAA transistor scaling" },
+        ],
+      },
+      {
+        name: "Ana Souza",
+        company: "ASML",
+        role: "Director Lithography",
+        past_companies: ["Nikon", "Carl Zeiss"],
+        education: [
+          { school: "ETH", degree: "M.S. Optical Engineering", year: 2010 },
+        ],
+        talks: [
+          { venue: "SPIE Advanced Lithography", year: 2023, topic: "High-NA EUV optics" },
+        ],
+      },
+      {
+        name: "Marcus Hale",
+        company: "Intel",
+        role: "Principal Engineer",
+        past_companies: ["AMD", "Apple"],
+        education: [
+          { school: "CMU", degree: "M.S. ECE", year: 2012 },
+          { school: "Berkeley", degree: "B.S. EECS", year: 2010 },
+        ],
+        talks: [
+          { venue: "Hot Chips", year: 2024, topic: "Foveros packaging tradeoffs" },
+        ],
+      },
+      {
+        name: "Priya Raman",
+        company: "NVIDIA",
+        role: "Director of HW",
+        past_companies: ["Google", "Qualcomm", "Broadcom"],
+        education: [
+          { school: "MIT", degree: "M.S. EECS", year: 2014 },
+        ],
+        talks: [
+          { venue: "NeurIPS", year: 2023, topic: "Accelerator design for LLM training" },
+          { venue: "Hot Chips", year: 2022, topic: "Datacenter GPU interconnect" },
+        ],
+      },
+      {
+        name: "Jonas Berg",
+        company: "Infineon",
+        role: "Head of Power",
+        past_companies: ["Bosch"],
+        education: [
+          { school: "TU Munich", degree: "Ph.D. EE", year: 2011 },
+          { school: "ETH", degree: "B.S. EE", year: 2005 },
+        ],
+        talks: [],
+      },
     ];
     for (const p of seed) {
-      const id = this.createProspect({ ...p, industry: "Semiconductors" });
+      const { past_companies, education, talks, ...base } = p;
+      const id = this.createProspect({
+        ...base,
+        industry: "Semiconductors",
+        past_companies,
+        education,
+        talks,
+      });
       this.runScoringSync(id);
     }
   }

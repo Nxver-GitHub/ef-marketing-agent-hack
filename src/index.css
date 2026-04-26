@@ -53,12 +53,62 @@
     --sidebar-accent-foreground: 40 12% 92%;
     --sidebar-border: 0 0% 14%;
     --sidebar-ring: 217 91% 56%;
+
+    /* Graph node-type colors (Credence Tokens) */
+    --node-person:     222 47% 11%;
+    --node-company:    210 80% 45%;
+    --node-role:       262 52% 47%;
+    --node-city:        25 80% 50%;
+    --node-school:     170 55% 38%;
+    --node-conference: 320 55% 52%;
+    --node-industry:   215 14% 48%;
+
+    /* Graph edge-type colors */
+    --edge-reports:      222 47% 11%;
+    --edge-employer:     210 60% 55%;
+    --edge-location:      25 70% 60%;
+    --edge-evidence:     142 50% 50%;
+    --edge-scope:        262 50% 60%;
+    --edge-partnership:  320 55% 55%;
+    --edge-past-empl:    200 70% 50%;
+    --edge-education:     90 55% 42%;
+    --edge-vertical:     215 14% 65%;
+
+    /* Score buckets */
+    --score-strong:    142 71% 45%;
+    --score-plausible:  38 92% 50%;
+    --score-weak:        0 72% 51%;
   }
 
   .dark {
     /* same — app is monochrome dark by default */
     --background: 0 0% 4%;
     --foreground: 40 12% 92%;
+
+    /* Graph node-type colors — lifted L for dark canvas */
+    --node-person:     222 47% 35%;
+    --node-company:    210 80% 65%;
+    --node-role:       262 52% 67%;
+    --node-city:        25 80% 65%;
+    --node-school:     170 55% 58%;
+    --node-conference: 320 55% 70%;
+    --node-industry:   215 14% 68%;
+
+    /* Graph edge-type colors — lifted L for dark canvas */
+    --edge-reports:      222 47% 70%;
+    --edge-employer:     210 60% 72%;
+    --edge-location:      25 70% 72%;
+    --edge-evidence:     142 50% 65%;
+    --edge-scope:        262 50% 75%;
+    --edge-partnership:  320 55% 72%;
+    --edge-past-empl:    200 70% 68%;
+    --edge-education:     90 55% 60%;
+    --edge-vertical:     215 14% 78%;
+
+    /* Score buckets — lifted L for dark canvas */
+    --score-strong:    142 71% 60%;
+    --score-plausible:  38 92% 65%;
+    --score-weak:        0 72% 66%;
   }
 }
 

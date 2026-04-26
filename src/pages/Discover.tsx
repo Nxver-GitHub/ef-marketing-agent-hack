@@ -1,12 +1,219 @@
-import { useEffect, useMemo, useState } from "react";
+/**
+ * Discover (v2) — three-column graph view.
+ *
+ * Layout:
+ *   TopBar (with edge-filter pills)
+ *   ┌──────────────────────────────────────────────────────────────┐
+ *   │ GraphChat │ Subheader + Force-graph canvas │ NodeInspector  │
+ *   └──────────────────────────────────────────────────────────────┘
+ *
+ * We bypass PageShell here to get full-bleed; PageShell adds max-width +
+ * padding which breaks the graph canvas filling the body row. The TopBar
+ * is rendered directly so the route still uses the shared chrome.
+ */
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { PageShell } from "@/components/PageShell";
-import { useProspects, useScoresFor, useSignalsForMany, extractSignalValue } from "@/lib/db";
-import { scoreColor } from "@/components/ScoreBar";
+import ForceGraph2D, {
+  type ForceGraphMethods,
+  type LinkObject,
+  type NodeObject,
+} from "react-force-graph-2d";
+import { TopBar } from "@/components/TopBar";
+import { GraphChat } from "@/components/GraphChat";
+import { NodeInspector } from "@/components/NodeInspector";
+import { useProspects, useScoresFor, useSignalsForMany } from "@/lib/db";
+import {
+  buildGraph,
+  type EdgeKind,
+  type GraphEdge,
+  type GraphNode,
+  type NodeKind,
+} from "@/lib/graph";
+import type { AgentContext } from "@/lib/agent";
 
-type SortKey = "overall_score" | "authenticity_score" | "authority_score" | "warmth_score";
+// ─── CSS-var color helpers ───────────────────────────────────────────────────
 
-const INDUSTRIES = ["All", "Semiconductors", "Defense", "Pharma", "Quantum", "Aerospace"];
+const slugifyEdge = (kind: EdgeKind): string => {
+  // index.css maps EdgeKind -> --edge-<slug>; mapping is the post-fix part.
+  switch (kind) {
+    case "reports_to":
+      return "reports";
+    case "works_at":
+      return "employer";
+    case "located_in":
+      return "location";
+    case "evidence_cited":
+      return "evidence";
+    case "scope_signal":
+      return "scope";
+    case "partnership":
+      return "partnership";
+    case "past_employer":
+      return "past-empl";
+    case "education":
+      return "education";
+    case "vertical":
+      return "vertical";
+    case "colleague":
+      // Not defined as its own token — borrow employer.
+      return "employer";
+  }
+};
+
+function hslFromVar(varName: string): string {
+  if (typeof window === "undefined") return "hsl(0 0% 50%)";
+  const raw = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  return raw ? `hsl(${raw})` : "hsl(0 0% 50%)";
+}
+
+const NODE_VAR: Record<NodeKind, string> = {
+  person: "--node-person",
+  company: "--node-company",
+  role: "--node-role",
+  city: "--node-city",
+  school: "--node-school",
+  conference: "--node-conference",
+  industry: "--node-industry",
+};
+
+// ─── Force-graph link/node typing helpers ────────────────────────────────────
+
+type FGNode = NodeObject<GraphNode>;
+type FGLink = LinkObject<GraphNode, { kind: EdgeKind; id: string }>;
+
+// react-force-graph mutates source/target to NodeObjects after init; this
+// narrows safely whether we're pre- or post-init.
+function linkEndpointId(end: string | number | FGNode | undefined): string | undefined {
+  if (end === undefined) return undefined;
+  if (typeof end === "string") return end;
+  if (typeof end === "number") return String(end);
+  return end.id as string | undefined;
+}
+
+// ─── Small per-node-kind shape painter ───────────────────────────────────────
+
+function paintShape(
+  ctx: CanvasRenderingContext2D,
+  kind: NodeKind,
+  x: number,
+  y: number,
+  r: number,
+  fill: string,
+): void {
+  ctx.fillStyle = fill;
+  ctx.strokeStyle = fill;
+  ctx.lineWidth = 1;
+  switch (kind) {
+    case "person": {
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+      return;
+    }
+    case "company": {
+      const s = r * 1.8;
+      const rad = r * 0.35;
+      roundRect(ctx, x - s / 2, y - s / 2, s, s, rad);
+      ctx.fill();
+      return;
+    }
+    case "role": {
+      // Hexagon
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = (Math.PI / 3) * i + Math.PI / 6;
+        const px = x + Math.cos(a) * r;
+        const py = y + Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fill();
+      return;
+    }
+    case "city": {
+      // Pill
+      const w = r * 2.6;
+      const h = r * 1.4;
+      roundRect(ctx, x - w / 2, y - h / 2, w, h, h / 2);
+      ctx.fill();
+      return;
+    }
+    case "school": {
+      // Diamond
+      ctx.beginPath();
+      ctx.moveTo(x, y - r);
+      ctx.lineTo(x + r, y);
+      ctx.lineTo(x, y + r);
+      ctx.lineTo(x - r, y);
+      ctx.closePath();
+      ctx.fill();
+      return;
+    }
+    case "conference": {
+      // Triangle
+      ctx.beginPath();
+      ctx.moveTo(x, y - r);
+      ctx.lineTo(x + r * 0.9, y + r * 0.7);
+      ctx.lineTo(x - r * 0.9, y + r * 0.7);
+      ctx.closePath();
+      ctx.fill();
+      return;
+    }
+    case "industry": {
+      // Small square
+      const s = r * 1.6;
+      ctx.fillRect(x - s / 2, y - s / 2, s, s);
+      return;
+    }
+  }
+}
+
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+): void {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+  ctx.lineTo(x + rr, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+  ctx.lineTo(x, y + rr);
+  ctx.quadraticCurveTo(x, y, x + rr, y);
+  ctx.closePath();
+}
+
+// ─── Subheader bits ──────────────────────────────────────────────────────────
+
+const NODE_KINDS_LEGEND: ReadonlyArray<{ kind: NodeKind; label: string }> = [
+  { kind: "person", label: "Person" },
+  { kind: "company", label: "Company" },
+  { kind: "role", label: "Role" },
+  { kind: "city", label: "City" },
+  { kind: "school", label: "School" },
+  { kind: "conference", label: "Conf." },
+  { kind: "industry", label: "Industry" },
+];
+
+const DEFAULT_EDGE_KINDS: EdgeKind[] = [
+  "reports_to",
+  "works_at",
+  "located_in",
+  "evidence_cited",
+  "scope_signal",
+  "partnership",
+  "past_employer",
+];
+
+// ─── Component ───────────────────────────────────────────────────────────────
 
 const Discover = () => {
   const navigate = useNavigate();
@@ -15,327 +222,317 @@ const Discover = () => {
   const scores = useScoresFor(prospectIds);
   const signalsById = useSignalsForMany(prospectIds);
 
-  // Pre-compute a compact per-row enrichment line: tenure · talks · patents
-  // and an outbound LinkedIn click-through. Numbers come from the signals
-  // table (each signal_type stored as {raw: N}). Falls back gracefully when
-  // a given signal is missing for a prospect.
-  const enrichmentById = useMemo(() => {
-    const out: Record<
-      string,
-      { tenure: number; talks: number; patents: number; mutuals: number }
-    > = {};
-    for (const pid of Object.keys(signalsById)) {
-      const sigs = signalsById[pid] ?? [];
-      const pick = (t: string) => {
-        const s = sigs.find((s: { signal_type: string }) => s.signal_type === t);
-        return s ? extractSignalValue(s.value) : 0;
-      };
-      out[pid] = {
-        tenure: pick("tenure_years"),
-        talks: pick("conference_talks"),
-        patents: pick("patent_count"),
-        mutuals: pick("mutual_connections"),
-      };
+  // Build graph (memoized).
+  const { nodes, edges } = useMemo(
+    () => buildGraph({ prospects, scores, signalsById }),
+    [prospects, scores, signalsById],
+  );
+
+  // ─── Local state ───────────────────────────────────────────────────────────
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string> | null>(null);
+  const [edgeKindsActive, setEdgeKindsActive] = useState<Set<EdgeKind>>(
+    () => new Set<EdgeKind>(DEFAULT_EDGE_KINDS),
+  );
+
+  // Derived: neighbor map for halo / fade.
+  const neighborByNode = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const e of edges) {
+      if (!map.has(e.source)) map.set(e.source, new Set());
+      if (!map.has(e.target)) map.set(e.target, new Set());
+      map.get(e.source)!.add(e.target);
+      map.get(e.target)!.add(e.source);
     }
+    return map;
+  }, [edges]);
+
+  // Resolve selected node (may be null/stale).
+  const selectedNode = useMemo<GraphNode | null>(
+    () => (selectedId ? (nodes.find((n) => n.id === selectedId) ?? null) : null),
+    [nodes, selectedId],
+  );
+
+  // Per-kind cached colors. Recomputed once per mount; theme switch would
+  // need to bust this — fine for v1 since the theme toggle isn't on Discover.
+  const nodeColorByKind = useMemo<Record<NodeKind, string>>(() => {
+    const out = {} as Record<NodeKind, string>;
+    (Object.keys(NODE_VAR) as NodeKind[]).forEach((k) => {
+      out[k] = hslFromVar(NODE_VAR[k]);
+    });
     return out;
-  }, [signalsById]);
+  }, []);
 
-  const [query, setQuery] = useState("");
-  const [industry, setIndustry] = useState("All");
-  const [sortKey, setSortKey] = useState<SortKey>("overall_score");
+  // Edge color cache — same caveat as above.
+  const edgeColorByKind = useMemo<Record<EdgeKind, string>>(() => {
+    const kinds: EdgeKind[] = [
+      "works_at",
+      "colleague",
+      "located_in",
+      "reports_to",
+      "past_employer",
+      "partnership",
+      "education",
+      "scope_signal",
+      "vertical",
+      "evidence_cited",
+    ];
+    const out = {} as Record<EdgeKind, string>;
+    for (const k of kinds) out[k] = hslFromVar(`--edge-${slugifyEdge(k)}`);
+    return out;
+  }, []);
 
-  // Give Supabase a beat before showing "no prospects yet" so the user isn't
-  // told to go validate when the data is just mid-flight.
-  const [settled, setSettled] = useState(false);
+  // Build the graphData ForceGraph2D consumes (nodes + links).
+  const graphData = useMemo(
+    () => ({
+      nodes: nodes as FGNode[],
+      links: edges.map<FGLink>((e: GraphEdge) => ({
+        source: e.source,
+        target: e.target,
+        kind: e.kind,
+        id: e.id,
+      })),
+    }),
+    [nodes, edges],
+  );
+
+  // ─── Canvas sizing — ResizeObserver against the canvas column ──────────────
+  const canvasWrapRef = useRef<HTMLDivElement | null>(null);
+  const fgRef = useRef<ForceGraphMethods<FGNode, FGLink> | undefined>(undefined);
+  const [canvasSize, setCanvasSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+
   useEffect(() => {
-    if (prospects.length > 0) {
-      setSettled(true);
-      return;
-    }
-    const t = setTimeout(() => setSettled(true), 600);
-    return () => clearTimeout(t);
-  }, [prospects.length]);
-
-  const scored = useMemo(
-    () => prospects.filter((p) => scores[p._id]),
-    [prospects, scores]
-  );
-  const avgScore = scored.length
-    ? scored.reduce((s, p) => s + (scores[p._id]?.overall_score ?? 0), 0) / scored.length
-    : 0;
-  const topScore = scored.length
-    ? Math.max(...scored.map((p) => scores[p._id]?.overall_score ?? 0))
-    : 0;
-
-  // Case-insensitive industry match — DB has "Semiconductors" but API lowercases.
-  const industryEq = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
-
-  const filtered = useMemo(() => {
-    const q = query.toLowerCase();
-    return prospects
-      .filter((p) => {
-        const matchQ =
-          !q ||
-          p.name.toLowerCase().includes(q) ||
-          p.company.toLowerCase().includes(q) ||
-          p.role.toLowerCase().includes(q);
-        const matchI = industry === "All" || industryEq(p.industry, industry);
-        return matchQ && matchI && scores[p._id];
-      })
-      .map((p) => ({ p, score: scores[p._id]! }))
-      .sort((a, b) => (b.score[sortKey] ?? 0) - (a.score[sortKey] ?? 0));
-  }, [prospects, scores, query, industry, sortKey]);
-
-  // Per-industry prospect counts (scored only) — used to hint which filters have data.
-  const industryCounts = useMemo(() => {
-    const counts: Record<string, number> = { All: 0 };
-    for (const p of prospects) {
-      if (!scores[p._id]) continue;
-      counts.All += 1;
-      for (const i of INDUSTRIES) {
-        if (i !== "All" && industryEq(p.industry, i)) counts[i] = (counts[i] ?? 0) + 1;
+    const el = canvasWrapRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        setCanvasSize({ w: Math.max(0, Math.floor(width)), h: Math.max(0, Math.floor(height)) });
       }
-    }
-    return counts;
-  }, [prospects, scores]);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
-  // Explicit col-span map so Tailwind's JIT statically picks the classes up.
-  const colSpanClass: Record<number, string> = { 1: "col-span-1", 2: "col-span-2" };
+  // After first layout settles, fit graph to view.
+  useEffect(() => {
+    if (!nodes.length) return;
+    const t = setTimeout(() => fgRef.current?.zoomToFit(400, 60), 600);
+    return () => clearTimeout(t);
+  }, [nodes.length]);
 
-  const col = (key: SortKey, label: string, span = 1) => (
-    <button
-      onClick={() => setSortKey(key)}
-      className={`${colSpanClass[span] ?? "col-span-1"} text-right text-[10px] uppercase tracking-[0.16em] transition-colors ${
-        sortKey === key ? "text-foreground" : "text-muted-foreground hover:text-foreground"
-      }`}
-    >
-      {label}
-      {sortKey === key && <span className="ml-1 text-mono">↓</span>}
-    </button>
+  // ─── Agent context ─────────────────────────────────────────────────────────
+  const ctx: AgentContext = useMemo(
+    () => ({
+      nodes,
+      edges,
+      setSelectedId,
+      setVisibleNodeIds,
+      getProspectById: (id) =>
+        prospects.find((p) => `person:${p._id}` === id || p._id === id),
+      getScoreById: (id) => {
+        const personId = id.startsWith("person:") ? id.slice(7) : id;
+        return scores[personId];
+      },
+    }),
+    [nodes, edges, prospects, scores],
   );
 
+  // ─── Inspector data wiring (person variant) ────────────────────────────────
+  const selectedProspect = useMemo(() => {
+    if (!selectedNode || selectedNode.kind !== "person") return undefined;
+    return prospects.find((p) => p._id === selectedNode.raw._id);
+  }, [selectedNode, prospects]);
+  const selectedScore = selectedProspect ? scores[selectedProspect._id] : undefined;
+  const selectedSignals = selectedProspect ? signalsById[selectedProspect._id] : undefined;
+
+  // ─── Edge-kind toggle handler ──────────────────────────────────────────────
+  const onToggleEdgeKind = (kind: EdgeKind) =>
+    setEdgeKindsActive((prev) => {
+      const next = new Set(prev);
+      if (next.has(kind)) next.delete(kind);
+      else next.add(kind);
+      return next;
+    });
+
+  // ─── Empty-state gate ──────────────────────────────────────────────────────
+  const isEmpty = nodes.length === 0;
+
+  // ─── Render ────────────────────────────────────────────────────────────────
   return (
-    <PageShell>
-      {/* Stats */}
-      <div className="grid grid-cols-3 gap-px border border-border mb-8">
-        <Stat label="Total prospects" value={String(prospects.length)} />
-        <Stat
-          label="Avg score"
-          value={scored.length ? avgScore.toFixed(1) : "—"}
-          color={scored.length ? scoreColor(avgScore) : undefined}
-        />
-        <Stat
-          label="Top score"
-          value={scored.length ? String(Math.round(topScore)) : "—"}
-          color={scored.length ? scoreColor(topScore) : undefined}
-        />
-      </div>
+    <div className="h-screen flex flex-col bg-background text-foreground">
+      <TopBar edgeKindsActive={edgeKindsActive} onToggleEdgeKind={onToggleEdgeKind} />
+      {/* Spacer for fixed TopBar (h-12) */}
+      <div className="h-12 shrink-0" />
+      <div className="flex flex-1 min-h-0">
+        {/* Left: chat */}
+        <GraphChat ctx={ctx} />
 
-      {/* Search + industry filter */}
-      <div className="flex flex-col md:flex-row gap-px mb-px">
-        <label className="border border-border flex-1 flex items-center px-4 gap-3 py-2">
-          <span className="text-muted-foreground text-[10px] uppercase tracking-[0.16em]">
-            Search
-          </span>
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Name, company, or role…"
-            className="flex-1 bg-transparent outline-none text-sm placeholder:text-muted-foreground/40"
-          />
-          {query && (
-            <button
-              onClick={() => setQuery("")}
-              className="text-muted-foreground hover:text-foreground text-xs"
-            >
-              ×
-            </button>
-          )}
-        </label>
-        <div className="border border-border md:border-l-0 flex items-center px-4 gap-1.5 flex-wrap py-2">
-          {INDUSTRIES.map((i) => {
-            const n = industryCounts[i] ?? 0;
-            const hasData = i === "All" ? n > 0 : n > 0;
-            const active = industry === i;
-            return (
-              <button
-                key={i}
-                onClick={() => setIndustry(i)}
-                disabled={!hasData && !active}
-                className={`text-[10px] px-2.5 py-1 border transition-colors inline-flex items-center gap-1.5 ${
-                  active
-                    ? "border-foreground bg-foreground text-background"
-                    : hasData
-                      ? "border-transparent text-muted-foreground hover:text-foreground"
-                      : "border-transparent text-muted-foreground/30 cursor-not-allowed"
-                }`}
-                title={hasData ? `${n} prospect${n !== 1 ? "s" : ""}` : "no data yet"}
-              >
-                <span>{i}</span>
-                {n > 0 && (
-                  <span className={`text-mono ${active ? "text-background/70" : "text-muted-foreground/60"}`}>
-                    {n}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Table */}
-      <div className="border border-border border-t-0">
-        <div className="grid grid-cols-12 gap-2 px-4 py-3 text-[10px] uppercase tracking-[0.16em] text-muted-foreground border-b border-border items-center">
-          <div className="col-span-1">#</div>
-          <div className="col-span-3">Name / Company</div>
-          <div className="col-span-3">Role</div>
-          {col("authenticity_score", "Authentic")}
-          {col("authority_score", "Authority")}
-          {col("warmth_score", "Warmth")}
-          {col("overall_score", "Overall", 2)}
-        </div>
-
-        {filtered.length === 0 && (
-          <div className="px-4 py-12 text-sm text-muted-foreground">
-            {!settled
-              ? "Loading prospects…"
-              : prospects.length === 0
-                ? "No prospects yet — validate one to get started."
-                : scored.length === 0
-                  ? "Prospects loaded but not scored yet — scoring is still running."
-                  : "No matches for this filter."}
+        {/* Center: subheader + canvas */}
+        <div className="flex-1 min-w-0 flex flex-col">
+          {/* Subheader: stats row */}
+          <div className="flex items-center justify-between gap-4 border-b border-border px-5 py-3">
+            <div className="flex items-center gap-5 text-[11px] text-muted-foreground text-mono">
+              <span>
+                <span className="text-foreground">{nodes.length}</span> nodes
+              </span>
+              <span>
+                <span className="text-foreground">{edges.length}</span> edges
+              </span>
+              <span>
+                <span className="text-foreground">
+                  {nodes.filter((n) => n.kind === "person").length}
+                </span>{" "}
+                candidates
+              </span>
+              <span>
+                Selected:{" "}
+                <span className="text-foreground">
+                  {selectedNode?.name ?? "—"}
+                </span>
+              </span>
+            </div>
+            <div className="flex items-center gap-1 text-mono text-[11px] text-muted-foreground">
+              <ZoomBtn onClick={() => fgRef.current?.zoom((fgRef.current?.zoom() ?? 1) * 0.8, 200)}>
+                −
+              </ZoomBtn>
+              <ZoomBtn onClick={() => fgRef.current?.zoom(1, 200)}>100%</ZoomBtn>
+              <ZoomBtn onClick={() => fgRef.current?.zoom((fgRef.current?.zoom() ?? 1) * 1.25, 200)}>
+                +
+              </ZoomBtn>
+              <ZoomBtn onClick={() => fgRef.current?.zoomToFit(400, 60)}>↻</ZoomBtn>
+            </div>
           </div>
-        )}
 
-        {filtered.map(({ p, score }, i) => (
-          <button
-            key={p._id}
-            onClick={() => navigate(`/prospect/${p._id}`)}
-            className="w-full grid grid-cols-12 gap-2 items-center px-4 py-4 border-b border-border/60 last:border-0 text-left hover:bg-secondary transition-colors"
-          >
-            <div className="col-span-1 text-mono text-xs text-muted-foreground">
-              {String(i + 1).padStart(2, "0")}
-            </div>
-            <div className="col-span-3 min-w-0">
-              <div className="text-sm truncate" title={p.name}>
-                {p.name}
-              </div>
-              <div className="text-xs text-muted-foreground truncate" title={p.company}>
-                {p.company}
-              </div>
-            </div>
-            <div
-              className="col-span-3 text-xs text-muted-foreground pr-4 leading-snug"
-              title={p.role}
-            >
-              <div className="line-clamp-2">{p.role}</div>
-              <Enrichment
-                signals={enrichmentById[p._id]}
-                linkedinUrl={p.linkedin_url ?? undefined}
-              />
-            </div>
-            <Pill v={score.authenticity_score} />
-            <Pill v={score.authority_score} />
-            <Pill v={score.warmth_score} />
-            <div
-              className="col-span-2 text-right text-mono text-base"
-              style={{ color: scoreColor(score.overall_score) }}
-            >
-              {Math.round(score.overall_score)}
-            </div>
-          </button>
-        ))}
-      </div>
+          {/* Subheader: legend */}
+          <div className="flex items-center gap-3 border-b border-border px-5 py-2 flex-wrap">
+            <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+              Legend
+            </span>
+            {NODE_KINDS_LEGEND.map((l) => (
+              <span key={l.kind} className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                <span
+                  className="inline-block h-2.5 w-2.5 rounded-sm"
+                  style={{ background: nodeColorByKind[l.kind] }}
+                />
+                {l.label}
+              </span>
+            ))}
+          </div>
 
-      {filtered.length > 0 && (
-        <div className="pt-3 text-[11px] text-muted-foreground text-mono flex items-center justify-between">
-          <span>
-            {filtered.length} of {scored.length} prospect{scored.length !== 1 ? "s" : ""} · sorted by{" "}
-            {sortKey.replace("_score", "")}
-          </span>
-          {filtered.length < scored.length && (
-            <button
-              onClick={() => {
-                setQuery("");
-                setIndustry("All");
-              }}
-              className="text-[10px] uppercase tracking-[0.16em] hover:text-foreground"
-            >
-              Clear filters
-            </button>
-          )}
+          {/* Canvas */}
+          <div ref={canvasWrapRef} className="relative flex-1 min-h-0">
+            {isEmpty ? (
+              <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
+                No prospects yet — validate one to get started.
+              </div>
+            ) : (
+              canvasSize.w > 0 &&
+              canvasSize.h > 0 && (
+                <ForceGraph2D<GraphNode, { kind: EdgeKind; id: string }>
+                  ref={fgRef}
+                  graphData={graphData}
+                  width={canvasSize.w}
+                  height={canvasSize.h}
+                  nodeId="id"
+                  nodeRelSize={4}
+                  cooldownTime={3000}
+                  linkDirectionalParticles={0}
+                  backgroundColor="transparent"
+                  linkColor={(link: FGLink) =>
+                    edgeColorByKind[link.kind] ?? "hsl(0 0% 50%)"
+                  }
+                  linkWidth={(link: FGLink) => {
+                    const sId = linkEndpointId(link.source);
+                    const tId = linkEndpointId(link.target);
+                    if (selectedId && (sId === selectedId || tId === selectedId)) return 1.5;
+                    return 0.6;
+                  }}
+                  linkVisibility={(link: FGLink) => edgeKindsActive.has(link.kind)}
+                  nodeVisibility={(node: FGNode) => {
+                    if (visibleNodeIds === null) return true;
+                    if (visibleNodeIds.has(node.id as string)) return true;
+                    if (selectedId && node.id === selectedId) return true;
+                    return false;
+                  }}
+                  onNodeClick={(node: FGNode) => setSelectedId(node.id as string)}
+                  onBackgroundClick={() => setSelectedId(null)}
+                  nodeCanvasObject={(node: FGNode, ctx2d: CanvasRenderingContext2D, globalScale: number) => {
+                    const gn = node as unknown as GraphNode;
+                    const x = node.x ?? 0;
+                    const y = node.y ?? 0;
+                    const baseR = gn.kind === "person" ? 5 : gn.kind === "city" ? 5 : 5.5;
+
+                    // Neighborhood-fade: when nothing's filtered AND a node is
+                    // selected, dim non-neighbors so the focal cluster pops.
+                    let alpha = 1;
+                    if (selectedId && visibleNodeIds === null) {
+                      const isSelf = gn.id === selectedId;
+                      const isNeighbor = neighborByNode.get(selectedId)?.has(gn.id) ?? false;
+                      if (!isSelf && !isNeighbor) alpha = 0.25;
+                    }
+
+                    ctx2d.save();
+                    ctx2d.globalAlpha = alpha;
+
+                    // Selected halo
+                    if (gn.id === selectedId) {
+                      ctx2d.beginPath();
+                      ctx2d.arc(x, y, baseR + 4, 0, Math.PI * 2);
+                      ctx2d.strokeStyle = nodeColorByKind[gn.kind];
+                      ctx2d.lineWidth = 1.5;
+                      ctx2d.globalAlpha = alpha * 0.6;
+                      ctx2d.stroke();
+                      ctx2d.globalAlpha = alpha;
+                    }
+
+                    paintShape(ctx2d, gn.kind, x, y, baseR, nodeColorByKind[gn.kind]);
+
+                    // Label only when zoomed in enough.
+                    if (globalScale >= 1.4) {
+                      ctx2d.font = `${10 / globalScale}px ui-sans-serif, system-ui, sans-serif`;
+                      ctx2d.fillStyle = "hsl(0 0% 45%)";
+                      ctx2d.textAlign = "center";
+                      ctx2d.textBaseline = "top";
+                      ctx2d.fillText(gn.name, x, y + baseR + 2);
+                    }
+
+                    ctx2d.restore();
+                  }}
+                />
+              )
+            )}
+          </div>
         </div>
-      )}
-    </PageShell>
+
+        {/* Right: inspector */}
+        <NodeInspector
+          node={selectedNode}
+          onClose={() => setSelectedId(null)}
+          prospect={selectedProspect}
+          score={selectedScore}
+          signals={selectedSignals}
+          onNavigateToProspect={(id) => navigate(`/prospect/${id}`)}
+        />
+      </div>
+    </div>
   );
 };
 
-const Stat = ({
-  label,
-  value,
-  color,
+const ZoomBtn = ({
+  onClick,
+  children,
 }: {
-  label: string;
-  value: string;
-  color?: string;
+  onClick: () => void;
+  children: React.ReactNode;
 }) => (
-  <div className="p-5">
-    <div className="label-eyebrow mb-2">{label}</div>
-    <div
-      className="text-3xl font-light tracking-tight text-mono"
-      style={color ? { color } : undefined}
-    >
-      {value}
-    </div>
-  </div>
-);
-
-const Pill = ({ v }: { v: number }) => (
-  <div
-    className="col-span-1 text-right text-mono text-xs"
-    style={{ color: scoreColor(v) }}
+  <button
+    type="button"
+    onClick={onClick}
+    className="h-7 min-w-7 px-2 border border-border hover:bg-muted transition-colors text-[11px]"
   >
-    {Math.round(v)}
-  </div>
+    {children}
+  </button>
 );
-
-/**
- * Compact per-row enrichment line: tenure · talks · patents · mutuals · LinkedIn.
- * Hidden when no signals have landed yet (prevents visual clutter on cold rows).
- */
-const Enrichment = ({
-  signals,
-  linkedinUrl,
-}: {
-  signals?: { tenure: number; talks: number; patents: number; mutuals: number };
-  linkedinUrl?: string;
-}) => {
-  const parts: React.ReactNode[] = [];
-  if (signals?.tenure) parts.push(<span key="tenure">{Math.round(signals.tenure)}y @ co</span>);
-  if (signals?.talks) parts.push(<span key="talks">{Math.round(signals.talks)} talks</span>);
-  if (signals?.patents) parts.push(<span key="patents">{Math.round(signals.patents)} patents</span>);
-  if (signals?.mutuals) parts.push(<span key="mut">{Math.round(signals.mutuals)} mutuals</span>);
-  if (parts.length === 0 && !linkedinUrl) return null;
-  return (
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-1 text-[10px] text-muted-foreground/70">
-      {parts.map((p, i) => (
-        <span key={i} className="after:content-['·'] after:ml-2 after:text-muted-foreground/30 last:after:content-['']">
-          {p}
-        </span>
-      ))}
-      {linkedinUrl && (
-        <a
-          href={linkedinUrl}
-          target="_blank"
-          rel="noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          className="underline hover:text-foreground"
-        >
-          → LinkedIn
-        </a>
-      )}
-    </div>
-  );
-};
 
 export default Discover;
