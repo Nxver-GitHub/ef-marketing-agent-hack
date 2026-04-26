@@ -159,17 +159,24 @@ function normalizeKey(s: string): string {
 }
 
 /**
- * Resolve COMPANY_META entry by normalized name. Falls back to an
- * Unknown/Unknown placeholder so every company still produces a city +
- * industry edge (graph stays connected).
+ * Resolve COMPANY_META entry by normalized name. Returns null if the company
+ * isn't in our metadata table — callers skip the city/industry edge for
+ * unknown companies rather than fall back to Unknown placeholder hubs (those
+ * pollute the canvas with meaningless clusters).
  */
-function resolveCompanyMeta(rawName: string): CompanyMeta {
+function resolveCompanyMeta(rawName: string): CompanyMeta | null {
   const norm = normalizeCompany(rawName);
   for (const [key, meta] of Object.entries(COMPANY_META)) {
     if (normalizeCompany(key) === norm) return meta;
   }
-  return { country: "Unknown", industry: "Unknown" };
+  return null;
 }
+
+// Singleton root node id. Every industry, city, and role rolls up to this
+// node so the canvas reads as a clean DAG: Technology → Industry/City →
+// Company/Role → Person.
+const TECH_ROOT_ID = "industry:technology";
+const TECH_ROOT_NAME = "Technology";
 
 function resolvePartnerships(rawName: string): string[] {
   const norm = normalizeCompany(rawName);
@@ -231,6 +238,10 @@ export function buildGraph(args: BuildGraphArgs): {
 
   // Track person→companyId to derive colleague edges in a second pass.
   const peopleByCompany = new Map<string, string[]>();
+  // Track role → set of industry ids of its holders' companies, so roles can
+  // hang off industries and slot into the DAG hierarchy at level 2 (next to
+  // company nodes).
+  const roleIndustries = new Map<string, Set<string>>();
 
   // First pass: person/company/city/industry/past/education/talks/role.
   for (const raw of prospects as ProspectWithGraphFields[]) {
@@ -248,11 +259,20 @@ export function buildGraph(args: BuildGraphArgs): {
       raw,
     });
 
-    // Current company.
+    // Current company. City still gates on COMPANY_META (we don't have
+    // per-prospect city signal yet), but industry now prefers the prospect's
+    // own `industry` column — COMPANY_META only seeds ~30 known semis cos,
+    // so without this fallback the Industry node degenerated to a single
+    // "Semiconductors" hub even though the DB has Health Tech, Defense,
+    // Aerospace, Quantum, etc.
     const meta = resolveCompanyMeta(raw.company);
-    const cityName = meta.state ?? meta.country;
-    const cityId = `city:${normalizeKey(cityName)}`;
-    const industryId = `industry:${normalizeKey(meta.industry)}`;
+    const cityName = meta ? (meta.state ?? meta.country) : undefined;
+    const cityId = cityName ? `city:${normalizeKey(cityName)}` : undefined;
+    const industryName =
+      (raw.industry && raw.industry.trim()) || meta?.industry || undefined;
+    const industryId = industryName
+      ? `industry:${normalizeKey(industryName)}`
+      : undefined;
 
     addNode({
       id: companyId,
@@ -261,29 +281,35 @@ export function buildGraph(args: BuildGraphArgs): {
       locationId: cityId,
       industryId,
     });
-    addNode({ id: cityId, kind: "city", name: cityName, country: meta.country });
-    addNode({ id: industryId, kind: "industry", name: meta.industry });
+    if (cityId && cityName && meta) {
+      addNode({ id: cityId, kind: "city", name: cityName, country: meta.country });
+      addEdge(companyId, cityId, "located_in");
+    }
+    if (industryId && industryName) {
+      addNode({ id: industryId, kind: "industry", name: industryName });
+      addEdge(companyId, industryId, "vertical");
+    }
 
     addEdge(personId, companyId, "works_at");
-    addEdge(companyId, cityId, "located_in");
-    addEdge(companyId, industryId, "vertical");
 
     // Track for colleague edges.
     const bucket = peopleByCompany.get(companyId);
     if (bucket) bucket.push(personId);
     else peopleByCompany.set(companyId, [personId]);
 
-    // Past companies — each becomes a company node + past_employer edge from
-    // the person, plus a vertical edge if we know the industry.
+    // Past companies — same Unknown gating as current company.
     for (const past of raw.past_companies ?? []) {
       if (!past) continue;
       const pastNorm = normalizeCompany(past);
       if (!pastNorm) continue;
       const pastId = `company:${pastNorm}`;
       const pastMeta = resolveCompanyMeta(past);
-      const pastCityName = pastMeta.state ?? pastMeta.country;
-      const pastCityId = `city:${normalizeKey(pastCityName)}`;
-      const pastIndustryId = `industry:${normalizeKey(pastMeta.industry)}`;
+      const pastCityName = pastMeta ? (pastMeta.state ?? pastMeta.country) : undefined;
+      const pastCityId = pastCityName ? `city:${normalizeKey(pastCityName)}` : undefined;
+      const pastIndustryId =
+        pastMeta && pastMeta.industry
+          ? `industry:${normalizeKey(pastMeta.industry)}`
+          : undefined;
       addNode({
         id: pastId,
         kind: "company",
@@ -291,16 +317,20 @@ export function buildGraph(args: BuildGraphArgs): {
         locationId: pastCityId,
         industryId: pastIndustryId,
       });
-      addNode({
-        id: pastCityId,
-        kind: "city",
-        name: pastCityName,
-        country: pastMeta.country,
-      });
-      addNode({ id: pastIndustryId, kind: "industry", name: pastMeta.industry });
+      if (pastCityId && pastCityName && pastMeta) {
+        addNode({
+          id: pastCityId,
+          kind: "city",
+          name: pastCityName,
+          country: pastMeta.country,
+        });
+        addEdge(pastId, pastCityId, "located_in");
+      }
+      if (pastIndustryId && pastMeta) {
+        addNode({ id: pastIndustryId, kind: "industry", name: pastMeta.industry });
+        addEdge(pastId, pastIndustryId, "vertical");
+      }
       addEdge(personId, pastId, "past_employer");
-      addEdge(pastId, pastCityId, "located_in");
-      addEdge(pastId, pastIndustryId, "vertical");
     }
 
     // Education.
@@ -327,6 +357,13 @@ export function buildGraph(args: BuildGraphArgs): {
       const roleId = `role:${normalizeKey(raw.role)}`;
       addNode({ id: roleId, kind: "role", name: raw.role });
       addEdge(personId, roleId, "scope_signal");
+      // Track which industry a role's holders work in, so we can later wire
+      // role → industry edges (puts roles at the same DAG level as companies).
+      if (industryId) {
+        const set = roleIndustries.get(roleId) ?? new Set<string>();
+        set.add(industryId);
+        roleIndustries.set(roleId, set);
+      }
     }
   }
 
@@ -355,9 +392,12 @@ export function buildGraph(args: BuildGraphArgs): {
       const partnerId = `company:${partnerNorm}`;
       if (!nodes.has(partnerId)) {
         const partnerMeta = resolveCompanyMeta(partner);
-        const partnerCity = partnerMeta.state ?? partnerMeta.country;
-        const partnerCityId = `city:${normalizeKey(partnerCity)}`;
-        const partnerIndustryId = `industry:${normalizeKey(partnerMeta.industry)}`;
+        const partnerCity = partnerMeta ? (partnerMeta.state ?? partnerMeta.country) : undefined;
+        const partnerCityId = partnerCity ? `city:${normalizeKey(partnerCity)}` : undefined;
+        const partnerIndustryId =
+          partnerMeta && partnerMeta.industry
+            ? `industry:${normalizeKey(partnerMeta.industry)}`
+            : undefined;
         addNode({
           id: partnerId,
           kind: "company",
@@ -365,21 +405,51 @@ export function buildGraph(args: BuildGraphArgs): {
           locationId: partnerCityId,
           industryId: partnerIndustryId,
         });
-        addNode({
-          id: partnerCityId,
-          kind: "city",
-          name: partnerCity,
-          country: partnerMeta.country,
-        });
-        addNode({
-          id: partnerIndustryId,
-          kind: "industry",
-          name: partnerMeta.industry,
-        });
-        addEdge(partnerId, partnerCityId, "located_in");
-        addEdge(partnerId, partnerIndustryId, "vertical");
+        if (partnerCityId && partnerCity && partnerMeta) {
+          addNode({
+            id: partnerCityId,
+            kind: "city",
+            name: partnerCity,
+            country: partnerMeta.country,
+          });
+          addEdge(partnerId, partnerCityId, "located_in");
+        }
+        if (partnerIndustryId && partnerMeta) {
+          addNode({
+            id: partnerIndustryId,
+            kind: "industry",
+            name: partnerMeta.industry,
+          });
+          addEdge(partnerId, partnerIndustryId, "vertical");
+        }
       }
       addEdge(company.id, partnerId, "partnership");
+    }
+  }
+
+  // Hierarchy pass: add the Technology root + roll every industry, city, and
+  // role up to it. Direction matters for DAG layout — `addEdge(child, root)`
+  // means the child sits BELOW the root in dagMode="bu" (bottom-up).
+  // Skip if there are no companies at all (nothing meaningful to hang).
+  if (presentCompanyNodes.length > 0) {
+    addNode({ id: TECH_ROOT_ID, kind: "industry", name: TECH_ROOT_NAME });
+    for (const node of nodes.values()) {
+      if (node.id === TECH_ROOT_ID) continue;
+      if (node.kind === "industry") addEdge(node.id, TECH_ROOT_ID, "vertical");
+      if (node.kind === "city") addEdge(node.id, TECH_ROOT_ID, "located_in");
+    }
+    // Roles → their holders' industries (puts roles at level 2 alongside
+    // companies). Falls back to direct → Technology if a role has no
+    // resolvable industry (rare — only when every holder works at an
+    // unknown company).
+    for (const [roleId, industries] of roleIndustries) {
+      if (industries.size === 0) {
+        addEdge(roleId, TECH_ROOT_ID, "vertical");
+      } else {
+        for (const industryId of industries) {
+          addEdge(roleId, industryId, "vertical");
+        }
+      }
     }
   }
 
