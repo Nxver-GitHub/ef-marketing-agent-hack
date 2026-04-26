@@ -12,6 +12,7 @@
  * is rendered directly so the route still uses the shared chrome.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useIsFetching } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import ForceGraph2D, {
   type ForceGraphMethods,
@@ -230,6 +231,15 @@ const DEFAULT_EDGE_KINDS: EdgeKind[] = [
   "past_employer",
 ];
 
+// Cap how many prospects we let into the force-directed canvas. ForceGraph2D
+// stops being legible (and starts hitching) past ~500 nodes; with 10k
+// prospects the colleague edges alone would balloon past 100k. The chat
+// copilot still operates on the full set via AgentContext.nodes/edges
+// (rebuilt from the un-sliced array) so "find me X" queries don't lose
+// recall. v1 strategy: top-N by overall_score, falling back to insertion
+// order if score is missing.
+const MAX_PROSPECTS_RENDERED = 500;
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
 // Edge-pill order — duplicated from TopBar so the legend renders the same
@@ -263,9 +273,22 @@ function decodeEdgeKinds(raw: string | null): Set<EdgeKind> | null {
 
 const Discover = () => {
   const navigate = useNavigate();
-  const prospects = useProspects();
+  const allProspects = useProspects();
+  const allProspectIds = useMemo(() => allProspects.map((p) => p._id), [allProspects]);
+  const scores = useScoresFor(allProspectIds);
+  // Render only the top-N by overall_score. Stable sort: ties resolved by
+  // insertion order. The agent context below still receives the full
+  // nodes/edges so `filter` / `focus_node` retain full recall.
+  const prospects = useMemo(() => {
+    if (allProspects.length <= MAX_PROSPECTS_RENDERED) return allProspects;
+    const ranked = [...allProspects].sort((a, b) => {
+      const sa = scores[a._id]?.overall_score ?? -1;
+      const sb = scores[b._id]?.overall_score ?? -1;
+      return sb - sa;
+    });
+    return ranked.slice(0, MAX_PROSPECTS_RENDERED);
+  }, [allProspects, scores]);
   const prospectIds = useMemo(() => prospects.map((p) => p._id), [prospects]);
-  const scores = useScoresFor(prospectIds);
   const signalsById = useSignalsForMany(prospectIds);
 
   // Per-kind cached colors. Recomputed once per mount; theme switch would
@@ -405,20 +428,28 @@ const Discover = () => {
   }, []);
 
   // ─── Agent context ─────────────────────────────────────────────────────────
+  // Built off the FULL prospect set, not the rendered slice — so the chat
+  // copilot keeps recall over all 10k+ candidates even when the canvas only
+  // shows the top 500. focus_node / filter / explain etc. all operate on
+  // this fuller graph.
+  const fullGraph = useMemo(
+    () => buildGraph({ prospects: allProspects, scores, signalsById, theme }),
+    [allProspects, scores, signalsById, theme],
+  );
   const ctx: AgentContext = useMemo(
     () => ({
-      nodes,
-      edges,
+      nodes: fullGraph.nodes,
+      edges: fullGraph.edges,
       setSelectedId,
       setVisibleNodeIds,
       getProspectById: (id) =>
-        prospects.find((p) => `person:${p._id}` === id || p._id === id),
+        allProspects.find((p) => `person:${p._id}` === id || p._id === id),
       getScoreById: (id) => {
         const personId = id.startsWith("person:") ? id.slice(7) : id;
         return scores[personId];
       },
     }),
-    [nodes, edges, prospects, scores],
+    [fullGraph, allProspects, scores],
   );
 
   // ─── Inspector data wiring (person variant) ────────────────────────────────
@@ -443,6 +474,16 @@ const Discover = () => {
 
   // ─── Empty-state gate ──────────────────────────────────────────────────────
   const isEmpty = nodes.length === 0;
+  // Bulk-table fetches against Supabase paginate up to ~10s for the full
+  // 10k+ prospects pull. Until either prospects or scores resolves, show
+  // "Loading…" rather than the misleading "validate one to get started"
+  // empty state. `useIsFetching` returns the count of in-flight queries
+  // matching the key — non-zero = still streaming pages.
+  const fetchingProspects = useIsFetching({ queryKey: ["prospects"] });
+  const fetchingScores = useIsFetching({ queryKey: ["scores"] });
+  const fetchingSignals = useIsFetching({ queryKey: ["signals", "all"] });
+  const isLoadingData =
+    fetchingProspects > 0 || fetchingScores > 0 || fetchingSignals > 0;
 
   // ─── Stable callbacks for ForceGraph2D (avoid per-render identity churn) ───
   const linkVisibility = useCallback(
@@ -471,7 +512,21 @@ const Discover = () => {
       const gn = node as unknown as GraphNode;
       const x = node.x ?? 0;
       const y = node.y ?? 0;
-      const baseR = gn.kind === "person" ? 5 : gn.kind === "city" ? 5 : 5.5;
+      // Visual rank — bigger nodes for higher levels in the hierarchy so
+      // the eye lands on Technology → Industry/City → Company/Role → Person
+      // top-down. Selected gets a small bump.
+      const isRoot = gn.id === "industry:technology";
+      const isSelected = gn.id === selectedId;
+      const baseR = isRoot
+        ? 11
+        : gn.kind === "industry" || gn.kind === "city"
+          ? 7.5
+          : gn.kind === "company" || gn.kind === "role"
+            ? 6
+            : gn.kind === "school" || gn.kind === "conference"
+              ? 5
+              : 4.5; // person
+      const r = isSelected ? baseR + 1.5 : baseR;
 
       // Neighborhood-fade: when nothing's filtered AND a node is
       // selected, dim non-neighbors so the focal cluster pops.
@@ -479,16 +534,16 @@ const Discover = () => {
       if (selectedId && visibleNodeIds === null) {
         const isSelf = gn.id === selectedId;
         const isNeighbor = neighborByNode.get(selectedId)?.has(gn.id) ?? false;
-        if (!isSelf && !isNeighbor) alpha = 0.25;
+        if (!isSelf && !isNeighbor) alpha = 0.2;
       }
 
       ctx2d.save();
       ctx2d.globalAlpha = alpha;
 
       // Selected halo
-      if (gn.id === selectedId) {
+      if (isSelected) {
         ctx2d.beginPath();
-        ctx2d.arc(x, y, baseR + 4, 0, Math.PI * 2);
+        ctx2d.arc(x, y, r + 4, 0, Math.PI * 2);
         ctx2d.strokeStyle = nodeColorByKind[gn.kind];
         ctx2d.lineWidth = 1.5;
         ctx2d.globalAlpha = alpha * 0.6;
@@ -496,16 +551,24 @@ const Discover = () => {
         ctx2d.globalAlpha = alpha;
       }
 
-      paintShape(ctx2d, gn.kind, x, y, baseR, nodeColorByKind[gn.kind]);
+      paintShape(ctx2d, gn.kind, x, y, r, nodeColorByKind[gn.kind]);
 
-      // Label only when zoomed in enough.
-      if (globalScale >= 1.4) {
-        ctx2d.font = `${10 / globalScale}px ui-sans-serif, system-ui, sans-serif`;
-        ctx2d.fillStyle = "hsl(0 0% 45%)";
-        ctx2d.textAlign = "center";
-        ctx2d.textBaseline = "top";
-        ctx2d.fillText(gn.name, x, y + baseR + 2);
-      }
+      // Always-visible labels, with size keyed off the hierarchy. The font
+      // size is in px — divide by globalScale so it stays readable across
+      // zoom levels. We DON'T gate by globalScale anymore; user wants all
+      // titles visible.
+      const labelPx = isRoot ? 14 : gn.kind === "industry" || gn.kind === "city" ? 11 : gn.kind === "company" || gn.kind === "role" ? 10 : 9;
+      ctx2d.font = `${isRoot || isSelected ? "600 " : ""}${labelPx / globalScale}px ui-sans-serif, system-ui, sans-serif`;
+      ctx2d.fillStyle = isRoot
+        ? "hsl(0 0% 15%)"
+        : isSelected
+          ? "hsl(0 0% 20%)"
+          : gn.kind === "person"
+            ? "hsl(0 0% 35%)"
+            : "hsl(0 0% 28%)";
+      ctx2d.textAlign = "center";
+      ctx2d.textBaseline = "top";
+      ctx2d.fillText(gn.name, x, y + r + 2);
 
       ctx2d.restore();
     },
@@ -539,7 +602,9 @@ const Discover = () => {
                 <span className="text-foreground">
                   {nodes.filter((n) => n.kind === "person").length}
                 </span>{" "}
-                candidates
+                {allProspects.length > MAX_PROSPECTS_RENDERED
+                  ? `of ${allProspects.length} candidates (top by score)`
+                  : "candidates"}
               </span>
               <span>
                 Selected:{" "}
@@ -614,8 +679,26 @@ const Discover = () => {
           {/* Canvas */}
           <div ref={canvasWrapRef} className="relative flex-1 min-h-0">
             {isEmpty ? (
-              <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
-                No prospects yet — validate one to get started.
+              <div
+                className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm text-muted-foreground"
+                aria-live="polite"
+                aria-busy={isLoadingData}
+              >
+                {isLoadingData ? (
+                  <>
+                    <div className="h-3 w-3 rounded-full bg-foreground/30 animate-pulse" />
+                    <div className="text-[11px] uppercase tracking-[0.18em]">
+                      Loading the network…
+                    </div>
+                    <div className="text-[11px] text-muted-foreground/70 text-mono">
+                      streaming {fetchingProspects > 0 ? "prospects" : ""}
+                      {fetchingScores > 0 ? " · scores" : ""}
+                      {fetchingSignals > 0 ? " · signals" : ""}
+                    </div>
+                  </>
+                ) : (
+                  "No prospects loaded yet — the graph will populate when data lands."
+                )}
               </div>
             ) : (
               canvasSize.w > 0 &&
@@ -627,15 +710,24 @@ const Discover = () => {
                   height={canvasSize.h}
                   nodeId="id"
                   nodeRelSize={4}
+                  // DAG layout: bottom-up so source nodes (children) sit BELOW
+                  // target nodes (parents). The edge direction Person → Role →
+                  // Industry → Technology reads as a top-down hierarchy on
+                  // screen.
+                  dagMode="td"
+                  dagLevelDistance={70}
+                  // colleague + partnership are symmetric and may form cycles;
+                  // ForceGraph throws by default. Swallow it — non-DAG nodes
+                  // just fall back to standard force layout.
+                  onDagError={() => undefined}
                   // Perf: shorter sim + faster cooldown. Audit (FrostyOtter)
                   // measured 3.6s warmup with the defaults; these knobs cut it
-                  // to ~700ms while still settling visually. Property-name
-                  // accessors below skip per-tick callbacks for color/width.
-                  cooldownTime={1200}
-                  cooldownTicks={70}
-                  warmupTicks={15}
-                  d3AlphaDecay={0.05}
-                  d3VelocityDecay={0.35}
+                  // to ~700ms while still settling visually.
+                  cooldownTime={1500}
+                  cooldownTicks={90}
+                  warmupTicks={20}
+                  d3AlphaDecay={0.04}
+                  d3VelocityDecay={0.3}
                   linkDirectionalParticles={0}
                   backgroundColor="transparent"
                   linkColor="color"

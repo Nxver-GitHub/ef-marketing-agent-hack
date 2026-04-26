@@ -34,35 +34,24 @@ const Index = () => {
           </div>
         </div>
 
+        {/*
+         * Validate + Weights cards are temporarily hidden per product call —
+         * the routes (/validate, /settings) and their pages remain so direct
+         * URL access works for testing/admin. Pipeline becomes the single
+         * primary entrypoint from the landing page.
+         */}
         <div className="md:col-span-5 flex flex-col justify-end gap-px">
           <Link
-            to="/validate"
-            className="group block border border-border p-8 hover:bg-secondary transition-colors"
-          >
-            <div className="label-eyebrow mb-6">Validate</div>
-            <div className="text-2xl md:text-3xl font-light tracking-tight mb-2">
-              Score a prospect.
-            </div>
-            <div className="text-sm text-muted-foreground mb-10">
-              Enter a name, company, role, and industry. Get a transparent trust-and-fit score with
-              every contributing signal exposed and falsifiable.
-            </div>
-            <div className="flex items-center justify-between text-xs text-mono">
-              <span className="text-muted-foreground">→ /validate</span>
-              <span className="opacity-0 group-hover:opacity-100 transition-opacity">↗</span>
-            </div>
-          </Link>
-
-          <Link
             to="/discover"
-            className="group block border border-border border-t-0 p-8 hover:bg-secondary transition-colors"
+            className="group block border border-border p-8 hover:bg-secondary transition-colors"
           >
             <div className="label-eyebrow mb-6">Pipeline</div>
             <div className="text-2xl md:text-3xl font-light tracking-tight mb-2">
-              Browse scored prospects.
+              Browse the prospect graph.
             </div>
             <div className="text-sm text-muted-foreground mb-6">
-              Filter, rank, and compare every prospect that has run through the scoring engine.
+              Triangulate people across companies, roles, cities, and evidence sources.
+              Ask the network to filter, focus, or explain any node.
             </div>
             {scored.length > 0 && (
               <div className="flex items-center gap-6 mb-6 text-xs text-mono text-muted-foreground">
@@ -76,24 +65,6 @@ const Index = () => {
             )}
             <div className="flex items-center justify-between text-xs text-mono">
               <span className="text-muted-foreground">→ /discover</span>
-              <span className="opacity-0 group-hover:opacity-100 transition-opacity">↗</span>
-            </div>
-          </Link>
-
-          <Link
-            to="/settings"
-            className="group block border border-border border-t-0 p-8 hover:bg-secondary transition-colors"
-          >
-            <div className="label-eyebrow mb-6">Weights</div>
-            <div className="text-2xl md:text-3xl font-light tracking-tight mb-2">
-              Tune the scoring model.
-            </div>
-            <div className="text-sm text-muted-foreground mb-10">
-              Adjust how each signal contributes to Authenticity, Authority, and Warmth.
-              Changes recompute all scores immediately.
-            </div>
-            <div className="flex items-center justify-between text-xs text-mono">
-              <span className="text-muted-foreground">→ /settings</span>
               <span className="opacity-0 group-hover:opacity-100 transition-opacity">↗</span>
             </div>
           </Link>
