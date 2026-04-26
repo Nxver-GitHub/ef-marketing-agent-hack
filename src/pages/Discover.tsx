@@ -23,6 +23,7 @@ import { TopBar } from "@/components/TopBar";
 import { GraphChat } from "@/components/GraphChat";
 import { NodeInspector } from "@/components/NodeInspector";
 import { useProspects, useScoresFor, useSignalsForMany } from "@/lib/db";
+import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import {
   buildGraph,
   type EdgeKind,
@@ -272,6 +273,7 @@ function decodeEdgeKinds(raw: string | null): Set<EdgeKind> | null {
 }
 
 const Discover = () => {
+  useDocumentTitle("Discover");
   const navigate = useNavigate();
   const allProspects = useProspects();
   const allProspectIds = useMemo(() => allProspects.map((p) => p._id), [allProspects]);
