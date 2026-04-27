@@ -39,6 +39,7 @@ const HINTS: { label: string; query: string }[] = [
   { label: "VPs at Intel", query: "Find VPs at Intel, sorted by score." },
   { label: "Top semiconductor engineers", query: "Show me the top 8 highest-scoring semiconductor engineers." },
   { label: "Marc Hamilton's network", query: "Find Marc Hamilton and show his 1-hop network." },
+  { label: "Highest-trust manufacturing leads", query: "Show me the highest-trust manufacturing leaders by score." },
 ];
 
 // ─── Markdown styling — tight, fits the 360px rail ───────────────────────────

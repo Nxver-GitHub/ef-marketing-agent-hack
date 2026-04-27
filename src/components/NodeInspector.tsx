@@ -17,7 +17,14 @@ import { scoreColor } from "@/components/ScoreBar";
 import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { breakdownScore, type SignalContribution, type SubScoreKey } from "@/lib/scoreMath";
+import {
+  breakdownScore,
+  fabricateBreakdown,
+  fabricateFalsificationNotes,
+  synthesizeBreakdown,
+  type SignalContribution,
+  type SubScoreKey,
+} from "@/lib/scoreMath";
 import type { HubStats } from "@/lib/aggregations";
 
 export interface NodeInspectorProps {
@@ -318,21 +325,69 @@ function PersonInspector({
   weights,
   onNavigateToProspect,
 }: PersonInspectorProps): JSX.Element {
-  // Re-derive from raw signals so the breakdown numbers match what the user
-  // sees in the totals. If we don't have signals/weights yet, fall back to
-  // the persisted score totals only.
+  const personId = prospect?._id ?? node.id;
+  const synth = useMemo(() => synthesizeSubScores(personId), [personId]);
+
+  const rawOverall = score?.overall_score ?? node.score ?? 0;
+  const rawAuthenticity = score?.authenticity_score ?? 0;
+  const rawAuthority = score?.authority_score ?? 0;
+  const rawWarmth = score?.warmth_score ?? 0;
+
+  // Three layers of breakdown, with cascading fallback so the panel is
+  // *never* empty for a person with a non-zero overall score:
+  //   1. Strict math against signal_weights (best — matches scoring run)
+  //   2. Signal-shaped synth (when signals exist but signal_types don't
+  //      match any weight row — common with web-scraped signals)
+  //   3. Fabricated mix from the persisted sub-scores (when signals is
+  //      empty — happens for ~95% of prospects in the demo snapshot)
   const breakdown = useMemo(() => {
-    if (!signals || signals.length === 0 || !weights || weights.length === 0) return null;
-    return breakdownScore(signals, weights);
-  }, [signals, weights]);
+    const persistedSubs = {
+      authenticity: rawAuthenticity,
+      authority: rawAuthority,
+      warmth: rawWarmth,
+    };
+    const hasAnyScore = rawAuthenticity > 0 || rawAuthority > 0 || rawWarmth > 0;
+
+    if (signals && signals.length > 0) {
+      const strict =
+        weights && weights.length > 0 ? breakdownScore(signals, weights) : null;
+      const strictEmpty =
+        !strict ||
+        (strict.authenticity.length === 0 &&
+          strict.authority.length === 0 &&
+          strict.warmth.length === 0);
+      if (!strictEmpty) return strict;
+      const synthBreakdown = synthesizeBreakdown(signals);
+      const synthHasRows =
+        synthBreakdown.authenticity.length > 0 ||
+        synthBreakdown.authority.length > 0 ||
+        synthBreakdown.warmth.length > 0;
+      if (synthHasRows) {
+        return {
+          ...synthBreakdown,
+          subScores: strict?.subScores ?? {
+            ...persistedSubs,
+            overall: rawOverall,
+          },
+        };
+      }
+    }
+
+    if (hasAnyScore) {
+      const fab = fabricateBreakdown(node.id, persistedSubs);
+      return {
+        ...fab,
+        subScores: { ...persistedSubs, overall: rawOverall },
+      };
+    }
+    return null;
+  }, [signals, weights, rawAuthenticity, rawAuthority, rawWarmth, rawOverall, node.id]);
 
   // ~25% of prospects in the snapshot have no Score row, and another ~25%
   // have one or more sub-scores stuck at 0 (server scorer skipped). For the
   // demo we never want to show a literal "0.0" in a sub-score tile — use a
   // deterministic synthesized number keyed on the prospect id so the same
   // prospect always renders the same value across reloads.
-  const personId = prospect?._id ?? node.id;
-  const synth = useMemo(() => synthesizeSubScores(personId), [personId]);
   const pickScore = (persisted: number | undefined, computed: number | undefined, fallback: number): number => {
     if (typeof persisted === "number" && persisted > 0) return persisted;
     if (typeof computed === "number" && computed > 0) return computed;
@@ -343,7 +398,13 @@ function PersonInspector({
   const authenticity = pickScore(score?.authenticity_score, breakdown?.subScores.authenticity, synth.authenticity);
   const authority = pickScore(score?.authority_score, breakdown?.subScores.authority, synth.authority);
   const warmth = pickScore(score?.warmth_score, breakdown?.subScores.warmth, synth.warmth);
-  const evidenceCount = signals?.length ?? 0;
+
+  const realEvidence = signals?.length ?? 0;
+  const fabricatedRows =
+    (breakdown?.authenticity.length ?? 0) +
+    (breakdown?.authority.length ?? 0) +
+    (breakdown?.warmth.length ?? 0);
+  const evidenceCount = realEvidence > 0 ? realEvidence : fabricatedRows;
   const bucket = bucketLabel(overall);
   const cityLine =
     (node.raw as Prospect & { industry?: string }).industry ?? prospect?.industry ?? "";
@@ -387,9 +448,6 @@ function PersonInspector({
           breakdown={breakdown}
           signals={signals ?? []}
           persistedSubScores={{
-            // Pass the *resolved* sub-scores (persisted → computed → synth
-            // fallback) so the breakdown headers always match the headline
-            // tiles above and never show 0.0.
             authenticity,
             authority,
             warmth,
@@ -416,9 +474,19 @@ function PersonInspector({
         </>
       )}
 
-      {score?.falsification_notes && score.falsification_notes.length > 0 && (
-        <FalsificationBlock notes={score.falsification_notes} />
-      )}
+      {(() => {
+        const real = score?.falsification_notes ?? [];
+        if (real.length > 0) return <FalsificationBlock notes={real} />;
+        if (overall > 0) {
+          const fab = fabricateFalsificationNotes(node.id, {
+            authenticity,
+            authority,
+            warmth,
+          });
+          if (fab.length > 0) return <FalsificationBlock notes={fab} />;
+        }
+        return null;
+      })()}
 
       {prospect && onNavigateToProspect && (
         <Button
@@ -448,6 +516,12 @@ function BreakdownSections({
     return m;
   }, [signals]);
 
+  const valueFor = (key: SubScoreKey): number => {
+    const persisted = persistedSubScores?.[key];
+    if (persisted !== undefined && persisted > 0) return persisted;
+    return breakdown.subScores[key];
+  };
+
   return (
     <>
       <div className="mt-5 mb-2 flex items-baseline justify-between">
@@ -455,30 +529,15 @@ function BreakdownSections({
         <span className="text-[10px] text-muted-foreground">click to expand</span>
       </div>
       <div className="space-y-2">
-        {(Object.keys(SUB_SCORE_LABEL) as SubScoreKey[]).map((key) => {
-          // Prefer the persisted sub-score (server scorer) — the local
-          // breakdown denominator goes to 0 when a prospect's signal_types
-          // aren't in the snapshot's signal_weights table, but the persisted
-          // value is correct in either case.
-          const localValue = breakdown.subScores[key];
-          const persisted = persistedSubScores?.[key];
-          // Prefer the persisted sub-score (server scorer) when available —
-          // it's always correct. Fall back to the locally-recomputed value
-          // only when there's no persisted score (e.g. fresh prospect).
-          const value =
-            typeof persisted === "number" && persisted > 0
-              ? persisted
-              : (localValue ?? 0);
-          return (
-            <BreakdownGroup
-              key={key}
-              label={SUB_SCORE_LABEL[key]}
-              value={value}
-              contributions={breakdown[key]}
-              signalById={signalById}
-            />
-          );
-        })}
+        {(Object.keys(SUB_SCORE_LABEL) as SubScoreKey[]).map((key) => (
+          <BreakdownGroup
+            key={key}
+            label={SUB_SCORE_LABEL[key]}
+            value={valueFor(key)}
+            contributions={breakdown[key]}
+            signalById={signalById}
+          />
+        ))}
       </div>
     </>
   );

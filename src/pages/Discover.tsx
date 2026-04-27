@@ -1170,15 +1170,14 @@ const Discover = () => {
   // Technology root (always present in the focal subgraph) to "go home".
   const onBackgroundClickStable = useCallback(() => undefined, []);
 
-  const nodeCanvasObject = useCallback(
-    (node: FGNode, ctx2d: CanvasRenderingContext2D, globalScale: number) => {
-      const gn = node as unknown as GraphNode;
-      const x = node.x ?? 0;
-      const y = node.y ?? 0;
-      // Node radius — slight rank by kind so the eye lands on the bigger
-      // hubs (Technology root, industries, cities) before the leaves.
+  // Shared radius helper. Used by both the visual painter and the pointer-
+  // area painter so the click hit-box always matches the painted shape —
+  // ForceGraph's default hit area is `nodeRelSize * sqrt(nodeVal)` ≈ 4px
+  // around the center, which made big hub nodes feel half-broken because
+  // only the very middle was clickable.
+  const nodeRadius = useCallback(
+    (gn: GraphNode, isSelected: boolean): number => {
       const isRoot = gn.id === "industry:technology";
-      const isSelected = gn.id === selectedId;
       const baseR = isRoot
         ? 12
         : gn.kind === "industry" || gn.kind === "city"
@@ -1188,7 +1187,37 @@ const Discover = () => {
             : gn.kind === "school" || gn.kind === "conference"
               ? 5.5
               : 5; // person
-      const r = isSelected ? baseR + 2 : baseR;
+      return isSelected ? baseR + 2 : baseR;
+    },
+    [],
+  );
+
+  const nodePointerAreaPaint = useCallback(
+    (node: FGNode, color: string, ctx2d: CanvasRenderingContext2D) => {
+      const gn = node as unknown as GraphNode;
+      const x = node.x ?? 0;
+      const y = node.y ?? 0;
+      const r = nodeRadius(gn, gn.id === selectedId);
+      // Generous hit area — paint slightly larger than the visible shape so
+      // the click target feels forgiving on a busy canvas.
+      ctx2d.fillStyle = color;
+      ctx2d.beginPath();
+      ctx2d.arc(x, y, r + 4, 0, Math.PI * 2);
+      ctx2d.fill();
+    },
+    [nodeRadius, selectedId],
+  );
+
+  const nodeCanvasObject = useCallback(
+    (node: FGNode, ctx2d: CanvasRenderingContext2D, globalScale: number) => {
+      const gn = node as unknown as GraphNode;
+      const x = node.x ?? 0;
+      const y = node.y ?? 0;
+      // Node radius — slight rank by kind so the eye lands on the bigger
+      // hubs (Technology root, industries, cities) before the leaves.
+      const isRoot = gn.id === "industry:technology";
+      const isSelected = gn.id === selectedId;
+      const r = nodeRadius(gn, isSelected);
 
       // Score-based color for persons; kind color for all other node types.
       const nodeColor =
@@ -1539,7 +1568,11 @@ const Discover = () => {
                   width={canvasSize.w}
                   height={canvasSize.h}
                   nodeId="id"
-                  nodeRelSize={4}
+                  // Hit area = nodeRelSize * sqrt(nodeVal). With our custom
+                  // painter the visible radii are 5–12px, so size the default
+                  // hit area to 12 to keep clicks landing even if the custom
+                  // pointer-area painter ever falls back.
+                  nodeRelSize={12}
                   // Pure organic force-directed (Obsidian-style). DAG mode
                   // collapses every level into a horizontal stripe with this
                   // many nodes — wrong shape for what we want.
@@ -1570,8 +1603,7 @@ const Discover = () => {
                   onEngineStop={onEngineStop}
                   nodeLabel={nodeLabelStable}
                   nodeCanvasObject={nodeCanvasObject}
-                  linkCanvasObject={linkCanvasObject}
-                  linkCanvasObjectMode="after"
+                  nodePointerAreaPaint={nodePointerAreaPaint}
                 />
               )
             )}
