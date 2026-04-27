@@ -450,14 +450,47 @@ const Discover = () => {
       const matched = allProspects.filter((p) => chatPromotedIds.has(p._id));
       if (matched.length > 0) return matched.slice(0, RENDER_CAP);
     }
-    if (allProspects.length <= RENDER_CAP) return allProspects;
+    // Focus-aware expansion: when the user clicks a company / industry / role,
+    // pull in *that node's* prospects on top of the global top-N so the focal
+    // subgraph isn't a 2-person sample of a 400-person org. Bounded so first-
+    // render stays cheap; only triggers on click.
+    const colonIdx = focusId?.indexOf(":") ?? -1;
+    const focusKind = focusId && colonIdx > 0 ? focusId.slice(0, colonIdx) : null;
+    const focusName = focusId && colonIdx > 0 ? focusId.slice(colonIdx + 1) : null;
+    const focusMatches: typeof allProspects = (() => {
+      if (!focusKind || !focusName || focusKind === "person") return [];
+      const norm = (s: string) => s.trim().toLowerCase();
+      switch (focusKind) {
+        case "company":
+          return allProspects.filter((p) => norm(p.company) === focusName);
+        case "industry":
+          return allProspects.filter((p) => norm(p.industry) === focusName);
+        case "role":
+          return allProspects.filter((p) => norm(p.role).includes(focusName));
+        default:
+          return [];
+      }
+    })();
+
+    if (allProspects.length <= RENDER_CAP && focusMatches.length === 0) {
+      return allProspects;
+    }
     const ranked = [...allProspects].sort((a, b) => {
       const sa = scores[a._id]?.overall_score ?? -1;
       const sb = scores[b._id]?.overall_score ?? -1;
       return sb - sa;
     });
-    return ranked.slice(0, RENDER_CAP);
-  }, [allProspects, chatPromotedIds, scores]);
+    const baseTopN = ranked.slice(0, RENDER_CAP);
+    if (focusMatches.length === 0) return baseTopN;
+    const seen = new Set(baseTopN.map((p) => p._id));
+    for (const p of focusMatches) {
+      if (!seen.has(p._id)) {
+        baseTopN.push(p);
+        seen.add(p._id);
+      }
+    }
+    return baseTopN;
+  }, [allProspects, chatPromotedIds, scores, focusId]);
 
   // Cap the agent-context graph too — pre-cap, /discover spent ~39s of long
   // tasks on first render building a 17k-prospect graph (audit Apr-26).
