@@ -22,7 +22,7 @@ import ForceGraph2D, {
 import { TopBar } from "@/components/TopBar";
 import { GraphChat } from "@/components/GraphChat";
 import { NodeInspector } from "@/components/NodeInspector";
-import { useProspects, useScoresFor, useSignalsForMany } from "@/lib/db";
+import { useProspects, useScoresFor, useSignalsFor, useSignalsForMany } from "@/lib/db";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import {
   buildGraph,
@@ -326,6 +326,50 @@ const FOCAL_AGG_PEOPLE_CAP = Number.POSITIVE_INFINITY;
 // button.
 const TECH_ROOT_ID = "industry:technology";
 
+// ─── View modes ──────────────────────────────────────────────────────────────
+// Curated presets that swap the active edge + node kinds in one click so the
+// user can isolate the relationship they care about without hunting through
+// the per-pill edge filter. "All" preserves the current default.
+type ViewMode = "all" | "org" | "roles" | "geo" | "industries";
+
+const VIEW_MODES: ReadonlyArray<{
+  id: ViewMode;
+  label: string;
+  edges: ReadonlySet<EdgeKind>;
+  nodes: ReadonlySet<NodeKind>;
+}> = [
+  {
+    id: "all",
+    label: "All",
+    edges: new Set(ALL_EDGE_KINDS),
+    nodes: new Set(["person", "company", "role", "city", "school", "conference", "industry"] as NodeKind[]),
+  },
+  {
+    id: "org",
+    label: "Org",
+    edges: new Set<EdgeKind>(["works_at", "colleague", "reports_to"]),
+    nodes: new Set<NodeKind>(["person", "company"]),
+  },
+  {
+    id: "roles",
+    label: "Roles",
+    edges: new Set<EdgeKind>(["works_at", "scope_signal"]),
+    nodes: new Set<NodeKind>(["person", "company", "role"]),
+  },
+  {
+    id: "geo",
+    label: "Geography",
+    edges: new Set<EdgeKind>(["located_in", "vertical"]),
+    nodes: new Set<NodeKind>(["company", "city", "industry"]),
+  },
+  {
+    id: "industries",
+    label: "Industries",
+    edges: new Set<EdgeKind>(["vertical", "partnership"]),
+    nodes: new Set<NodeKind>(["company", "industry"]),
+  },
+];
+
 // Seniority ranking. Lower number = higher in the org. Used to order the
 // focal-company subgraph from CEO down. Free-text role strings are messy, so
 // we match against word-boundary keywords in priority order.
@@ -415,6 +459,16 @@ const Discover = () => {
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string> | null>(null);
   const [edgeKindsActive, setEdgeKindsActive] = useState<Set<EdgeKind>>(initialEdgeKinds);
+  const [viewMode, setViewMode] = useState<ViewMode>("all");
+  const activeViewNodes = useMemo<ReadonlySet<NodeKind>>(
+    () => VIEW_MODES.find((v) => v.id === viewMode)?.nodes ?? VIEW_MODES[0].nodes,
+    [viewMode],
+  );
+  const onPickViewMode = useCallback((mode: ViewMode) => {
+    setViewMode(mode);
+    const preset = VIEW_MODES.find((v) => v.id === mode);
+    if (preset) setEdgeKindsActive(new Set(preset.edges));
+  }, []);
 
   // Render top-N by overall_score by default. When the chat copilot has
   // narrowed the world via `filter` / `focus_node` / `explain` /
@@ -453,13 +507,15 @@ const Discover = () => {
     }
     // Focus-aware expansion: when the user clicks a company / industry / role,
     // pull in *that node's* prospects on top of the global top-N so the focal
-    // subgraph isn't a 2-person sample of a 400-person org. Bounded so first-
-    // render stays cheap; only triggers on click.
+    // subgraph isn't a 2-person sample of a 400-person org. When the user
+    // clicks a PERSON, expand to that person's colleagues (same company) —
+    // gives an org-chart-style drill-down even if those colleagues weren't
+    // in the score-ranked top-250. Bounded by FOCAL_EXPAND_CAP below.
     const colonIdx = focusId?.indexOf(":") ?? -1;
     const focusKind = focusId && colonIdx > 0 ? focusId.slice(0, colonIdx) : null;
     const focusName = focusId && colonIdx > 0 ? focusId.slice(colonIdx + 1) : null;
     const focusMatches: typeof allProspects = (() => {
-      if (!focusKind || !focusName || focusKind === "person") return [];
+      if (!focusKind || !focusName) return [];
       const norm = (s: string) => s.trim().toLowerCase();
       switch (focusKind) {
         case "company":
@@ -468,6 +524,16 @@ const Discover = () => {
           return allProspects.filter((p) => norm(p.industry) === focusName);
         case "role":
           return allProspects.filter((p) => norm(p.role).includes(focusName));
+        case "person": {
+          // focusName is the prospect _id (since person:<id> is the node id).
+          const me = allProspects.find((p) => p._id === focusName);
+          if (!me) return [];
+          const myCompany = norm(me.company);
+          // colleagues at the same company, excluding self
+          return allProspects.filter(
+            (p) => p._id !== me._id && norm(p.company) === myCompany,
+          );
+        }
         default:
           return [];
       }
@@ -572,10 +638,10 @@ const Discover = () => {
   }, [edges]);
 
   // Resolve selected node (may be null/stale).
-  const selectedNode = useMemo<GraphNode | null>(
-    () => (selectedId ? (nodes.find((n) => n.id === selectedId) ?? null) : null),
-    [nodes, selectedId],
-  );
+  // selectedNode resolution. Defined later (after fullGraph) so it can fall
+  // back to the agent's full node set when the click came from a chat-
+  // surfaced node that isn't in the rendered top-250. See `selectedNode`
+  // declaration below.
 
   // ─── Focal subgraph — the local universe around `focusId` ──────────────────
   // When focusId is null we're in "wide view": show the whole rendered set.
@@ -624,9 +690,16 @@ const Discover = () => {
       for (const id of others) visible.add(id);
     }
     const out: GraphNode[] = [];
-    for (const n of nodes) if (visible.has(n.id)) out.push(n);
+    for (const n of nodes) {
+      if (!visible.has(n.id)) continue;
+      // View-mode filter: keep the focused node itself even if its kind is
+      // hidden (otherwise clicking a Role node in Geography mode strands you);
+      // otherwise only keep node kinds the active view allows.
+      if (n.id !== focusId && !activeViewNodes.has(n.kind)) continue;
+      out.push(n);
+    }
     return out;
-  }, [focusId, nodes, nodeById, neighborByNode]);
+  }, [focusId, nodes, nodeById, neighborByNode, activeViewNodes]);
 
   const focalEdges = useMemo(() => {
     if (!focusId) return edges;
@@ -838,13 +911,43 @@ const Discover = () => {
     [fullGraph, allProspects, scores],
   );
 
+  // selectedNode — first try the rendered nodeById (fast), then the agent's
+  // fullGraph (covers every prospect / company / city in the DB). Without
+  // the fallback, clicking a person whose colleague edge or chat-surfaced
+  // node hadn't yet been promoted to the rendered set left the inspector
+  // empty even though the click registered.
+  const fullNodeById = useMemo(() => {
+    const m = new Map<string, GraphNode>();
+    for (const n of fullGraph.nodes) m.set(n.id, n);
+    return m;
+  }, [fullGraph]);
+  const selectedNode = useMemo<GraphNode | null>(() => {
+    if (!selectedId) return null;
+    return nodeById.get(selectedId) ?? fullNodeById.get(selectedId) ?? null;
+  }, [nodeById, fullNodeById, selectedId]);
+
   // ─── Inspector data wiring (person variant) ────────────────────────────────
   const selectedProspect = useMemo(() => {
     if (!selectedNode || selectedNode.kind !== "person") return undefined;
-    return prospects.find((p) => p._id === selectedNode.raw._id);
-  }, [selectedNode, prospects]);
+    // Fall back to allProspects when the clicked person isn't in the
+    // top-250 rendered slice — the focal-expand bumps them in for the next
+    // render, but selectedProspect needs to resolve THIS render or the
+    // inspector renders a header-only stub.
+    return (
+      prospects.find((p) => p._id === selectedNode.raw._id) ??
+      allProspects.find((p) => p._id === selectedNode.raw._id)
+    );
+  }, [selectedNode, prospects, allProspects]);
   const selectedScore = selectedProspect ? scores[selectedProspect._id] : undefined;
-  const selectedSignals = selectedProspect ? signalsById[selectedProspect._id] : undefined;
+  // Signals lookup falls back to a live useSupaSignalsFor when the bulk
+  // signalsById doesn't have the prospect — covers the same off-render-set
+  // case as selectedProspect.
+  const fallbackSignals = useSignalsFor(
+    selectedProspect && !signalsById[selectedProspect._id] ? selectedProspect._id : undefined,
+  );
+  const selectedSignals = selectedProspect
+    ? (signalsById[selectedProspect._id] ?? fallbackSignals)
+    : undefined;
 
   // Tooltip body — kind-aware sub-line + optional score chip. Lives down
   // here so it can read selectedScore (declared just above).
