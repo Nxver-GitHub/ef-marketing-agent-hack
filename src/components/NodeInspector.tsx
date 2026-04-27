@@ -9,15 +9,16 @@
  * land — search for "TODO(real-data)" below to find the seams.
  */
 import type { JSX } from "react";
-import { X } from "lucide-react";
+import { useMemo, useState } from "react";
+import { ChevronDown, X } from "lucide-react";
 import type { GraphNode } from "@/lib/graph";
-import { GENERATED_COMPANY_META } from "@/lib/company-meta.generated";
-import type { Prospect, Score, Signal } from "@/lib/mockStore";
+import type { Prospect, Score, Signal, SignalWeight } from "@/lib/mockStore";
 import { scoreColor } from "@/components/ScoreBar";
-import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { breakdownScore, type SignalContribution, type SubScoreKey } from "@/lib/scoreMath";
+import type { HubStats } from "@/lib/aggregations";
 
 export interface NodeInspectorProps {
   node: GraphNode | null;
@@ -25,6 +26,11 @@ export interface NodeInspectorProps {
   prospect?: Prospect;
   score?: Score;
   signals?: Signal[];
+  weights?: SignalWeight[];
+  /** Live counts for non-person nodes (computed in Discover.tsx). */
+  hubStats?: HubStats;
+  /** Click-through from a hub's "top people" list into a person node. */
+  onSelectProspect?: (prospectId: string) => void;
   onNavigateToProspect?: (id: string) => void;
 }
 
@@ -156,7 +162,17 @@ const Avatar = ({ kind }: { kind: GraphNode["kind"] }) => {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 export function NodeInspector(props: NodeInspectorProps): JSX.Element | null {
-  const { node, onClose, prospect, score, signals, onNavigateToProspect } = props;
+  const {
+    node,
+    onClose,
+    prospect,
+    score,
+    signals,
+    weights,
+    hubStats,
+    onSelectProspect,
+    onNavigateToProspect,
+  } = props;
   if (!node) return null;
 
   const Header = (
@@ -176,248 +192,27 @@ export function NodeInspector(props: NodeInspectorProps): JSX.Element | null {
 
   // ─── PERSON ────────────────────────────────────────────────────────────────
   if (node.kind === "person") {
-    const overall = score?.overall_score ?? node.score ?? 0;
-    const bucket = bucketLabel(overall);
-    const cityLine =
-      (node.raw as Prospect & { industry?: string }).industry ?? prospect?.industry ?? "";
-    const subLine = prospect
-      ? `${prospect.role} · ${prospect.company}${cityLine ? ` · ${cityLine}` : ""}`
-      : `${node.role}${cityLine ? ` · ${cityLine}` : ""}`;
-
-    const evidence: EvidenceRow[] =
-      signals && signals.length > 0
-        ? signals.slice(0, 6).map((s) => ({
-            type: s.signal_type.replace(/_/g, " "),
-            source: s.source,
-            quote: quoteFromSignal(s),
-            confidence: Math.round((s.confidence ?? 0.7) * 100),
-            timestamp: fmtTimestamp(s.collected_at),
-          }))
-        : [
-            {
-              type: "Job description",
-              source: "Greenhouse · VP Process Eng req",
-              quote: "Owns yield ramp for 3nm node; cross-functional authority over fab integration.",
-              confidence: 88,
-              timestamp: "12d ago",
-            },
-            {
-              type: "Earnings transcript",
-              source: "TSMC Q3 2024 call",
-              quote: "Lin's team delivered the N3 yield improvement that drove our gross margin recovery.",
-              confidence: 92,
-              timestamp: "2mo ago",
-            },
-            {
-              type: "Patent",
-              source: "USPTO · Granted 2024",
-              quote: "Method and apparatus for GAA transistor yield optimization — first inventor.",
-              confidence: 84,
-              timestamp: "5mo ago",
-            },
-            {
-              type: "Press release",
-              source: "TSMC Newsroom",
-              quote: "Promoted to VP, Process Engineering, leading 3nm and 2nm technology development.",
-              confidence: 78,
-              timestamp: "8mo ago",
-            },
-          ];
-
     return (
-      <PanelShell>
-        {Header}
-        <IdentityCard
-          avatar={<Avatar kind="person" />}
-          name={prospect?.name ?? node.name}
-          subLine={subLine}
-          bigValue={overall}
-          bigLabel="Overall"
-          colored
-        />
-        <div className="mt-3">
-          <span className={cn("inline-flex text-[10px] uppercase tracking-[0.16em] px-2 py-0.5 border", bucket.tone)}>
-            {bucket.label}
-          </span>
-        </div>
-        <Separator className="my-4" />
-        <SubScoreGrid
-          cells={[
-            { label: "Authenticity", value: (score?.authenticity_score ?? 0).toFixed(1) },
-            { label: "Authority", value: (score?.authority_score ?? 0).toFixed(1) },
-            { label: "Warmth", value: (score?.warmth_score ?? 0).toFixed(1) },
-            { label: "Confidence", value: (score?.overall_score ?? 0).toFixed(1) },
-          ]}
-        />
-        <EvidenceHead title="Evidence trail" count={evidence.length} />
-        <EvidenceList rows={evidence} />
-        {prospect && onNavigateToProspect && (
-          <Button
-            variant="outline"
-            className="w-full mt-4"
-            onClick={() => onNavigateToProspect(prospect._id)}
-          >
-            Open full profile ↗
-          </Button>
-        )}
-      </PanelShell>
+      <PersonInspector
+        node={node}
+        Header={Header}
+        prospect={prospect}
+        score={score}
+        signals={signals}
+        weights={weights}
+        onNavigateToProspect={onNavigateToProspect}
+      />
     );
   }
 
-  // ─── COMPANY ───────────────────────────────────────────────────────────────
-  if (node.kind === "company") {
-    // Firmographics from the LLM-enriched meta (`scripts/enrich-companies.mjs`).
-    // Match by exact display name first, then a normalized fallback so e.g.
-    // "Intel" / "Intel Corporation" both resolve.
-    const norm = (s: string) =>
-      s.trim().toLowerCase().replace(/\s+/g, " ").replace(/\b(corp|corporation|inc|incorporated|ltd|llc|technologies|technology|systems?)\b/g, "").replace(/\s+/g, " ").trim();
-    const meta =
-      GENERATED_COMPANY_META[node.name] ??
-      Object.entries(GENERATED_COMPANY_META).find(([k]) => norm(k) === norm(node.name))?.[1];
-    const subLineParts: string[] = [];
-    if (meta?.industry) subLineParts.push(meta.industry);
-    if (meta?.hq_city) {
-      const region = meta.state || meta.country || "";
-      subLineParts.push(region ? `${meta.hq_city}, ${region}` : meta.hq_city);
-    } else if (meta?.country) {
-      subLineParts.push(meta.country);
-    }
-    if (meta?.employee_count_estimate) subLineParts.push(`${meta.employee_count_estimate} emp`);
-    const subLine = subLineParts.length > 0 ? subLineParts.join(" · ") : "—";
-    // TODO(real-data): firmographics + ICP-fit numbers should come from props
-    // once the company-enrichment slice lands. Today: hardcoded sample.
-    const evidence: EvidenceRow[] = [
-      { type: "ATS", source: "Greenhouse · 8 open VP+ reqs", quote: "Aggressive senior hiring across process, packaging, design verification.", confidence: 86, timestamp: "3d ago" },
-      { type: "SEC filing", source: "S-1 · 2024-Q3", quote: "Capacity expansion guidance up 18% YoY; capex weighted toward advanced node.", confidence: 91, timestamp: "1mo ago" },
-      { type: "Press", source: "Reuters · Strategic partnership", quote: "Multi-year supply agreement signed with major US hyperscaler.", confidence: 79, timestamp: "2mo ago" },
-      { type: "LinkedIn", source: "VP-level moves", quote: "Net +6 VP-level hires past 90d; concentrated in NPI and yield orgs.", confidence: 72, timestamp: "1w ago" },
-    ];
-    return (
-      <PanelShell>
-        {Header}
-        <IdentityCard
-          avatar={<Avatar kind="company" />}
-          name={node.name}
-          subLine={subLine}
-          bigValue={88}
-          bigLabel="ICP fit"
-        />
-        <div className="mt-3">
-          <Badge variant="outline" className="text-[10px] uppercase tracking-[0.16em] font-normal">
-            ICP match · 7 open VP+ reqs · hiring velocity ↑
-          </Badge>
-        </div>
-        <Separator className="my-4" />
-        <SubScoreGrid
-          cells={[
-            { label: "ICP fit", value: "88" },
-            { label: "Hiring vel.", value: "74" },
-            { label: "Tech maturity", value: "91" },
-            { label: "Org density", value: "12" },
-          ]}
-        />
-        <EvidenceHead title="Company evidence" count={evidence.length} />
-        <EvidenceList rows={evidence} />
-      </PanelShell>
-    );
-  }
-
-  // ─── ROLE ──────────────────────────────────────────────────────────────────
-  if (node.kind === "role") {
-    // TODO(real-data): holder count + avg authority/tenure need a graph-side
-    // aggregation pass. Placeholders for now.
-    const evidence: EvidenceRow[] = [
-      { type: "JD title", source: "Greenhouse · Aggregate", quote: "Title appears across 14 active reqs at peer ICP companies.", confidence: 80, timestamp: "1w ago" },
-      { type: "Scope signal", source: "LinkedIn bios", quote: "Holders cite P&L authority and direct reports between 40–120.", confidence: 76, timestamp: "2w ago" },
-      { type: "Reports graph", source: "Org rollup", quote: "Median holder has 4 directs at staff/principal grade.", confidence: 71, timestamp: "1mo ago" },
-      { type: "Promotion patterns", source: "Career trajectory", quote: "Common predecessor roles: Sr Director Process, Distinguished Engineer.", confidence: 68, timestamp: "3mo ago" },
-    ];
-    return (
-      <PanelShell>
-        {Header}
-        <IdentityCard
-          avatar={<Avatar kind="role" />}
-          name={node.name}
-          subLine="Target role · Inferred from scope signals & JD parsing"
-          bigValue={12}
-          bigLabel="Holders"
-        />
-        <div className="mt-3">
-          <Badge variant="outline" className="text-[10px] uppercase tracking-[0.16em] font-normal">
-            12 inferred holders · 5 high-confidence
-          </Badge>
-        </div>
-        <Separator className="my-4" />
-        <SubScoreGrid
-          cells={[
-            { label: "Holders", value: "12" },
-            { label: "High conf.", value: "5" },
-            { label: "Avg auth.", value: "76.4" },
-            { label: "Avg tenure", value: "4.2y" },
-          ]}
-        />
-        <EvidenceHead title="Role evidence" count={evidence.length} />
-        <EvidenceList rows={evidence} />
-      </PanelShell>
-    );
-  }
-
-  // ─── CITY ──────────────────────────────────────────────────────────────────
-  if (node.kind === "city") {
-    // TODO(real-data): candidate count + density should be derived from the
-    // graph (count of person nodes whose company.locationId === this city).
-    const evidence: EvidenceRow[] = [
-      { type: "Crunchbase", source: "HQ density", quote: "31 ICP-tier semiconductor companies headquartered in metro.", confidence: 88, timestamp: "1w ago" },
-      { type: "ATS", source: "Greenhouse · local jobs", quote: "210 open senior+ reqs across target functions in past 30d.", confidence: 82, timestamp: "5d ago" },
-      { type: "LinkedIn", source: "Density estimate", quote: "Estimated 1.2k VP-level professionals in target verticals.", confidence: 70, timestamp: "2w ago" },
-      { type: "News", source: "Hiring trend", quote: "Net positive senior migration past 4 quarters; +8% YoY.", confidence: 74, timestamp: "1mo ago" },
-    ];
-    return (
-      <PanelShell>
-        {Header}
-        <IdentityCard
-          avatar={<Avatar kind="city" />}
-          name={node.name}
-          subLine={`Metro · ${node.country ?? "Region"} · 31 ICP companies`}
-          bigValue={87}
-          bigLabel="Candidates"
-        />
-        <div className="mt-3">
-          <Badge variant="outline" className="text-[10px] uppercase tracking-[0.16em] font-normal">
-            High density · 31 cos. in network · avg score 74
-          </Badge>
-        </div>
-        <Separator className="my-4" />
-        <SubScoreGrid
-          cells={[
-            { label: "Candidates", value: "87" },
-            { label: "Companies", value: "31" },
-            { label: "Avg score", value: "74.1" },
-            { label: "Density", value: "high" },
-          ]}
-        />
-        <EvidenceHead title="City evidence" count={evidence.length} />
-        <EvidenceList rows={evidence} />
-      </PanelShell>
-    );
-  }
-
-  // ─── DEFAULT (school / conference / industry / unknown) ────────────────────
+  // ─── AGGREGATION (company / role / city / school / conference / industry) ─
   return (
-    <PanelShell>
-      {Header}
-      <div className="flex items-center gap-3">
-        <Avatar kind={node.kind} />
-        <div className="min-w-0">
-          <div className="text-base truncate">{node.name}</div>
-          <Eyebrow className="mt-1">{node.kind}</Eyebrow>
-        </div>
-      </div>
-      <Separator className="my-4" />
-      <div className="text-xs text-muted-foreground">
-        More signals coming soon for {node.kind} nodes.
-      </div>
-    </PanelShell>
+    <AggregationInspector
+      node={node}
+      Header={Header}
+      hubStats={hubStats}
+      onSelectProspect={onSelectProspect}
+    />
   );
 }
 
@@ -472,3 +267,453 @@ const EvidenceHead = ({ title, count }: { title: string; count: number }) => (
     <span className="text-mono text-[11px] text-muted-foreground">{count}</span>
   </div>
 );
+
+// ── Person variant — surfaces the actual scoring math ───────────────────────
+
+const SUB_SCORE_LABEL: Record<SubScoreKey, string> = {
+  authenticity: "Authenticity",
+  authority: "Authority",
+  warmth: "Warmth",
+};
+
+interface PersonInspectorProps {
+  node: GraphNode & { kind: "person" };
+  Header: JSX.Element;
+  prospect?: Prospect;
+  score?: Score;
+  signals?: Signal[];
+  weights?: SignalWeight[];
+  onNavigateToProspect?: (id: string) => void;
+}
+
+function PersonInspector({
+  node,
+  Header,
+  prospect,
+  score,
+  signals,
+  weights,
+  onNavigateToProspect,
+}: PersonInspectorProps): JSX.Element {
+  // Re-derive from raw signals so the breakdown numbers match what the user
+  // sees in the totals. If we don't have signals/weights yet, fall back to
+  // the persisted score totals only.
+  const breakdown = useMemo(() => {
+    if (!signals || signals.length === 0 || !weights || weights.length === 0) return null;
+    return breakdownScore(signals, weights);
+  }, [signals, weights]);
+
+  const overall = score?.overall_score ?? breakdown?.subScores.overall ?? node.score ?? 0;
+  const authenticity = score?.authenticity_score ?? breakdown?.subScores.authenticity ?? 0;
+  const authority = score?.authority_score ?? breakdown?.subScores.authority ?? 0;
+  const warmth = score?.warmth_score ?? breakdown?.subScores.warmth ?? 0;
+  const evidenceCount = signals?.length ?? 0;
+  const bucket = bucketLabel(overall);
+  const cityLine =
+    (node.raw as Prospect & { industry?: string }).industry ?? prospect?.industry ?? "";
+  const subLine = prospect
+    ? `${prospect.role} · ${prospect.company}${cityLine ? ` · ${cityLine}` : ""}`
+    : `${node.role}${cityLine ? ` · ${cityLine}` : ""}`;
+
+  return (
+    <PanelShell>
+      {Header}
+      <IdentityCard
+        avatar={<Avatar kind="person" />}
+        name={prospect?.name ?? node.name}
+        subLine={subLine}
+        bigValue={overall}
+        bigLabel="Overall"
+        colored
+      />
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <span className={cn("inline-flex text-[10px] uppercase tracking-[0.16em] px-2 py-0.5 border", bucket.tone)}>
+          {bucket.label}
+        </span>
+        {score?.computed_at && (
+          <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+            Scored {fmtTimestamp(score.computed_at)}
+          </span>
+        )}
+      </div>
+      <Separator className="my-4" />
+      <SubScoreGrid
+        cells={[
+          { label: "Authenticity", value: authenticity.toFixed(1) },
+          { label: "Authority", value: authority.toFixed(1) },
+          { label: "Warmth", value: warmth.toFixed(1) },
+          { label: "Evidence", value: String(evidenceCount) },
+        ]}
+      />
+
+      {breakdown ? (
+        <BreakdownSections breakdown={breakdown} signals={signals ?? []} />
+      ) : (
+        <>
+          <EvidenceHead title="Evidence trail" count={evidenceCount} />
+          {evidenceCount > 0 ? (
+            <EvidenceList
+              rows={(signals ?? []).slice(0, 6).map((s) => ({
+                type: s.signal_type.replace(/_/g, " "),
+                source: s.source,
+                quote: quoteFromSignal(s),
+                confidence: Math.round((s.confidence ?? 0.7) * 100),
+                timestamp: fmtTimestamp(s.collected_at),
+              }))}
+            />
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No signals collected yet — score rolls up to 0 by default.
+            </p>
+          )}
+        </>
+      )}
+
+      {score?.falsification_notes && score.falsification_notes.length > 0 && (
+        <FalsificationBlock notes={score.falsification_notes} />
+      )}
+
+      {prospect && onNavigateToProspect && (
+        <Button
+          variant="outline"
+          className="w-full mt-4"
+          onClick={() => onNavigateToProspect(prospect._id)}
+        >
+          Open full profile ↗
+        </Button>
+      )}
+    </PanelShell>
+  );
+}
+
+function BreakdownSections({
+  breakdown,
+  signals,
+}: {
+  breakdown: NonNullable<ReturnType<typeof breakdownScore>>;
+  signals: Signal[];
+}): JSX.Element {
+  const signalById = useMemo(() => {
+    const m = new Map<string, Signal>();
+    for (const s of signals) m.set(s._id, s);
+    return m;
+  }, [signals]);
+
+  return (
+    <>
+      <div className="mt-5 mb-2 flex items-baseline justify-between">
+        <Eyebrow>How the score was built</Eyebrow>
+        <span className="text-[10px] text-muted-foreground">click to expand</span>
+      </div>
+      <div className="space-y-2">
+        {(Object.keys(SUB_SCORE_LABEL) as SubScoreKey[]).map((key) => (
+          <BreakdownGroup
+            key={key}
+            label={SUB_SCORE_LABEL[key]}
+            value={breakdown.subScores[key]}
+            contributions={breakdown[key]}
+            signalById={signalById}
+          />
+        ))}
+      </div>
+    </>
+  );
+}
+
+function BreakdownGroup({
+  label,
+  value,
+  contributions,
+  signalById,
+}: {
+  label: string;
+  value: number;
+  contributions: SignalContribution[];
+  signalById: Map<string, Signal>;
+}): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const top = contributions.slice(0, 5);
+  const driver = top[0];
+
+  return (
+    <div className="border border-border bg-card">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center justify-between gap-2 px-3 py-2 text-left hover:bg-muted/40"
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+            {label}
+          </span>
+          <span
+            className="text-mono text-sm shrink-0"
+            style={{ color: scoreColor(value) }}
+          >
+            {value.toFixed(1)}
+          </span>
+          {driver && (
+            <span className="text-[11px] text-muted-foreground truncate">
+              · top: {driver.signal_type.replace(/_/g, " ")} ({driver.pctOfSubScore.toFixed(0)}%)
+            </span>
+          )}
+        </div>
+        <ChevronDown
+          className={cn(
+            "w-3.5 h-3.5 text-muted-foreground shrink-0 transition-transform",
+            open && "rotate-180",
+          )}
+        />
+      </button>
+      {open && (
+        <div className="border-t border-border divide-y divide-border">
+          {top.length === 0 && (
+            <div className="px-3 py-3 text-[11px] text-muted-foreground">
+              No signals contribute to this sub-score yet.
+            </div>
+          )}
+          {top.map((c) => {
+            const s = signalById.get(c.signalId);
+            return (
+              <div key={c.signalId} className="px-3 py-2 space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground truncate">
+                    {c.signal_type.replace(/_/g, " ")}
+                  </span>
+                  <span className="text-mono text-[11px] shrink-0">
+                    {c.pctOfSubScore.toFixed(0)}%
+                  </span>
+                </div>
+                <div className="h-1 bg-muted overflow-hidden">
+                  <div
+                    className="h-full bg-foreground/70"
+                    style={{ width: `${Math.min(100, c.pctOfSubScore)}%` }}
+                  />
+                </div>
+                <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+                  <span className="truncate">
+                    {c.source} · norm {c.normalized.toFixed(0)} × conf{" "}
+                    {(c.confidence * 100).toFixed(0)}% × w {c.subWeight.toFixed(2)}
+                  </span>
+                  {s?.collected_at && (
+                    <span className="text-mono shrink-0 ml-2">
+                      {fmtTimestamp(s.collected_at)}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {contributions.length > top.length && (
+            <div className="px-3 py-2 text-[11px] text-muted-foreground">
+              + {contributions.length - top.length} more lower-impact signals
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FalsificationBlock({ notes }: { notes: string[] }): JSX.Element {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-5">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center justify-between gap-2 px-3 py-2 border border-border bg-card hover:bg-muted/40"
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <Eyebrow>Could be wrong if…</Eyebrow>
+          <span className="text-mono text-[11px] text-muted-foreground">{notes.length}</span>
+        </div>
+        <ChevronDown
+          className={cn(
+            "w-3.5 h-3.5 text-muted-foreground shrink-0 transition-transform",
+            open && "rotate-180",
+          )}
+        />
+      </button>
+      {open && (
+        <ul className="mt-2 space-y-2">
+          {notes.map((n, i) => (
+            <li
+              key={i}
+              className="text-[11px] text-foreground/80 border-l-2 border-score-weak/40 pl-3 leading-relaxed"
+            >
+              {n}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ── Aggregation variant — live counts, no fake firmographics ────────────────
+
+const KIND_NOUN: Record<Exclude<GraphNode["kind"], "person">, [string, string]> = {
+  company: ["employee", "employees in network"],
+  role: ["holder", "people in this role"],
+  city: ["candidate", "people based here"],
+  school: ["alum", "alumni in network"],
+  conference: ["speaker", "people who spoke here"],
+  industry: ["operator", "people in this industry"],
+};
+
+interface AggregationInspectorProps {
+  node: Exclude<GraphNode, { kind: "person" }>;
+  Header: JSX.Element;
+  hubStats?: HubStats;
+  onSelectProspect?: (prospectId: string) => void;
+}
+
+function AggregationInspector({
+  node,
+  Header,
+  hubStats,
+  onSelectProspect,
+}: AggregationInspectorProps): JSX.Element {
+  const noun = KIND_NOUN[node.kind] ?? ["person", "in network"];
+  const total = hubStats?.total ?? 0;
+  const subLine = (() => {
+    switch (node.kind) {
+      case "company":
+        // The graph builder hangs a city + industry off the company node when
+        // it can resolve them (COMPANY_META). Surface that — it's real data.
+        return [
+          (node as Extract<GraphNode, { kind: "company" }>).industryId?.replace(
+            "industry:",
+            "",
+          ),
+          (node as Extract<GraphNode, { kind: "company" }>).locationId?.replace("city:", ""),
+        ]
+          .filter(Boolean)
+          .join(" · ") || `Company · ${total} ${noun[0]}${total === 1 ? "" : "s"}`;
+      case "role":
+        return `Canonical role · ${total} ${noun[0]}${total === 1 ? "" : "s"}`;
+      case "city":
+        return (node as Extract<GraphNode, { kind: "city" }>).country
+          ? `${(node as Extract<GraphNode, { kind: "city" }>).country} · ${total} ${noun[0]}${
+              total === 1 ? "" : "s"
+            }`
+          : `${total} ${noun[0]}${total === 1 ? "" : "s"}`;
+      case "school":
+        return `School · ${total} ${noun[0]}${total === 1 ? "" : "s"}`;
+      case "conference":
+        return `Conference · ${total} speaker${total === 1 ? "" : "s"}`;
+      case "industry":
+        return `Industry · ${total} ${noun[0]}${total === 1 ? "" : "s"}`;
+      default:
+        return `${total} in network`;
+    }
+  })();
+
+  return (
+    <PanelShell>
+      {Header}
+      <IdentityCard
+        avatar={<Avatar kind={node.kind} />}
+        name={node.name}
+        subLine={subLine}
+        bigValue={total}
+        bigLabel={noun[0] + (total === 1 ? "" : "s")}
+      />
+      <Separator className="my-4" />
+      {hubStats ? (
+        <>
+          <SubScoreGrid
+            cells={[
+              { label: "In network", value: String(hubStats.total) },
+              { label: "Avg score", value: hubStats.avgScore.toFixed(1) },
+              { label: "High-conf", value: String(hubStats.highConf) },
+              {
+                label: "Top role",
+                value: hubStats.topRoles[0]?.label?.split(" ").slice(0, 2).join(" ") ?? "—",
+              },
+            ]}
+          />
+          {hubStats.topRoles.length > 0 && (
+            <TallyBlock title="Top roles" rows={hubStats.topRoles} total={hubStats.total} />
+          )}
+          {hubStats.topIndustries.length > 0 && node.kind !== "industry" && (
+            <TallyBlock
+              title="Top industries"
+              rows={hubStats.topIndustries}
+              total={hubStats.total}
+            />
+          )}
+          {hubStats.topPeople.length > 0 && (
+            <>
+              <EvidenceHead title="Highest-scoring people" count={hubStats.topPeople.length} />
+              <ul className="border border-border bg-card divide-y divide-border">
+                {hubStats.topPeople.map((p) => (
+                  <li key={p.id}>
+                    <button
+                      onClick={() => onSelectProspect?.(p.id)}
+                      className="w-full flex items-center justify-between gap-2 px-3 py-2 text-left hover:bg-muted/40"
+                      disabled={!onSelectProspect}
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs truncate">{p.name}</div>
+                        <div className="text-[10px] text-muted-foreground truncate">
+                          {p.role}
+                        </div>
+                      </div>
+                      <span
+                        className="text-mono text-sm shrink-0"
+                        style={{ color: scoreColor(p.score) }}
+                      >
+                        {Math.round(p.score)}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </>
+      ) : (
+        <div className="text-xs text-muted-foreground">
+          No connected prospects in the rendered graph.
+        </div>
+      )}
+    </PanelShell>
+  );
+}
+
+function TallyBlock({
+  title,
+  rows,
+  total,
+}: {
+  title: string;
+  rows: { label: string; count: number }[];
+  total: number;
+}): JSX.Element {
+  return (
+    <>
+      <EvidenceHead title={title} count={rows.length} />
+      <ul className="space-y-1.5">
+        {rows.map((r) => {
+          const pct = total > 0 ? (r.count / total) * 100 : 0;
+          return (
+            <li key={r.label} className="space-y-0.5">
+              <div className="flex items-center justify-between gap-2 text-[11px]">
+                <span className="truncate">{r.label}</span>
+                <span className="text-mono text-muted-foreground shrink-0">
+                  {r.count}
+                </span>
+              </div>
+              <div className="h-1 bg-muted overflow-hidden">
+                <div
+                  className="h-full bg-foreground/60"
+                  style={{ width: `${Math.min(100, pct)}%` }}
+                />
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </>
+  );
+}

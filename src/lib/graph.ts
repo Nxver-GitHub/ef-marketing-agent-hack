@@ -153,7 +153,7 @@ const COMPANY_META: Record<string, CompanyMeta> = {
  * variants ("Intel Corp" vs "Intel Corporation") collapse to one node.
  * Duplicated rather than imported to keep this module pure (no React deps).
  */
-function normalizeCompany(s: string | null | undefined): string {
+export function normalizeCompany(s: string | null | undefined): string {
   return (s ?? "")
     .toLowerCase()
     .replace(
@@ -164,7 +164,7 @@ function normalizeCompany(s: string | null | undefined): string {
     .trim();
 }
 
-function normalizeKey(s: string): string {
+export function normalizeKey(s: string): string {
   return s.trim().toLowerCase();
 }
 
@@ -223,7 +223,7 @@ const NORMALIZED_GENERATED_META: Map<string, CompanyMeta> = (() => {
  * null only when both miss — callers skip the city/industry edge in that
  * case to avoid Unknown placeholder hubs.
  */
-function resolveCompanyMeta(rawName: string): CompanyMeta | null {
+export function resolveCompanyMeta(rawName: string): CompanyMeta | null {
   const norm = normalizeCompany(rawName);
   for (const [key, meta] of Object.entries(COMPANY_META)) {
     if (normalizeCompany(key) === norm) return meta;
@@ -432,14 +432,28 @@ export function buildGraph(args: BuildGraphArgs): {
     }
   }
 
-  // Second pass: colleague edges (any two persons sharing a companyId).
-  // O(k²) per company, k = head-count at that company. Off in agent-context
-  // builds where the chat copilot only needs node lookups, not traversal.
+  // Second pass: colleague edges. Naïve O(n²) (every pair) explodes the
+  // canvas for any company with >50 prospects (Micron has 428 → 91k edges,
+  // which freezes the layout solver). Cap to a small per-person fan-out
+  // instead — each person connects to up to COLLEAGUE_FANOUT others at the
+  // same company. Off entirely in agent-context builds (`skipColleagueEdges`)
+  // where the chat copilot only needs node lookups, not traversal.
   if (!args.skipColleagueEdges) {
+    const COLLEAGUE_FANOUT = 6;
     for (const persons of peopleByCompany.values()) {
+      if (persons.length <= 1) continue;
+      if (persons.length <= COLLEAGUE_FANOUT + 1) {
+        for (let i = 0; i < persons.length; i++) {
+          for (let j = i + 1; j < persons.length; j++) {
+            addEdge(persons[i], persons[j], "colleague");
+          }
+        }
+        continue;
+      }
       for (let i = 0; i < persons.length; i++) {
-        for (let j = i + 1; j < persons.length; j++) {
-          addEdge(persons[i], persons[j], "colleague");
+        const limit = Math.min(COLLEAGUE_FANOUT, persons.length - 1 - i);
+        for (let k = 1; k <= limit; k++) {
+          addEdge(persons[i], persons[i + k], "colleague");
         }
       }
     }

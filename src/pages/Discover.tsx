@@ -22,7 +22,13 @@ import ForceGraph2D, {
 import { TopBar } from "@/components/TopBar";
 import { GraphChat } from "@/components/GraphChat";
 import { NodeInspector } from "@/components/NodeInspector";
-import { useProspects, useScoresFor, useSignalsFor, useSignalsForMany } from "@/lib/db";
+import {
+  useProspects,
+  useScoresFor,
+  useSignalsFor,
+  useSignalsForMany,
+  useWeights,
+} from "@/lib/db";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import {
   buildGraph,
@@ -32,6 +38,11 @@ import {
   type NodeKind,
   type ThemeTokens,
 } from "@/lib/graph";
+import {
+  prospectIdsForAggregation,
+  computeHubStats,
+  type AggregationProspect,
+} from "@/lib/aggregations";
 import type { AgentContext } from "@/lib/agent";
 
 // ─── CSS-var color helpers ───────────────────────────────────────────────────
@@ -432,6 +443,7 @@ const Discover = () => {
   const allProspects = useProspects();
   const allProspectIds = useMemo(() => allProspects.map((p) => p._id), [allProspects]);
   const scores = useScoresFor(allProspectIds);
+  const weights = useWeights();
 
   // ─── URL-synced view state — hoisted so `prospects` below can react to
   //     chat-driven selection / filtering. (Originally lived further down.) ──
@@ -456,7 +468,11 @@ const Discover = () => {
   // of state in case we later want "selection without re-focusing" (e.g.
   // hover-preview). For now, click = focus = select.
   const [selectedId, setSelectedId] = useState<string | null>(focusId);
-  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  // Hover lives in a ref, not state — the canvas redraws every frame from
+  // the force sim, so reading the latest hover from a ref keeps the ring
+  // responsive without triggering a Discover re-render on every mousemove
+  // (which was making the page lag during hover with 100+ nodes).
+  const hoveredIdRef = useRef<string | null>(null);
   const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string> | null>(null);
   const [edgeKindsActive, setEdgeKindsActive] = useState<Set<EdgeKind>>(initialEdgeKinds);
   const [viewMode, setViewMode] = useState<ViewMode>("all");
@@ -492,86 +508,80 @@ const Discover = () => {
     return out;
   }, [visibleNodeIds]);
 
-  // Cap how many prospects feed the RENDERED force graph. ForceGraph2D + the
-  // colleague-edge step (O(k²) within each company) become unworkable past a
-  // few hundred — Intel alone has 446 prospects ≈ 99k colleague edges.
-  // Top-N by overall_score, fallback to insertion order. The chat copilot
-  // sees the FULL prospect set below (no cap; colleague edges skipped, so
-  // the agent buildGraph stays O(n) over the entire DB).
+  // Cap how many prospects feed the RENDERED force graph. ForceGraph2D + dense
+  // colleague meshes become unworkable past a few hundred. The chat copilot
+  // sees the FULL prospect set in agent builds (colleague edges skipped).
   const RENDER_CAP = 250;
 
+  // Hub matching for focal expansion — shared with NodeInspector counts via
+  // `lib/aggregations.ts`. Person nodes return null here; colleague drill-down
+  // for a focused person is handled separately below.
+  const focalAggregationIds = useMemo<Set<string> | null>(
+    () => prospectIdsForAggregation(focusId, allProspects as AggregationProspect[]),
+    [focusId, allProspects],
+  );
+
   const prospects = useMemo(() => {
+    const byScoreDesc = (a: { _id: string }, b: { _id: string }) => {
+      const sa = scores[a._id]?.overall_score ?? -1;
+      const sb = scores[b._id]?.overall_score ?? -1;
+      return sb - sa;
+    };
+
     if (chatPromotedIds) {
       const matched = allProspects.filter((p) => chatPromotedIds.has(p._id));
       if (matched.length > 0) return matched.slice(0, RENDER_CAP);
     }
-    // Focus-aware expansion: when the user clicks a company / industry / role,
-    // pull in *that node's* prospects on top of the global top-N so the focal
-    // subgraph isn't a 2-person sample of a 400-person org. When the user
-    // clicks a PERSON, expand to that person's colleagues (same company) —
-    // gives an org-chart-style drill-down even if those colleagues weren't
-    // in the score-ranked top-250. Bounded by FOCAL_EXPAND_CAP below.
+
     const colonIdx = focusId?.indexOf(":") ?? -1;
     const focusKind = focusId && colonIdx > 0 ? focusId.slice(0, colonIdx) : null;
     const focusName = focusId && colonIdx > 0 ? focusId.slice(colonIdx + 1) : null;
-    const focusMatches: typeof allProspects = (() => {
-      if (!focusKind || !focusName) return [];
+
+    // Person focus: same-company colleagues merged into the global top-N slice.
+    if (focusKind === "person" && focusName) {
       const norm = (s: string) => s.trim().toLowerCase();
-      switch (focusKind) {
-        case "company":
-          return allProspects.filter((p) => norm(p.company) === focusName);
-        case "industry":
-          return allProspects.filter((p) => norm(p.industry) === focusName);
-        case "role":
-          return allProspects.filter((p) => norm(p.role).includes(focusName));
-        case "person": {
-          // focusName is the prospect _id (since person:<id> is the node id).
-          const me = allProspects.find((p) => p._id === focusName);
-          if (!me) return [];
-          const myCompany = norm(me.company);
-          // colleagues at the same company, excluding self
-          return allProspects.filter(
-            (p) => p._id !== me._id && norm(p.company) === myCompany,
-          );
+      const me = allProspects.find((p) => p._id === focusName);
+      if (me) {
+        const colleagues = allProspects.filter(
+          (p) => p._id !== me._id && norm(p.company) === norm(me.company),
+        );
+        if (allProspects.length <= RENDER_CAP && colleagues.length === 0) {
+          return allProspects;
         }
-        default:
-          return [];
-      }
-    })();
-
-    if (allProspects.length <= RENDER_CAP && focusMatches.length === 0) {
-      return allProspects;
-    }
-    const ranked = [...allProspects].sort((a, b) => {
-      const sa = scores[a._id]?.overall_score ?? -1;
-      const sb = scores[b._id]?.overall_score ?? -1;
-      return sb - sa;
-    });
-    const baseTopN = ranked.slice(0, RENDER_CAP);
-    if (focusMatches.length === 0) return baseTopN;
-
-    // Cap focal-context expansion. Without this, clicking Intel (446 people)
-    // pushed `prospects` to ~700 and buildGraph's colleague pass — O(k²)
-    // within Intel — generated ~99k edges, locking the canvas for seconds.
-    // Score-rank focusMatches and take the top FOCAL_EXPAND_CAP.
-    const FOCAL_EXPAND_CAP = 60;
-    const rankedFocus = [...focusMatches].sort((a, b) => {
-      const sa = scores[a._id]?.overall_score ?? -1;
-      const sb = scores[b._id]?.overall_score ?? -1;
-      return sb - sa;
-    });
-    const seen = new Set(baseTopN.map((p) => p._id));
-    let added = 0;
-    for (const p of rankedFocus) {
-      if (added >= FOCAL_EXPAND_CAP) break;
-      if (!seen.has(p._id)) {
-        baseTopN.push(p);
-        seen.add(p._id);
-        added++;
+        const ranked = [...allProspects].sort(byScoreDesc);
+        const baseTopN = ranked.slice(0, RENDER_CAP);
+        const FOCAL_EXPAND_CAP = 60;
+        const rankedColleagues = [...colleagues].sort(byScoreDesc);
+        const seen = new Set(baseTopN.map((p) => p._id));
+        let added = 0;
+        for (const p of rankedColleagues) {
+          if (added >= FOCAL_EXPAND_CAP) break;
+          if (!seen.has(p._id)) {
+            baseTopN.push(p);
+            seen.add(p._id);
+            added++;
+          }
+        }
+        return baseTopN;
       }
     }
-    return baseTopN;
-  }, [allProspects, chatPromotedIds, scores, focusId]);
+
+    if (focalAggregationIds) {
+      const FOCAL_MATCH_RENDER_CAP = 100;
+      const matched = allProspects
+        .filter((p) => focalAggregationIds.has(p._id))
+        .sort(byScoreDesc)
+        .slice(0, FOCAL_MATCH_RENDER_CAP);
+      const remaining = allProspects
+        .filter((p) => !focalAggregationIds.has(p._id))
+        .sort(byScoreDesc);
+      const ambientCap = Math.max(0, RENDER_CAP - matched.length);
+      return [...matched, ...remaining.slice(0, ambientCap)];
+    }
+
+    if (allProspects.length <= RENDER_CAP) return allProspects;
+    return [...allProspects].sort(byScoreDesc).slice(0, RENDER_CAP);
+  }, [allProspects, scores, chatPromotedIds, focalAggregationIds, focusId]);
 
   const prospectIds = useMemo(() => prospects.map((p) => p._id), [prospects]);
   const signalsById = useSignalsForMany(prospectIds);
@@ -949,6 +959,22 @@ const Discover = () => {
     ? (signalsById[selectedProspect._id] ?? fallbackSignals)
     : undefined;
 
+  // ─── Inspector data wiring (aggregation variants) ──────────────────────────
+  // Compute live counts for the selected hub so the right rail can show
+  // honest numbers ("428 people connected to Micron") instead of placeholder
+  // firmographics. Computed against the *full* prospect pool, not the
+  // rendered top-N, so the inspector matches what the focal expansion will
+  // surface.
+  const hubStats = useMemo(() => {
+    if (!selectedNode || selectedNode.kind === "person") return undefined;
+    const ids = prospectIdsForAggregation(
+      selectedNode.id,
+      allProspects as AggregationProspect[],
+    );
+    if (!ids) return undefined;
+    return computeHubStats(ids, allProspects as AggregationProspect[], scores);
+  }, [selectedNode, allProspects, scores]);
+
   // Tooltip body — kind-aware sub-line + optional score chip. Lives down
   // here so it can read selectedScore (declared just above).
   const tooltipMeta = useMemo<{
@@ -1063,17 +1089,17 @@ const Discover = () => {
     if (id === TECH_ROOT_ID) {
       setFocusId(null);
       setSelectedId(null);
-      setHoveredId(null);
+      hoveredIdRef.current = null;
       setEngineRunning(true);
       return;
     }
     setFocusId(id);
     setSelectedId(id);
-    setHoveredId(null);
+    hoveredIdRef.current = null;
     setEngineRunning(true);
   }, []);
   const onNodeHoverStable = useCallback((node: FGNode | null) => {
-    setHoveredId(node ? (node.id as string) : null);
+    hoveredIdRef.current = node ? (node.id as string) : null;
   }, []);
   const nodeLabelStable = useCallback(
     (node: FGNode) => (node as unknown as GraphNode).name,
@@ -1126,7 +1152,7 @@ const Discover = () => {
       // Hover ring — drawn before the selected halo so a hovered-but-
       // not-selected node still gets feedback. Skip when the node is
       // selected (the halo below is more prominent).
-      if (gn.id === hoveredId && !isSelected) {
+      if (gn.id === hoveredIdRef.current && !isSelected) {
         ctx2d.beginPath();
         ctx2d.arc(x, y, r + 4, 0, Math.PI * 2);
         ctx2d.strokeStyle = nodeColor;
@@ -1224,7 +1250,6 @@ const Discover = () => {
     },
     [
       selectedId,
-      hoveredId,
       visibleNodeIds,
       neighborByNode,
       nodeColorByKind,
@@ -1401,18 +1426,18 @@ const Discover = () => {
                   // many nodes — wrong shape for what we want.
                   // Smoother cool-down: longer warmup with slower velocity
                   // decay so motion fades instead of slamming to a halt.
-                  cooldownTime={2500}
-                  cooldownTicks={120}
-                  warmupTicks={50}
-                  d3AlphaDecay={0.028}
-                  d3VelocityDecay={0.35}
+                  cooldownTime={1500}
+                  cooldownTicks={60}
+                  warmupTicks={20}
+                  d3AlphaDecay={0.05}
+                  d3VelocityDecay={0.5}
                   // Curved edges — subtle arc gives the canvas a spider-web
                   // feel instead of the rigid hub-and-spoke that straight
                   // lines produce. 0.22 gives a more organic web feel.
                   linkCurvature={0.22}
-                  linkDirectionalParticles={2}
-                  linkDirectionalParticleWidth={2}
-                  linkDirectionalParticleSpeed={0.004}
+                  // Directional particles animate per frame on every edge —
+                  // disabled to keep the canvas at 60fps for the demo.
+                  linkDirectionalParticles={0}
                   backgroundColor="transparent"
                   linkColor="color"
                   linkWidth="width"
@@ -1501,6 +1526,9 @@ const Discover = () => {
           prospect={selectedProspect}
           score={selectedScore}
           signals={selectedSignals}
+          weights={weights}
+          hubStats={hubStats}
+          onSelectProspect={(id) => setSelectedId(`person:${id}`)}
           onNavigateToProspect={(id) => navigate(`/prospect/${id}`)}
         />
       </div>
