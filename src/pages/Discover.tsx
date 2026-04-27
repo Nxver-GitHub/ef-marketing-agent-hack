@@ -324,9 +324,20 @@ const DEFAULT_EDGE_KINDS: EdgeKind[] = [
 // "wide" (no focus) view. We're after an Obsidian-style web — readable at
 // first glance, with focusable clusters, not a 500-node hairball. Once the
 // user clicks a node, we drill into a focal subgraph that's bounded
-// When drilled into a person focal node, we cap to the immediate
-// 1-hop neighborhood (still bounded — direct neighbors only).
-const FOCAL_PEOPLE_CAP = 20;
+// When drilled into a person focal node, we cap colleague-style neighbors
+// in the rendered subgraph. Set generously so a top-scored prospect's
+// inferred org cluster (focused person + their colleagues at the same
+// company) reads as a believable team, not 20 dots — the all-pairs
+// colleague mesh that this would normally drag in is dropped in
+// `focalEdges`, so the higher cap doesn't bring back the hairball.
+const FOCAL_PEOPLE_CAP = 40;
+// Score threshold above which a person is treated as a "headline prospect"
+// — for these we always include the company, role, city, and at least
+// HEADLINE_MIN_COLLEAGUES colleagues, regardless of how many edges exist
+// in the prebuilt graph. Below the threshold we still show what's there
+// but don't force-pad.
+const HEADLINE_PROSPECT_SCORE = 75;
+const HEADLINE_MIN_COLLEAGUES = 12;
 // When the focal node is an aggregation (company / industry / role / city /
 // school / conference) the user wants to see *who's there* — every prospect.
 // No cap: ForceGraph2D handles a few thousand nodes, and a silently-truncated
@@ -728,6 +739,33 @@ const Discover = () => {
       const cap = focalIsAggregation ? FOCAL_AGG_PEOPLE_CAP : FOCAL_PEOPLE_CAP;
       for (const id of persons.slice(0, cap)) visible.add(id);
       for (const id of others) visible.add(id);
+
+      // Top-scored person backstop: top-scored prospects are the demo's
+      // headline. If for any reason their direct edges aren't enough to
+      // reach HEADLINE_MIN_COLLEAGUES (small company, sparse colleague
+      // edges in the rendered slice, etc.) walk allProspects directly to
+      // pull in the missing same-company peers ranked by score.
+      if (!focalIsAggregation && focal.kind === "person") {
+        const focalScore = (focal as { score?: number }).score ?? 0;
+        if (focalScore >= HEADLINE_PROSPECT_SCORE) {
+          const me = allProspects.find((p) => `person:${p._id}` === focusId);
+          if (me) {
+            const norm = (s: string) => s.trim().toLowerCase();
+            const sameCompany = allProspects
+              .filter((p) => p._id !== me._id && norm(p.company) === norm(me.company))
+              .map((p) => ({ id: `person:${p._id}`, score: scores[p._id]?.overall_score ?? -1 }))
+              .sort((a, b) => b.score - a.score);
+            let added = persons.slice(0, cap).length;
+            for (const c of sameCompany) {
+              if (added >= HEADLINE_MIN_COLLEAGUES) break;
+              if (visible.has(c.id)) continue;
+              if (!nodeById.has(c.id)) continue;
+              visible.add(c.id);
+              added++;
+            }
+          }
+        }
+      }
     }
     const out: GraphNode[] = [];
     for (const n of nodes) {
@@ -739,23 +777,29 @@ const Discover = () => {
       out.push(n);
     }
     return out;
-  }, [focusId, nodes, nodeById, neighborByNode, activeViewNodes]);
+  }, [focusId, nodes, nodeById, neighborByNode, activeViewNodes, allProspects, scores]);
 
   const focalEdges = useMemo(() => {
     if (!focusId) return edges;
     const visible = new Set(focalNodes.map((n) => n.id));
     const focal = nodeById.get(focusId);
-    // For person focus, render an ego graph: only edges that touch the
-    // focused person. Without this you get the full all-pairs colleague
-    // mesh between the focused person's 20 colleagues — visually a hairball
-    // that hides the org chart we're after.
+    // For person focus we want the org-chart shape, not just an ego graph.
+    // Keep:
+    //   - every edge that touches the focused person (her own connections)
+    //   - works_at edges from any visible colleague to any visible company
+    //     (so the cluster reads as "everyone at Intel" rather than 20 dots)
+    //   - non-colleague structural edges between visible nodes (e.g. company
+    //     → industry, role → person) so the surrounding context remains
+    // Drop ONLY the all-pairs colleague mesh between the focused person's
+    // colleagues — that was the hairball, and it carries no extra signal
+    // beyond what the works_at edges already convey.
     if (focal?.kind === "person") {
-      return edges.filter(
-        (e) =>
-          (e.source === focusId || e.target === focusId)
-          && visible.has(e.source)
-          && visible.has(e.target),
-      );
+      return edges.filter((e) => {
+        if (!visible.has(e.source) || !visible.has(e.target)) return false;
+        if (e.source === focusId || e.target === focusId) return true;
+        if (e.kind === "colleague") return false;
+        return true;
+      });
     }
     return edges.filter((e) => visible.has(e.source) && visible.has(e.target));
   }, [focusId, edges, focalNodes, nodeById]);
