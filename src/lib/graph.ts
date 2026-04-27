@@ -8,6 +8,7 @@
  * for the full type union.
  */
 import type { Prospect, Score, Signal } from "./mockStore";
+import { GENERATED_COMPANY_META } from "./company-meta.generated";
 
 // ─── Node + edge schema ──────────────────────────────────────────────────────
 
@@ -198,18 +199,36 @@ export function canonicalizeRole(raw: string): string {
   return s;
 }
 
+// Pre-build a normalized lookup keyed off the LLM-generated meta. ~170
+// entries; building it once at module load is fast and lets resolveCompanyMeta
+// stay O(1) per call (vs. the previous O(meta-size) scan).
+const NORMALIZED_GENERATED_META: Map<string, CompanyMeta> = (() => {
+  const out = new Map<string, CompanyMeta>();
+  for (const [key, gen] of Object.entries(GENERATED_COMPANY_META)) {
+    if (!gen.country || !gen.industry) continue;
+    out.set(normalizeCompany(key), {
+      country: gen.country,
+      state: gen.state || undefined,
+      industry: gen.industry,
+      partnerships: gen.partnerships?.length ? gen.partnerships : undefined,
+    });
+  }
+  return out;
+})();
+
 /**
- * Resolve COMPANY_META entry by normalized name. Returns null if the company
- * isn't in our metadata table — callers skip the city/industry edge for
- * unknown companies rather than fall back to Unknown placeholder hubs (those
- * pollute the canvas with meaningless clusters).
+ * Resolve metadata for a company. Tries the hand-curated COMPANY_META first
+ * (so any local overrides win), then falls back to the LLM-generated table
+ * which covers ~170 of the 179 distinct companies in the live DB. Returns
+ * null only when both miss — callers skip the city/industry edge in that
+ * case to avoid Unknown placeholder hubs.
  */
 function resolveCompanyMeta(rawName: string): CompanyMeta | null {
   const norm = normalizeCompany(rawName);
   for (const [key, meta] of Object.entries(COMPANY_META)) {
     if (normalizeCompany(key) === norm) return meta;
   }
-  return null;
+  return NORMALIZED_GENERATED_META.get(norm) ?? null;
 }
 
 // Singleton root node id. Every industry, city, and role rolls up to this
@@ -219,11 +238,8 @@ const TECH_ROOT_ID = "industry:technology";
 const TECH_ROOT_NAME = "Technology";
 
 function resolvePartnerships(rawName: string): string[] {
-  const norm = normalizeCompany(rawName);
-  for (const [key, meta] of Object.entries(COMPANY_META)) {
-    if (normalizeCompany(key) === norm) return meta.partnerships ?? [];
-  }
-  return [];
+  const meta = resolveCompanyMeta(rawName);
+  return meta?.partnerships ?? [];
 }
 
 // ─── Optional Prospect enrichment fields ─────────────────────────────────────
