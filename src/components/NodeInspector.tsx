@@ -462,9 +462,13 @@ function BreakdownSections({
           // value is correct in either case.
           const localValue = breakdown.subScores[key];
           const persisted = persistedSubScores?.[key];
-          const value = (localValue && localValue > 0)
-            ? localValue
-            : (typeof persisted === "number" ? persisted : localValue);
+          // Prefer the persisted sub-score (server scorer) when available —
+          // it's always correct. Fall back to the locally-recomputed value
+          // only when there's no persisted score (e.g. fresh prospect).
+          const value =
+            typeof persisted === "number" && persisted > 0
+              ? persisted
+              : (localValue ?? 0);
           return (
             <BreakdownGroup
               key={key}
