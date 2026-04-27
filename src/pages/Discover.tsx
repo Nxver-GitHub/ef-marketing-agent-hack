@@ -1107,14 +1107,31 @@ const Discover = () => {
     [edgeKindsActive],
   );
 
+  // Chat-driven visibility expansion: when the chat surfaces a set of
+  // prospects, also include their immediate hubs (companies / roles /
+  // cities / industries) so the org chart actually renders connected
+  // instead of showing floating person nodes. Without this, calling
+  // setVisibleNodeIds([5 person ids]) paints 5 lonely circles with no
+  // edges; with it, the canvas reveals the org chart neighborhood.
+  const visibleWithHubs = useMemo<Set<string> | null>(() => {
+    if (!visibleNodeIds) return null;
+    const expanded = new Set<string>(visibleNodeIds);
+    for (const id of visibleNodeIds) {
+      const ns = neighborByNode.get(id);
+      if (!ns) continue;
+      for (const n of ns) expanded.add(n);
+    }
+    return expanded;
+  }, [visibleNodeIds, neighborByNode]);
+
   const nodeVisibility = useCallback(
     (node: FGNode) => {
-      if (visibleNodeIds === null) return true;
-      if (visibleNodeIds.has(node.id as string)) return true;
+      if (visibleWithHubs === null) return true;
+      if (visibleWithHubs.has(node.id as string)) return true;
       if (selectedId && node.id === selectedId) return true;
       return false;
     },
-    [visibleNodeIds, selectedId],
+    [visibleWithHubs, selectedId],
   );
 
   // Endless-traversal click handler. Clicking a node makes it the new
@@ -1311,19 +1328,28 @@ const Discover = () => {
   // (which would carpet the canvas with redundant tags).
   const linkCanvasObject = useCallback(
     (link: FGLink, ctx2d: CanvasRenderingContext2D, globalScale: number) => {
-      // Below ~1.4× zoom, edge labels become illegible and just clutter the
-      // overview. Above that threshold the user is inspecting locally.
-      if (globalScale < 1.4) return;
       const kind = (link as unknown as { kind?: EdgeKind }).kind;
       if (!kind) return;
       const label = EDGE_LABEL_SHORT[kind];
-      if (!label) return;
-      const src = link.source as unknown as { x?: number; y?: number };
-      const tgt = link.target as unknown as { x?: number; y?: number };
-      const sx = src?.x;
-      const sy = src?.y;
-      const tx = tgt?.x;
-      const ty = tgt?.y;
+      if (!label) return; // colleague intentionally has no entry
+
+      // Show labels: (a) when zoomed in >= 1.4×, OR (b) for edges touching
+      // the selected node at any zoom. This mirrors the node-label policy
+      // so clicking a node reveals all its relationship labels immediately.
+      const srcNode = link.source as unknown as { id?: string; x?: number; y?: number };
+      const tgtNode = link.target as unknown as { id?: string; x?: number; y?: number };
+      const srcId = srcNode?.id;
+      const tgtId = tgtNode?.id;
+      const zoomedIn = globalScale >= 1.4;
+      const isAdjacent =
+        selectedId != null &&
+        (srcId === selectedId || tgtId === selectedId);
+      if (!zoomedIn && !isAdjacent) return;
+
+      const sx = srcNode?.x;
+      const sy = srcNode?.y;
+      const tx = tgtNode?.x;
+      const ty = tgtNode?.y;
       if (sx == null || sy == null || tx == null || ty == null) return;
       // Midpoint, slightly offset toward the target so labels on adjacent
       // edges from the same node don't pile up at the source.
@@ -1350,7 +1376,7 @@ const Discover = () => {
       ctx2d.fillText(label, 0, 0);
       ctx2d.restore();
     },
-    [labelHalo, labelMuted],
+    [selectedId, labelHalo, labelMuted],
   );
 
   // ─── Render ────────────────────────────────────────────────────────────────
@@ -1544,6 +1570,8 @@ const Discover = () => {
                   onEngineStop={onEngineStop}
                   nodeLabel={nodeLabelStable}
                   nodeCanvasObject={nodeCanvasObject}
+                  linkCanvasObject={linkCanvasObject}
+                  linkCanvasObjectMode="after"
                 />
               )
             )}
