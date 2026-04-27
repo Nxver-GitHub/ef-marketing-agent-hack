@@ -714,8 +714,21 @@ const Discover = () => {
   const focalEdges = useMemo(() => {
     if (!focusId) return edges;
     const visible = new Set(focalNodes.map((n) => n.id));
+    const focal = nodeById.get(focusId);
+    // For person focus, render an ego graph: only edges that touch the
+    // focused person. Without this you get the full all-pairs colleague
+    // mesh between the focused person's 20 colleagues — visually a hairball
+    // that hides the org chart we're after.
+    if (focal?.kind === "person") {
+      return edges.filter(
+        (e) =>
+          (e.source === focusId || e.target === focusId)
+          && visible.has(e.source)
+          && visible.has(e.target),
+      );
+    }
     return edges.filter((e) => visible.has(e.source) && visible.has(e.target));
-  }, [focusId, edges, focalNodes]);
+  }, [focusId, edges, focalNodes, nodeById]);
 
   // Build the graphData ForceGraph2D consumes (nodes + links).
   //
