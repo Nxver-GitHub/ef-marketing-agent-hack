@@ -422,6 +422,23 @@ const EDGE_LEGEND: ReadonlyArray<{ kind: EdgeKind; label: string }> = [
   { kind: "vertical", label: "Vertical" },
 ];
 
+// Compact mid-edge labels — drawn by linkCanvasObject in zoomed-in views so
+// the user can tell apart works_at / past_employer / education / partnership
+// without consulting the legend. `colleague` is intentionally suppressed: it
+// would carpet the canvas with redundant "Colleague" tags between every pair
+// of co-workers.
+const EDGE_LABEL_SHORT: Partial<Record<EdgeKind, string>> = {
+  reports_to: "REPORTS",
+  works_at: "WORKS AT",
+  located_in: "LOCATED IN",
+  past_employer: "EX",
+  partnership: "PARTNER",
+  education: "EDUCATED AT",
+  vertical: "VERTICAL",
+  scope_signal: "SCOPE",
+  evidence_cited: "EVIDENCE",
+};
+
 // Encode/decode helpers for URL-sync. Unknown values are dropped so a hand-
 // edited URL can't crash the page.
 function encodeEdgeKinds(active: Set<EdgeKind>): string {
@@ -1286,6 +1303,56 @@ const Discover = () => {
     ],
   );
 
+  // Edge-label painter. Renders a compact uppercase label centered on each
+  // edge (`WORKS AT`, `EDUCATED AT`, `EX`, `PARTNER`, …) so the canvas reads
+  // like a Figma sketch instead of an unlabeled spider web. Painted in
+  // `after` mode so default link rendering still draws the line; we only
+  // overlay the text. Suppressed at low zoom and for `colleague` edges
+  // (which would carpet the canvas with redundant tags).
+  const linkCanvasObject = useCallback(
+    (link: FGLink, ctx2d: CanvasRenderingContext2D, globalScale: number) => {
+      // Below ~1.4× zoom, edge labels become illegible and just clutter the
+      // overview. Above that threshold the user is inspecting locally.
+      if (globalScale < 1.4) return;
+      const kind = (link as unknown as { kind?: EdgeKind }).kind;
+      if (!kind) return;
+      const label = EDGE_LABEL_SHORT[kind];
+      if (!label) return;
+      const src = link.source as unknown as { x?: number; y?: number };
+      const tgt = link.target as unknown as { x?: number; y?: number };
+      const sx = src?.x;
+      const sy = src?.y;
+      const tx = tgt?.x;
+      const ty = tgt?.y;
+      if (sx == null || sy == null || tx == null || ty == null) return;
+      // Midpoint, slightly offset toward the target so labels on adjacent
+      // edges from the same node don't pile up at the source.
+      const mx = sx + (tx - sx) * 0.55;
+      const my = sy + (ty - sy) * 0.55;
+      // Edge angle — orient the label along the edge for that "wire diagram"
+      // feel. Flip when the edge runs right-to-left so text isn't upside down.
+      let angle = Math.atan2(ty - sy, tx - sx);
+      if (angle > Math.PI / 2 || angle < -Math.PI / 2) angle += Math.PI;
+      const fontPx = 9 / globalScale; // keep visual size constant across zooms
+      ctx2d.save();
+      ctx2d.translate(mx, my);
+      ctx2d.rotate(angle);
+      ctx2d.font = `500 ${fontPx}px Inter, system-ui, sans-serif`;
+      ctx2d.textAlign = "center";
+      ctx2d.textBaseline = "middle";
+      // Halo against the line color (taken from the edge itself if pre-baked).
+      const linkAny = link as unknown as { color?: string };
+      const fill = linkAny.color ?? labelMuted;
+      ctx2d.lineWidth = 3 / globalScale;
+      ctx2d.strokeStyle = labelHalo;
+      ctx2d.strokeText(label, 0, 0);
+      ctx2d.fillStyle = fill;
+      ctx2d.fillText(label, 0, 0);
+      ctx2d.restore();
+    },
+    [labelHalo, labelMuted],
+  );
+
   // ─── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-background text-foreground">
@@ -1467,6 +1534,8 @@ const Discover = () => {
                   backgroundColor="transparent"
                   linkColor="color"
                   linkWidth="width"
+                  linkCanvasObjectMode={() => "after"}
+                  linkCanvasObject={linkCanvasObject}
                   linkVisibility={linkVisibility}
                   nodeVisibility={nodeVisibility}
                   onNodeClick={onNodeClickStable}
