@@ -11,6 +11,7 @@
 import type { JSX } from "react";
 import { X } from "lucide-react";
 import type { GraphNode } from "@/lib/graph";
+import { GENERATED_COMPANY_META } from "@/lib/company-meta.generated";
 import type { Prospect, Score, Signal } from "@/lib/mockStore";
 import { scoreColor } from "@/components/ScoreBar";
 import { Badge } from "@/components/ui/badge";
@@ -265,6 +266,24 @@ export function NodeInspector(props: NodeInspectorProps): JSX.Element | null {
 
   // ─── COMPANY ───────────────────────────────────────────────────────────────
   if (node.kind === "company") {
+    // Firmographics from the LLM-enriched meta (`scripts/enrich-companies.mjs`).
+    // Match by exact display name first, then a normalized fallback so e.g.
+    // "Intel" / "Intel Corporation" both resolve.
+    const norm = (s: string) =>
+      s.trim().toLowerCase().replace(/\s+/g, " ").replace(/\b(corp|corporation|inc|incorporated|ltd|llc|technologies|technology|systems?)\b/g, "").replace(/\s+/g, " ").trim();
+    const meta =
+      GENERATED_COMPANY_META[node.name] ??
+      Object.entries(GENERATED_COMPANY_META).find(([k]) => norm(k) === norm(node.name))?.[1];
+    const subLineParts: string[] = [];
+    if (meta?.industry) subLineParts.push(meta.industry);
+    if (meta?.hq_city) {
+      const region = meta.state || meta.country || "";
+      subLineParts.push(region ? `${meta.hq_city}, ${region}` : meta.hq_city);
+    } else if (meta?.country) {
+      subLineParts.push(meta.country);
+    }
+    if (meta?.employee_count_estimate) subLineParts.push(`${meta.employee_count_estimate} emp`);
+    const subLine = subLineParts.length > 0 ? subLineParts.join(" · ") : "—";
     // TODO(real-data): firmographics + ICP-fit numbers should come from props
     // once the company-enrichment slice lands. Today: hardcoded sample.
     const evidence: EvidenceRow[] = [
@@ -279,7 +298,7 @@ export function NodeInspector(props: NodeInspectorProps): JSX.Element | null {
         <IdentityCard
           avatar={<Avatar kind="company" />}
           name={node.name}
-          subLine="Series D · Semiconductors · Hsinchu · ~70k emp"
+          subLine={subLine}
           bigValue={88}
           bigLabel="ICP fit"
         />
