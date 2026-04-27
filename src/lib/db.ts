@@ -165,16 +165,16 @@ function useSupaProspect(id?: string) {
   return data ?? null;
 }
 
+// Per-prospect signals — always hits live Supabase, even in snapshot mode.
+// The bulk snapshot strips signals.value / raw_data (40MB JSONB blobs) for
+// graph-build perf, so the inspector panel needs the live row to render
+// evidence values. Single small fetch (~50KB) per inspector open.
 function useSupaSignalsFor(id?: string) {
   const { data } = useQuery({
-    queryKey: ["signals", id, USE_SNAPSHOT ? "snapshot" : "live"],
+    queryKey: ["signals", id],
     enabled: HAS_REAL_SUPABASE && !!id,
-    staleTime: USE_SNAPSHOT ? Infinity : BULK_STALE_MS,
+    staleTime: BULK_STALE_MS,
     queryFn: async () => {
-      if (USE_SNAPSHOT) {
-        const snap = await loadSnapshot();
-        return snap.signals.filter((s) => s.prospect_id === id).map(toSig);
-      }
       const { data: rows } = await supabase!
         .from("signals")
         .select("*")

@@ -55,7 +55,16 @@ console.log("→ snapshotting Supabase…");
 const prospects = await pageAll("prospects", { order: "created_at.desc,id.asc" });
 const signal_weights = await pageAll("signal_weights");
 const allScores = await pageAll("scores", { order: "computed_at.desc" });
-const allSignals = await pageAll("signals", { order: "collected_at.desc" });
+
+// Lite signal projection — `value` and `raw_data` JSONB blobs are 40MB+
+// combined and only the per-prospect inspector reads them. The graph builder
+// just needs (id, prospect_id, signal_type, confidence, weight, collected_at)
+// to count evidence per prospect and emit evidence_cited edges. The inspector
+// keeps fetching full signals from live Supabase via useSupaSignalsFor(id).
+const allSignals = await pageAll("signals", {
+  order: "collected_at.desc",
+  select: "id,prospect_id,source,signal_type,confidence,weight,collected_at",
+});
 
 // ─── shrink scores: pick best per prospect (mirrors db.ts MODEL_PRECEDENCE) ──
 const MODEL_PRECEDENCE = {
