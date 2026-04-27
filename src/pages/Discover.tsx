@@ -1286,8 +1286,31 @@ const Discover = () => {
             </div>
           </div>
 
-          {/* Subheader: legend (nodes + edges) — U5 */}
+          {/* Subheader: legend (view + nodes + edges) — U5 */}
           <div className="flex flex-col gap-1.5 border-b border-border px-5 py-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground w-12 shrink-0">
+                View
+              </span>
+              {VIEW_MODES.map((v) => {
+                const active = viewMode === v.id;
+                return (
+                  <button
+                    key={v.id}
+                    type="button"
+                    onClick={() => onPickViewMode(v.id)}
+                    aria-pressed={active}
+                    className={`rounded-full border border-border py-[3px] px-3 text-[11px] leading-none transition-colors ${
+                      active
+                        ? "bg-foreground text-background"
+                        : "bg-transparent text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {v.label}
+                  </button>
+                );
+              })}
+            </div>
             <div className="flex items-center gap-3 flex-wrap">
               <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground w-12 shrink-0">
                 Nodes
