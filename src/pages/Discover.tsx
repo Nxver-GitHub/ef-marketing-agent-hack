@@ -1265,7 +1265,9 @@ const Discover = () => {
                 <span className="text-foreground">
                   {focalNodes.filter((n) => n.kind === "person").length}
                 </span>{" "}
-                {"candidates"}
+                {allProspects.length > focalNodes.filter((n) => n.kind === "person").length
+                  ? `of ${allProspects.length.toLocaleString()} candidates`
+                  : "candidates"}
               </span>
               <span>
                 Selected:{" "}
