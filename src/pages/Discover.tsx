@@ -438,12 +438,13 @@ const Discover = () => {
     return out;
   }, [visibleNodeIds]);
 
-  // Cap how many prospects feed the rendered force graph. ForceGraph2D + the
-  // O(n²) colleague-edge step in buildGraph become unworkable past a few
-  // hundred. Top-N by overall_score, falling back to insertion order. The
-  // chat copilot still sees a wider AGENT_FULL_CAP set below.
+  // Cap how many prospects feed the RENDERED force graph. ForceGraph2D + the
+  // colleague-edge step (O(k²) within each company) become unworkable past a
+  // few hundred — Intel alone has 446 prospects ≈ 99k colleague edges.
+  // Top-N by overall_score, fallback to insertion order. The chat copilot
+  // sees the FULL prospect set below (no cap; colleague edges skipped, so
+  // the agent buildGraph stays O(n) over the entire DB).
   const RENDER_CAP = 250;
-  const AGENT_FULL_CAP = 2_000;
 
   const prospects = useMemo(() => {
     if (chatPromotedIds) {
@@ -491,18 +492,6 @@ const Discover = () => {
     }
     return baseTopN;
   }, [allProspects, chatPromotedIds, scores, focusId]);
-
-  // Cap the agent-context graph too — pre-cap, /discover spent ~39s of long
-  // tasks on first render building a 17k-prospect graph (audit Apr-26).
-  const agentProspects = useMemo(() => {
-    if (allProspects.length <= AGENT_FULL_CAP) return allProspects;
-    const ranked = [...allProspects].sort((a, b) => {
-      const sa = scores[a._id]?.overall_score ?? -1;
-      const sb = scores[b._id]?.overall_score ?? -1;
-      return sb - sa;
-    });
-    return ranked.slice(0, AGENT_FULL_CAP);
-  }, [allProspects, scores]);
 
   const prospectIds = useMemo(() => prospects.map((p) => p._id), [prospects]);
   const signalsById = useSignalsForMany(prospectIds);
@@ -803,13 +792,21 @@ const Discover = () => {
   }, [focusId, focalNodes]);
 
   // ─── Agent context ─────────────────────────────────────────────────────────
-  // Built off the FULL prospect set, not the rendered slice — so the chat
-  // copilot keeps recall over all 10k+ candidates even when the canvas only
-  // shows the top 500. focus_node / filter / explain etc. all operate on
-  // this fuller graph.
+  // Built off the FULL prospect set (no cap) — the chat copilot keeps recall
+  // over every candidate in the DB. We skip colleague edges (the only
+  // O(n²) step in buildGraph) so this stays O(n) and finishes in <1s even
+  // for 17k+ prospects. Chat tools do node lookups, not traversal, so
+  // missing colleague edges has no behavioural cost.
   const fullGraph = useMemo(
-    () => buildGraph({ prospects: agentProspects, scores, signalsById, theme }),
-    [agentProspects, scores, signalsById, theme],
+    () =>
+      buildGraph({
+        prospects: allProspects,
+        scores,
+        signalsById,
+        theme,
+        skipColleagueEdges: true,
+      }),
+    [allProspects, scores, signalsById, theme],
   );
   const ctx: AgentContext = useMemo(
     () => ({
@@ -817,9 +814,6 @@ const Discover = () => {
       edges: fullGraph.edges,
       setSelectedId,
       setVisibleNodeIds,
-      // Lookup over allProspects (not the capped agent set) — a chat tool
-      // can still resolve any id the user pastes in, even if it's outside
-      // the top-N graph. The graph just won't have a node for it.
       getProspectById: (id) =>
         allProspects.find((p) => `person:${p._id}` === id || p._id === id),
       getScoreById: (id) => {

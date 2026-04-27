@@ -85,6 +85,15 @@ export interface BuildGraphArgs {
    * ("color") instead of per-tick callbacks.
    */
   theme?: ThemeTokens;
+  /**
+   * Skip the O(n²) "colleague" edge pass. Drops `colleague` edges entirely,
+   * which is the only super-linear step in buildGraph: a company with 446
+   * prospects emits ~99k colleague edges by itself. Set this true on the
+   * agent-context build (chat copilot does name/company lookups, not
+   * graph traversal) so the full DB can fit in the agent context without
+   * locking up the main thread.
+   */
+  skipColleagueEdges?: boolean;
 }
 
 // ─── Company metadata ────────────────────────────────────────────────────────
@@ -408,10 +417,14 @@ export function buildGraph(args: BuildGraphArgs): {
   }
 
   // Second pass: colleague edges (any two persons sharing a companyId).
-  for (const persons of peopleByCompany.values()) {
-    for (let i = 0; i < persons.length; i++) {
-      for (let j = i + 1; j < persons.length; j++) {
-        addEdge(persons[i], persons[j], "colleague");
+  // O(k²) per company, k = head-count at that company. Off in agent-context
+  // builds where the chat copilot only needs node lookups, not traversal.
+  if (!args.skipColleagueEdges) {
+    for (const persons of peopleByCompany.values()) {
+      for (let i = 0; i < persons.length; i++) {
+        for (let j = i + 1; j < persons.length; j++) {
+          addEdge(persons[i], persons[j], "colleague");
+        }
       }
     }
   }
