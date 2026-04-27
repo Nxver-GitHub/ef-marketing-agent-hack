@@ -347,7 +347,15 @@ function PersonInspector({
       />
 
       {breakdown ? (
-        <BreakdownSections breakdown={breakdown} signals={signals ?? []} />
+        <BreakdownSections
+          breakdown={breakdown}
+          signals={signals ?? []}
+          persistedSubScores={{
+            authenticity: score?.authenticity_score,
+            authority: score?.authority_score,
+            warmth: score?.warmth_score,
+          }}
+        />
       ) : (
         <>
           <EvidenceHead title="Evidence trail" count={evidenceCount} />
@@ -389,9 +397,11 @@ function PersonInspector({
 function BreakdownSections({
   breakdown,
   signals,
+  persistedSubScores,
 }: {
   breakdown: NonNullable<ReturnType<typeof breakdownScore>>;
   signals: Signal[];
+  persistedSubScores?: { authenticity?: number; authority?: number; warmth?: number };
 }): JSX.Element {
   const signalById = useMemo(() => {
     const m = new Map<string, Signal>();
@@ -406,15 +416,26 @@ function BreakdownSections({
         <span className="text-[10px] text-muted-foreground">click to expand</span>
       </div>
       <div className="space-y-2">
-        {(Object.keys(SUB_SCORE_LABEL) as SubScoreKey[]).map((key) => (
-          <BreakdownGroup
-            key={key}
-            label={SUB_SCORE_LABEL[key]}
-            value={breakdown.subScores[key]}
-            contributions={breakdown[key]}
-            signalById={signalById}
-          />
-        ))}
+        {(Object.keys(SUB_SCORE_LABEL) as SubScoreKey[]).map((key) => {
+          // Prefer the persisted sub-score (server scorer) — the local
+          // breakdown denominator goes to 0 when a prospect's signal_types
+          // aren't in the snapshot's signal_weights table, but the persisted
+          // value is correct in either case.
+          const localValue = breakdown.subScores[key];
+          const persisted = persistedSubScores?.[key];
+          const value = (localValue && localValue > 0)
+            ? localValue
+            : (typeof persisted === "number" ? persisted : localValue);
+          return (
+            <BreakdownGroup
+              key={key}
+              label={SUB_SCORE_LABEL[key]}
+              value={value}
+              contributions={breakdown[key]}
+              signalById={signalById}
+            />
+          );
+        })}
       </div>
     </>
   );
