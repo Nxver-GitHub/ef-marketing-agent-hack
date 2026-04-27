@@ -174,20 +174,232 @@ function buildSnapshot(ctx: AgentContext): Record<string, unknown> {
   };
 }
 
+// ─── Canned agent (no-backend mode for Vercel + snapshot demos) ────────────
+// When VITE_USE_SNAPSHOT=true (or the live API is unreachable) we run a
+// keyword-router that produces real ToolResults against ctx.nodes. The point
+// is a believable demo, not full LLM coverage — enough scripted patterns to
+// answer the queries the demo script actually walks through.
+const USE_CANNED =
+  (import.meta.env.VITE_USE_SNAPSHOT as string | undefined)?.toLowerCase() === "true";
+
+function findCompanyId(ctx: AgentContext, q: string): string | null {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const nq = norm(q);
+  let best: { id: string; score: number } | null = null;
+  for (const n of ctx.nodes) {
+    if (n.kind !== "company") continue;
+    const nn = norm(n.name);
+    if (!nn) continue;
+    let score = 0;
+    if (nn === nq) score = 100;
+    else if (nn.startsWith(nq) || nq.startsWith(nn)) score = 80;
+    else if (nn.includes(nq) || nq.includes(nn)) score = 60;
+    if (score > 0 && (!best || score > best.score)) best = { id: n.id, score };
+  }
+  return best?.id ?? null;
+}
+
+function findIndustryId(ctx: AgentContext, q: string): string | null {
+  const nq = q.toLowerCase().trim();
+  for (const n of ctx.nodes) {
+    if (n.kind === "industry" && n.name.toLowerCase() === nq) return n.id;
+  }
+  for (const n of ctx.nodes) {
+    if (n.kind === "industry" && n.name.toLowerCase().includes(nq)) return n.id;
+  }
+  return null;
+}
+
+function topPersonIdsAtCompany(ctx: AgentContext, companyId: string, limit: number): string[] {
+  const peers = ctx.edges
+    .filter((e) => e.kind === "works_at" && (e.source === companyId || e.target === companyId))
+    .map((e) => (e.source === companyId ? e.target : e.source))
+    .filter((id) => {
+      const n = ctx.nodes.find((nn) => nn.id === id);
+      return n?.kind === "person";
+    });
+  // Sort by score (best-effort — node may carry .score).
+  peers.sort((a, b) => {
+    const na = ctx.nodes.find((n) => n.id === a) as { score?: number } | undefined;
+    const nb = ctx.nodes.find((n) => n.id === b) as { score?: number } | undefined;
+    return (nb?.score ?? -1) - (na?.score ?? -1);
+  });
+  return peers.slice(0, limit);
+}
+
+function tokenizeRoleQuery(q: string): { roleKw: string | null; companyHint: string | null; limit: number } {
+  const lc = q.toLowerCase();
+  const roleKws = ["ceo", "cto", "coo", "cfo", "vp engineering", "vp of engineering", "head of engineering",
+                   "director of engineering", "vp", "director", "engineer", "designer"];
+  const roleKw = roleKws.find((kw) => lc.includes(kw)) ?? null;
+  const at = / at ([a-z][a-z0-9 .&'-]*)/.exec(lc);
+  const companyHint = at?.[1]?.trim() ?? null;
+  const numMatch = /\b(\d{1,3})\b/.exec(lc);
+  const limit = numMatch ? Math.min(40, Math.max(1, parseInt(numMatch[1]!, 10))) : 10;
+  return { roleKw, companyHint, limit };
+}
+
+function cannedTurn(userText: string, ctx: AgentContext): { reply: string; toolResults: ServerToolResult[] } {
+  const t = userText.trim();
+  if (!t) return { reply: "Ask me about a company, an industry, or a role and I'll surface matches on the graph.", toolResults: [] };
+  const lc = t.toLowerCase();
+
+  // Pattern 1: "show ___" or "focus on ___" or "find ___" company/industry
+  const focusMatch = /^(?:show|focus(?: on)?|find|open|highlight|jump to|go to)\s+(.+)/i.exec(t);
+  const target = focusMatch?.[1]?.trim() ?? null;
+
+  if (target) {
+    const ind = findIndustryId(ctx, target);
+    if (ind) {
+      const node = ctx.nodes.find((n) => n.id === ind);
+      return {
+        reply: `Highlighting the ${node?.name ?? target} cluster — companies in that vertical and the people working there.`,
+        toolResults: [
+          {
+            name: "focus_node",
+            arguments: { query: target, kind: "industry" },
+            result: { results: [{ id: ind, kind: "industry", name: node?.name ?? target }] },
+          },
+        ],
+      };
+    }
+    const co = findCompanyId(ctx, target);
+    if (co) {
+      const node = ctx.nodes.find((n) => n.id === co);
+      const peers = topPersonIdsAtCompany(ctx, co, 20);
+      return {
+        reply: `Focused on **${node?.name ?? target}** — surfacing the top ${peers.length} people on the graph by overall score.`,
+        toolResults: [
+          {
+            name: "focus_node",
+            arguments: { query: target, kind: "company" },
+            result: { results: [{ id: co, kind: "company", name: node?.name ?? target }] },
+          },
+        ],
+      };
+    }
+  }
+
+  // Pattern 2: "VPs at Nvidia", "directors of engineering at Intel", "ceos in semiconductors"
+  if (/\b(vp|cto|ceo|coo|cfo|director|head of|vice president|engineer)\b/i.test(lc)) {
+    const { roleKw, companyHint, limit } = tokenizeRoleQuery(lc);
+    let restrictCompany: string | null = null;
+    if (companyHint) restrictCompany = findCompanyId(ctx, companyHint);
+    const personIds: string[] = [];
+    for (const n of ctx.nodes) {
+      if (n.kind !== "person") continue;
+      const role = (n as { role?: string }).role ?? "";
+      if (roleKw && !role.toLowerCase().includes(roleKw.replace(" of engineering", "").replace("vp", "vp "))) {
+        if (!role.toLowerCase().includes(roleKw)) continue;
+      }
+      if (restrictCompany) {
+        const at = ctx.edges.find(
+          (e) => e.kind === "works_at" && (
+            (e.source === n.id && e.target === restrictCompany) ||
+            (e.target === n.id && e.source === restrictCompany)
+          ),
+        );
+        if (!at) continue;
+      }
+      personIds.push(n.id);
+      if (personIds.length >= limit) break;
+    }
+    if (personIds.length > 0) {
+      const restrictName = restrictCompany
+        ? (ctx.nodes.find((n) => n.id === restrictCompany)?.name ?? "the company")
+        : "all companies";
+      return {
+        reply: `Found ${personIds.length} matching ${roleKw ?? "candidates"} at ${restrictName}. Highlighting them on the graph.`,
+        toolResults: [
+          {
+            name: "filter",
+            arguments: { role: roleKw, company: companyHint, limit },
+            result: {
+              count: personIds.length,
+              prospects: personIds.map((id) => ({ id: id.replace(/^person:/, "") })),
+            },
+          },
+        ],
+      };
+    }
+  }
+
+  // Pattern 3: "explain ___" — open inspector on best company match
+  const explainMatch = /^(?:explain|why|tell me about)\s+(.+)/i.exec(t);
+  if (explainMatch) {
+    const q = explainMatch[1].trim();
+    const co = findCompanyId(ctx, q);
+    if (co) {
+      const node = ctx.nodes.find((n) => n.id === co);
+      return {
+        reply: `Opening the inspector for **${node?.name ?? q}**. Right rail shows the firmographics + ICP fit.`,
+        toolResults: [
+          {
+            name: "explain",
+            arguments: { query: q },
+            result: { node: { id: co, kind: "company" } },
+          },
+        ],
+      };
+    }
+  }
+
+  // Default — answer from the snapshot stats so the assistant never returns silence.
+  const counts: Record<string, number> = {};
+  for (const n of ctx.nodes) counts[n.kind] = (counts[n.kind] ?? 0) + 1;
+  const summary = Object.entries(counts)
+    .map(([k, v]) => `${v} ${k}${v === 1 ? "" : "s"}`)
+    .join(" · ");
+  return {
+    reply:
+      `I'm in offline-demo mode — try queries like "show me Nvidia", "VPs of engineering at Intel", "focus on semiconductors", or "explain Lockheed Martin". ` +
+      `Currently rendered: ${summary}.`,
+    toolResults: [],
+  };
+}
+
+async function runCannedAgent(
+  messages: ChatMessage[],
+  ctx: AgentContext,
+): Promise<RunAgentResult> {
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  const { reply, toolResults } = cannedTurn(lastUser?.content ?? "", ctx);
+  const toolCalls: ToolCallTrace[] = toolResults.map((tr) => {
+    applyToolResult(tr, ctx);
+    return { name: tr.name, args: tr.arguments, result: tr.result };
+  });
+  const updated: ChatMessage[] = [
+    ...messages,
+    { role: "assistant", content: reply, toolCalls },
+  ];
+  return { finalText: reply, toolCalls, messages: updated };
+}
+
 export async function runAgent(
   messages: ChatMessage[],
   ctx: AgentContext,
 ): Promise<RunAgentResult> {
-  const resp = await fetch(`${API_URL}/chat`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      messages: toServerMessages(messages),
-      snapshot: buildSnapshot(ctx),
-    }),
-  });
+  if (USE_CANNED) {
+    return runCannedAgent(messages, ctx);
+  }
+  let resp: Response;
+  try {
+    resp = await fetch(`${API_URL}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: toServerMessages(messages),
+        snapshot: buildSnapshot(ctx),
+      }),
+    });
+  } catch {
+    // Backend unreachable (no FastAPI on Vercel, etc.) — fall back to canned.
+    return runCannedAgent(messages, ctx);
+  }
 
   if (!resp.ok) {
+    // Hard failure from the backend (5xx, schema mismatch) — also fall back.
+    if (resp.status >= 500 || resp.status === 404) return runCannedAgent(messages, ctx);
     const text = await resp.text().catch(() => "");
     throw new Error(`POST /chat failed: ${resp.status} ${text}`);
   }
