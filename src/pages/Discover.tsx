@@ -537,7 +537,12 @@ const Discover = () => {
     const focusKind = focusId && colonIdx > 0 ? focusId.slice(0, colonIdx) : null;
     const focusName = focusId && colonIdx > 0 ? focusId.slice(colonIdx + 1) : null;
 
-    // Person focus: same-company colleagues merged into the global top-N slice.
+    // Person focus: the clicked prospect + same-company colleagues merged
+    // into the global top-N slice. Critical: include `me` himself — without
+    // it, clicking a person whose score is outside the top-250 left him
+    // absent from `prospects` so buildGraph never emitted a person:<id>
+    // node, and focalNodes collapsed to "0 of N candidates" with stale
+    // company nodes from prior state.
     if (focusKind === "person" && focusName) {
       const norm = (s: string) => s.trim().toLowerCase();
       const me = allProspects.find((p) => p._id === focusName);
@@ -546,13 +551,21 @@ const Discover = () => {
           (p) => p._id !== me._id && norm(p.company) === norm(me.company),
         );
         if (allProspects.length <= RENDER_CAP && colleagues.length === 0) {
-          return allProspects;
+          // Whole DB fits and no colleagues — still ensure `me` is present.
+          return allProspects.some((p) => p._id === me._id)
+            ? allProspects
+            : [me, ...allProspects];
         }
         const ranked = [...allProspects].sort(byScoreDesc);
         const baseTopN = ranked.slice(0, RENDER_CAP);
         const FOCAL_EXPAND_CAP = 60;
         const rankedColleagues = [...colleagues].sort(byScoreDesc);
         const seen = new Set(baseTopN.map((p) => p._id));
+        // Always include the focal person himself first — non-negotiable.
+        if (!seen.has(me._id)) {
+          baseTopN.push(me);
+          seen.add(me._id);
+        }
         let added = 0;
         for (const p of rankedColleagues) {
           if (added >= FOCAL_EXPAND_CAP) break;
