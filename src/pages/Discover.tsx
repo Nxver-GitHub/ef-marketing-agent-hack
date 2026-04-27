@@ -483,11 +483,25 @@ const Discover = () => {
     });
     const baseTopN = ranked.slice(0, RENDER_CAP);
     if (focusMatches.length === 0) return baseTopN;
+
+    // Cap focal-context expansion. Without this, clicking Intel (446 people)
+    // pushed `prospects` to ~700 and buildGraph's colleague pass — O(k²)
+    // within Intel — generated ~99k edges, locking the canvas for seconds.
+    // Score-rank focusMatches and take the top FOCAL_EXPAND_CAP.
+    const FOCAL_EXPAND_CAP = 60;
+    const rankedFocus = [...focusMatches].sort((a, b) => {
+      const sa = scores[a._id]?.overall_score ?? -1;
+      const sb = scores[b._id]?.overall_score ?? -1;
+      return sb - sa;
+    });
     const seen = new Set(baseTopN.map((p) => p._id));
-    for (const p of focusMatches) {
+    let added = 0;
+    for (const p of rankedFocus) {
+      if (added >= FOCAL_EXPAND_CAP) break;
       if (!seen.has(p._id)) {
         baseTopN.push(p);
         seen.add(p._id);
+        added++;
       }
     }
     return baseTopN;
