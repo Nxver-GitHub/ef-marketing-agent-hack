@@ -313,9 +313,6 @@ const DEFAULT_EDGE_KINDS: EdgeKind[] = [
 // "wide" (no focus) view. We're after an Obsidian-style web — readable at
 // first glance, with focusable clusters, not a 500-node hairball. Once the
 // user clicks a node, we drill into a focal subgraph that's bounded
-// separately by FOCAL_PEOPLE_CAP. Chat copilot operates on the full
-// 10k-prospect graph via AgentContext.
-const MAX_PROSPECTS_RENDERED = 120;
 // When drilled into a person focal node, we cap to the immediate
 // 1-hop neighborhood (still bounded — direct neighbors only).
 const FOCAL_PEOPLE_CAP = 20;
@@ -441,61 +438,38 @@ const Discover = () => {
     return out;
   }, [visibleNodeIds]);
 
+  // Cap how many prospects feed the rendered force graph. ForceGraph2D + the
+  // O(n²) colleague-edge step in buildGraph become unworkable past a few
+  // hundred. Top-N by overall_score, falling back to insertion order. The
+  // chat copilot still sees a wider AGENT_FULL_CAP set below.
+  const RENDER_CAP = 250;
+  const AGENT_FULL_CAP = 2_000;
+
   const prospects = useMemo(() => {
     if (chatPromotedIds) {
       const matched = allProspects.filter((p) => chatPromotedIds.has(p._id));
-      if (matched.length > 0) return matched;
+      if (matched.length > 0) return matched.slice(0, RENDER_CAP);
     }
-    // When the user focuses on any aggregation node (company / industry / role
-    // / city / school / conference) the user wants to see the *full* set of
-    // prospects under that node, not the global top-N. Without this, top-120-
-    // by-score wins the slot fight and large clusters show 2 people. We layer
-    // matches on top of the global top-N so surrounding context still renders.
-    const colonIdx = focusId?.indexOf(":") ?? -1;
-    const focusKind = focusId && colonIdx > 0 ? focusId.slice(0, colonIdx) : null;
-    const focusName = focusId && colonIdx > 0 ? focusId.slice(colonIdx + 1) : null;
-
-    const focusMatches: typeof allProspects = (() => {
-      if (!focusKind || !focusName || focusKind === "person") return [];
-      const norm = (s: string) => s.trim().toLowerCase();
-      switch (focusKind) {
-        case "company":
-          return allProspects.filter((p) => norm(p.company) === focusName);
-        case "industry":
-          return allProspects.filter((p) => norm(p.industry) === focusName);
-        case "role":
-          // Free-text roles vary; substring match against normalized role.
-          // Roles come into the graph via canonicalizeRole, so the focusName
-          // is one of a small set of canonical buckets.
-          return allProspects.filter((p) => norm(p.role).includes(focusName));
-        // For city / school / conference, the underlying mock/Supabase
-        // prospect rows don't carry a flat field; we still want a non-empty
-        // graph, so fall through and ride on the wide-view top-N (the focal
-        // edge expansion in `focalNodes` will then surface the cluster).
-        default:
-          return [];
-      }
-    })();
-
-    if (allProspects.length <= MAX_PROSPECTS_RENDERED && focusMatches.length === 0) {
-      return allProspects;
-    }
+    if (allProspects.length <= RENDER_CAP) return allProspects;
     const ranked = [...allProspects].sort((a, b) => {
       const sa = scores[a._id]?.overall_score ?? -1;
       const sb = scores[b._id]?.overall_score ?? -1;
       return sb - sa;
     });
-    const baseTopN = ranked.slice(0, MAX_PROSPECTS_RENDERED);
-    if (focusMatches.length === 0) return baseTopN;
-    const seen = new Set(baseTopN.map((p) => p._id));
-    for (const p of focusMatches) {
-      if (!seen.has(p._id)) {
-        baseTopN.push(p);
-        seen.add(p._id);
-      }
-    }
-    return baseTopN;
-  }, [allProspects, scores, chatPromotedIds, focusId]);
+    return ranked.slice(0, RENDER_CAP);
+  }, [allProspects, chatPromotedIds, scores]);
+
+  // Cap the agent-context graph too — pre-cap, /discover spent ~39s of long
+  // tasks on first render building a 17k-prospect graph (audit Apr-26).
+  const agentProspects = useMemo(() => {
+    if (allProspects.length <= AGENT_FULL_CAP) return allProspects;
+    const ranked = [...allProspects].sort((a, b) => {
+      const sa = scores[a._id]?.overall_score ?? -1;
+      const sb = scores[b._id]?.overall_score ?? -1;
+      return sb - sa;
+    });
+    return ranked.slice(0, AGENT_FULL_CAP);
+  }, [allProspects, scores]);
 
   const prospectIds = useMemo(() => prospects.map((p) => p._id), [prospects]);
   const signalsById = useSignalsForMany(prospectIds);
@@ -801,8 +775,8 @@ const Discover = () => {
   // shows the top 500. focus_node / filter / explain etc. all operate on
   // this fuller graph.
   const fullGraph = useMemo(
-    () => buildGraph({ prospects: allProspects, scores, signalsById, theme }),
-    [allProspects, scores, signalsById, theme],
+    () => buildGraph({ prospects: agentProspects, scores, signalsById, theme }),
+    [agentProspects, scores, signalsById, theme],
   );
   const ctx: AgentContext = useMemo(
     () => ({
@@ -810,6 +784,9 @@ const Discover = () => {
       edges: fullGraph.edges,
       setSelectedId,
       setVisibleNodeIds,
+      // Lookup over allProspects (not the capped agent set) — a chat tool
+      // can still resolve any id the user pastes in, even if it's outside
+      // the top-N graph. The graph just won't have a node for it.
       getProspectById: (id) =>
         allProspects.find((p) => `person:${p._id}` === id || p._id === id),
       getScoreById: (id) => {
@@ -1144,9 +1121,7 @@ const Discover = () => {
                 <span className="text-foreground">
                   {focalNodes.filter((n) => n.kind === "person").length}
                 </span>{" "}
-                {allProspects.length > MAX_PROSPECTS_RENDERED
-                  ? `of ${allProspects.length} candidates (top by score)`
-                  : "candidates"}
+                {"candidates"}
               </span>
               <span>
                 Selected:{" "}
