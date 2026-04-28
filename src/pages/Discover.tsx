@@ -1390,6 +1390,7 @@ const Discover = () => {
       labelStrong,
       labelMuted,
       labelHalo,
+      nodeRadius,
     ],
   );
 
