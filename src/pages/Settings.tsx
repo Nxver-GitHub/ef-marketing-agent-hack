@@ -1,8 +1,12 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { PageShell } from "@/components/PageShell";
-import { useWeights, useProspects, db } from "@/lib/db";
+import { useWeights, useProspects, db, type SignalWeight } from "@/lib/db";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
+import { HAS_REAL_SUPABASE } from "@/lib/supabase";
+
+const USE_SNAPSHOT =
+  HAS_REAL_SUPABASE && (import.meta.env.VITE_USE_SNAPSHOT as string | undefined) === "true";
 
 const Settings = () => {
   useDocumentTitle("Settings");
@@ -15,16 +19,18 @@ const Settings = () => {
   const get = (signal_type: string, idx: 0 | 1 | 2, fallback: number) =>
     draft[signal_type]?.[idx] ?? fallback;
 
-  const setVal = (signal_type: string, idx: 0 | 1 | 2, v: number, w: any) => {
+  const setVal = (signal_type: string, idx: 0 | 1 | 2, v: number, w: SignalWeight) => {
     const cur = draft[signal_type] ?? [
       w.authenticity_weight,
       w.authority_weight,
       w.warmth_weight,
     ];
-    const next: [number, number, number] = [...cur] as any;
+    const next: [number, number, number] = [cur[0], cur[1], cur[2]];
     next[idx] = v;
     setDraft({ ...draft, [signal_type]: next });
   };
+
+  const reset = () => setDraft({});
 
   const save = async () => {
     if (!dirty || saving) return;
@@ -55,11 +61,24 @@ const Settings = () => {
           <h1 className="text-4xl md:text-5xl font-light tracking-tight leading-[1.05] mb-6">
             Signal weights.
           </h1>
-          <p className="text-sm text-muted-foreground mb-6">
-            Tune how each signal contributes to the three sub-scores. Saving recomputes every
-            prospect immediately. Scoring code never hardcodes weights — they live here.
+          <p className="text-sm text-muted-foreground mb-6 leading-relaxed">
+            Tune how each signal contributes to the three sub-scores. Saving
+            recomputes every prospect immediately. Scoring code never hardcodes
+            weights — they live here.
           </p>
-          <div className="flex items-center gap-3">
+
+          {USE_SNAPSHOT && (
+            <div className="border border-amber-500/40 bg-amber-500/5 px-4 py-3 mb-6 text-xs text-amber-200/90 leading-relaxed">
+              <div className="text-[10px] uppercase tracking-[0.16em] text-amber-300/80 mb-1">
+                Snapshot mode
+              </div>
+              Saves write to Supabase, but the offline JSON snapshot won't
+              reflect new scores until you re-run{" "}
+              <span className="text-mono">scripts/snapshot-supabase.mjs</span>.
+            </div>
+          )}
+
+          <div className="flex items-center gap-3 flex-wrap">
             <button
               onClick={save}
               disabled={!dirty || saving}
@@ -73,10 +92,20 @@ const Settings = () => {
                   : "No changes"}
             </button>
             {dirty > 0 && !saving && (
-              <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
-                {dirty} unsaved
-              </span>
+              <button
+                onClick={reset}
+                className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground hover:text-foreground transition-colors"
+              >
+                Reset {dirty} unsaved
+              </button>
             )}
+          </div>
+
+          <div className="text-[10px] text-muted-foreground mt-8 leading-relaxed">
+            <div className="label-eyebrow mb-2">Reading the math</div>
+            Each signal contributes <span className="text-mono">norm × confidence × weight</span> to
+            the corresponding sub-score. Sub-scores combine as{" "}
+            <span className="text-mono">0.4 · auth + 0.4 · authority + 0.2 · warmth</span>.
           </div>
         </div>
 
@@ -88,27 +117,36 @@ const Settings = () => {
               <div className="col-span-2 text-right">Authority</div>
               <div className="col-span-3 text-right">Warmth</div>
             </div>
-            {weights.map((w) => (
-              <div
-                key={w._id}
-                className="grid grid-cols-12 items-center px-4 py-3 border-b border-border/60 last:border-0"
-              >
-                <div className="col-span-5 text-sm text-mono">{w.signal_type}</div>
-                <WeightInput
-                  v={get(w.signal_type, 0, w.authenticity_weight)}
-                  onChange={(v) => setVal(w.signal_type, 0, v, w)}
-                />
-                <WeightInput
-                  v={get(w.signal_type, 1, w.authority_weight)}
-                  onChange={(v) => setVal(w.signal_type, 1, v, w)}
-                />
-                <WeightInput
-                  v={get(w.signal_type, 2, w.warmth_weight)}
-                  onChange={(v) => setVal(w.signal_type, 2, v, w)}
-                  cols={3}
-                />
+            {weights.length === 0 ? (
+              <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                No signal weights loaded yet…
               </div>
-            ))}
+            ) : (
+              weights.map((w) => (
+                <div
+                  key={w._id}
+                  className="grid grid-cols-12 items-center px-4 py-3 border-b border-border/60 last:border-0"
+                >
+                  <div className="col-span-5 text-sm text-mono">{w.signal_type}</div>
+                  <WeightInput
+                    v={get(w.signal_type, 0, w.authenticity_weight)}
+                    onChange={(v) => setVal(w.signal_type, 0, v, w)}
+                    dirty={draft[w.signal_type]?.[0] !== undefined}
+                  />
+                  <WeightInput
+                    v={get(w.signal_type, 1, w.authority_weight)}
+                    onChange={(v) => setVal(w.signal_type, 1, v, w)}
+                    dirty={draft[w.signal_type]?.[1] !== undefined}
+                  />
+                  <WeightInput
+                    v={get(w.signal_type, 2, w.warmth_weight)}
+                    onChange={(v) => setVal(w.signal_type, 2, v, w)}
+                    cols={3}
+                    dirty={draft[w.signal_type]?.[2] !== undefined}
+                  />
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>
@@ -120,10 +158,12 @@ const WeightInput = ({
   v,
   onChange,
   cols = 2,
+  dirty = false,
 }: {
   v: number;
   onChange: (v: number) => void;
   cols?: 2 | 3;
+  dirty?: boolean;
 }) => (
   <div className={`${cols === 3 ? "col-span-3" : "col-span-2"} flex justify-end`}>
     <input
@@ -133,7 +173,9 @@ const WeightInput = ({
       max={2}
       value={v}
       onChange={(e) => onChange(Number(e.target.value))}
-      className="w-20 text-right bg-transparent border border-border px-2 py-1 text-mono text-xs focus:outline-none focus:border-accent"
+      className={`w-20 text-right bg-transparent border px-2 py-1 text-mono text-xs focus:outline-none focus:border-accent transition-colors ${
+        dirty ? "border-accent text-foreground" : "border-border"
+      }`}
     />
   </div>
 );

@@ -1,37 +1,10 @@
 import { useState, useRef, KeyboardEvent, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { PageShell } from "@/components/PageShell";
-import { db } from "@/lib/db";
-import { supabase, HAS_REAL_SUPABASE } from "@/lib/supabase";
+import { db, useProspects, useScoresFor } from "@/lib/db";
 import { useAutocompleteSources, rankSuggestions } from "@/lib/autocompleteSources";
 import { scoreColor } from "@/components/ScoreBar";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
-
-// Scorer tier precedence. Must match src/lib/db.ts::MODEL_PRECEDENCE so the
-// Validate results page surfaces the same "best" row as ProspectDetail.
-const MODEL_PRECEDENCE: Record<string, number> = {
-  chartreuse_llm_v1: 1,
-  chartreuse_deterministic_v1: 2,
-  lightweight_v1: 3,
-};
-type ScoreRow = {
-  overall_score: number;
-  authenticity_score: number;
-  authority_score: number;
-  warmth_score: number;
-  model_version: string | null;
-  computed_at: string;
-};
-function pickBest(rows: ScoreRow[] | null | undefined): ScoreRow | null {
-  if (!rows || rows.length === 0) return null;
-  const sorted = [...rows].sort((a, b) => {
-    const ta = MODEL_PRECEDENCE[a.model_version ?? ""] ?? 9;
-    const tb = MODEL_PRECEDENCE[b.model_version ?? ""] ?? 9;
-    if (ta !== tb) return ta - tb;
-    return +new Date(b.computed_at) - +new Date(a.computed_at);
-  });
-  return sorted[0] ?? null;
-}
 
 type ValidateRanked = {
   id: string;
@@ -71,6 +44,13 @@ const Validate = () => {
     keywords: string[];
     industry: string;
   } | null>(null);
+
+  // Pull the unified prospect+score corpus (mock, snapshot, or live Supabase
+  // — all resolved by db.ts). Validation ranks against this in-memory set,
+  // so the page works in every mode without separate code paths.
+  const allProspects = useProspects();
+  const allProspectIds = useMemo(() => allProspects.map((p) => p._id), [allProspects]);
+  const scoreMap = useScoresFor(allProspectIds);
 
   const makeTagHandlers = (
     items: string[],
@@ -141,15 +121,13 @@ const Validate = () => {
       industry,
     });
 
-    const top10 = HAS_REAL_SUPABASE
-      ? await lookupTopProspects({
-          name: trimmedName,
-          company: companyTrim,
-          roles: finalRoles,
-          keywords: finalKeywords,
-          industry,
-        })
-      : [];
+    const top10 = lookupTopProspectsLocal({
+      name: trimmedName,
+      company: companyTrim,
+      roles: finalRoles,
+      keywords: finalKeywords,
+      industry,
+    });
     setResults(top10);
     setSubmitting(false);
   };
@@ -176,86 +154,68 @@ const Validate = () => {
     navigate(`/prospect/${id}`);
   };
 
-  // Rank top-10 prospects matching (name?, company, roles[], keywords[], industry).
+  // Rank top-10 prospects matching (name?, company, roles[], keywords[], industry)
+  // against the unified in-memory corpus (mock, snapshot, or live Supabase).
+  //
   // Rubric (out of ~10):
   //   +4 if name matches (only when user provided a name)
   //   +3 weighted by role-token overlap ratio (union of all role tags)
-  //   +2 if company matches ILIKE
+  //   +2 if company matches (substring, either direction)
   //   +1 if industry matches
   //   +0.5 per keyword that appears in prospect.role (up to +2)
   // Blended rank = 0.6 * match_score + 0.4 * (overall_score / 10)
-  async function lookupTopProspects(q: {
+  function lookupTopProspectsLocal(q: {
     name: string;
     company: string;
     roles: string[];
     keywords: string[];
     industry: string;
-  }): Promise<ValidateRanked[]> {
-    if (!supabase) return [];
-    // Pull candidates constrained by company (fuzzy) AND industry (fuzzy).
-    // Include nested scores so we can rank by overall_score too.
-    const { data: rows, error } = await supabase
-      .from("prospects")
-      .select(
-        "id, name, company, role, industry, linkedin_url, scores(overall_score, authenticity_score, authority_score, warmth_score, model_version, computed_at)",
-      )
-      .ilike("company", `%${q.company}%`)
-      .ilike("industry", `%${q.industry}%`)
-      .limit(200);
-    if (error || !rows || rows.length === 0) return [];
-
-    // Merge every role's tokens into one set — any overlap scores.
+  }): ValidateRanked[] {
+    if (allProspects.length === 0) return [];
     const roleTokens = new Set<string>();
     for (const rl of q.roles) {
       for (const t of rl.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)) roleTokens.add(t);
     }
     const nameLower = q.name.toLowerCase();
+    const companyLower = q.company.toLowerCase();
+    const industryLower = q.industry.toLowerCase();
     const kwLowers = q.keywords.map((k) => k.toLowerCase()).filter(Boolean);
 
-    type Cand = {
-      id: string;
-      name: string;
-      company: string;
-      role: string;
-      industry: string;
-      linkedin_url: string | null;
-      scores: ScoreRow[] | null;
-    };
-
     const ranked: ValidateRanked[] = [];
-    for (const r of rows as Cand[]) {
+    for (const p of allProspects) {
+      const pCompany = (p.company ?? "").toLowerCase();
+      const pIndustry = (p.industry ?? "").toLowerCase();
+      const pRole = (p.role ?? "").toLowerCase();
+      const pName = (p.name ?? "").toLowerCase();
+
       let s = 0;
-      if (q.name && r.name && r.name.toLowerCase().includes(nameLower)) s += 4;
-      const rRoleTokens = new Set(
-        (r.role ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean),
-      );
+      if (q.name && pName.includes(nameLower)) s += 4;
+      const rRoleTokens = new Set(pRole.split(/[^a-z0-9]+/).filter(Boolean));
       let overlap = 0;
       for (const t of roleTokens) if (rRoleTokens.has(t)) overlap += 1;
       if (overlap > 0) s += 3 * (overlap / Math.max(1, roleTokens.size));
-      if ((r.company ?? "").toLowerCase().includes(q.company.toLowerCase())) s += 2;
-      if ((r.industry ?? "").toLowerCase().includes(q.industry.toLowerCase())) s += 1;
-      // Keyword hits in role text — up to +2
-      const roleLower = (r.role ?? "").toLowerCase();
+      if (companyLower && (pCompany.includes(companyLower) || companyLower.includes(pCompany))) s += 2;
+      if (pIndustry.includes(industryLower)) s += 1;
       let kwHits = 0;
-      for (const kw of kwLowers) if (kw && roleLower.includes(kw)) kwHits += 1;
+      for (const kw of kwLowers) if (kw && pRole.includes(kw)) kwHits += 1;
       s += Math.min(2, kwHits * 0.5);
 
-      const best = pickBest(r.scores);
-      const overall = best?.overall_score ?? 0;
+      const score = scoreMap[p._id];
+      const overall = score?.overall_score ?? 0;
       const blended = 0.6 * s + 0.4 * (overall / 10);
 
       ranked.push({
-        id: r.id,
-        name: r.name,
-        company: r.company,
-        role: r.role,
-        industry: r.industry,
-        linkedin_url: r.linkedin_url,
+        id: p._id,
+        name: p.name ?? "",
+        company: p.company ?? "",
+        role: p.role ?? "",
+        industry: p.industry ?? "",
+        linkedin_url: (p as { linkedin_url?: string | null }).linkedin_url ?? null,
         match_score: Math.round(s * 10) / 10,
         overall_score: overall,
-        authenticity_score: best?.authenticity_score ?? 0,
-        authority_score: best?.authority_score ?? 0,
-        warmth_score: best?.warmth_score ?? 0,
+        authenticity_score: score?.authenticity_score ?? 0,
+        authority_score: score?.authority_score ?? 0,
+        warmth_score: score?.warmth_score ?? 0,
         blended,
       });
     }
@@ -365,10 +325,16 @@ const Validate = () => {
           <h1 className="text-4xl md:text-5xl font-light tracking-tight leading-[1.05] mb-6">
             Find the right person to contact.
           </h1>
-          <p className="text-sm text-muted-foreground max-w-md">
-            You know the role, the company, and the domain — but not the name. Describe what you
-            know and we will surface the exact lead, scored and falsifiable.
+          <p className="text-sm text-muted-foreground max-w-md leading-relaxed">
+            You know the role, the company, and the domain — but not the name.
+            Describe what you know and we will surface the exact lead, scored
+            and falsifiable.
           </p>
+          <div className="mt-6 text-[10px] text-mono uppercase tracking-[0.16em] text-muted-foreground">
+            {allProspects.length === 0
+              ? "loading prospect index…"
+              : `${allProspects.length.toLocaleString()} prospects indexed`}
+          </div>
         </div>
 
         <form onSubmit={onSubmit} className="md:col-span-7 space-y-px">

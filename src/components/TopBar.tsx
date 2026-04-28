@@ -65,15 +65,20 @@ const TopBarInner = () => {
         <ClockReadout city="San Francisco" timeZone="America/Los_Angeles" />
         <ClockReadout city="Hsinchu" timeZone="Asia/Taipei" />
         <nav className="flex items-center gap-6 justify-end">
-          {/*
-           * Validate + Weights are temporarily hidden from the header per
-           * product call. Routes and components still exist (/validate,
-           * /settings) — direct URL access works for testing/admin.
-           */}
           <NavItem
             to="/discover"
             label="Pipeline"
             active={pathname.startsWith("/discover") || pathname.startsWith("/prospect")}
+          />
+          <NavItem
+            to="/validate"
+            label="Validate"
+            active={pathname.startsWith("/validate")}
+          />
+          <NavItem
+            to="/settings"
+            label="Weights"
+            active={pathname.startsWith("/settings")}
           />
         </nav>
       </div>

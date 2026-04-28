@@ -7,6 +7,7 @@ import {
   useSignalsFor,
   useLatestScore,
   useLatestRun,
+  type ScoringRun,
 } from "@/lib/db";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { BigScore, ScoreBar, scoreColor } from "@/components/ScoreBar";
@@ -95,7 +96,32 @@ const ProspectDetail = () => {
   if (!prospect) {
     return (
       <PageShell>
-        <div className="text-muted-foreground text-sm">Prospect not found.</div>
+        <div className="grid md:grid-cols-12 gap-10 min-h-[40vh] items-start py-12">
+          <div className="md:col-span-7 space-y-4">
+            <div className="label-eyebrow">Prospect not found</div>
+            <h1 className="text-3xl md:text-4xl font-light tracking-tight leading-tight">
+              We couldn't find this person in the network.
+            </h1>
+            <p className="text-sm text-muted-foreground max-w-prose">
+              The prospect may have been removed, the URL might be stale, or the
+              snapshot you're running against doesn't include this id ({id?.slice(0, 8) ?? "?"}).
+            </p>
+            <div className="flex gap-3 pt-2">
+              <Link
+                to="/discover"
+                className="inline-flex items-center gap-2 px-3 py-1.5 border border-border text-xs text-mono hover:bg-secondary"
+              >
+                ← back to network
+              </Link>
+              <Link
+                to="/validate"
+                className="inline-flex items-center gap-2 px-3 py-1.5 border border-border text-xs text-mono hover:bg-secondary"
+              >
+                Search a new prospect →
+              </Link>
+            </div>
+          </div>
+        </div>
       </PageShell>
     );
   }
@@ -322,7 +348,7 @@ const NoScoreState = ({
         {failed
           ? "The scoring agent returned an error on its last run. You can retry below."
           : runStatus === null
-            ? "Scoring runs via the Claude agent in a Supabase Edge Function. If this page stays empty for more than ~90 seconds, the function may not be deployed or the ANTHROPIC_API_KEY env var may be missing. Retry below to kick off another run."
+            ? "Scoring runs via the FastAPI worker (server/) backed by Z.AI. If this page stays empty for more than ~90 seconds the worker may not be reachable, or the ZAI_API_KEY env var may be missing on the server. Retry below to kick off another run."
             : `Run status: ${runStatus}. Waiting for the agent to write a score row.`}
       </p>
       {failed && errorLog && (
@@ -366,7 +392,7 @@ const AgentStep = ({ step }: { step: Record<string, unknown> }) => {
   return null;
 };
 
-const ProgressView = ({ run }: { run: any }) => {
+const ProgressView = ({ run }: { run: ScoringRun }) => {
   const steps = (run.agent_steps ?? []) as Array<Record<string, unknown>>;
   return (
     <div className="max-w-2xl">
