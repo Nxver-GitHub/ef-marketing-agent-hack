@@ -26,24 +26,43 @@ export type { Prospect, Signal, Score, SignalWeight, ScoringRun } from "./mockSt
 // ─── Type normalizers ────────────────────────────────────────────────────────
 // Supabase rows use `id` (UUID string) and ISO timestamps.
 // The mock store (and pages) use `_id` and millisecond timestamps.
-const toP = (r: any) => ({
+type SupaRow = Record<string, unknown> & { id: string };
+type SupaProspectRow = SupaRow & {
+  created_at: string | number;
+  updated_at: string | number;
+};
+type SupaSignalRow = SupaRow & {
+  prospect_id: string;
+  collected_at: string | number;
+};
+type SupaScoreRow = SupaRow & {
+  prospect_id: string;
+  computed_at: string | number;
+  model_version?: string;
+};
+type SupaRunRow = SupaRow & {
+  started_at: string | number;
+  completed_at?: string | number | null;
+};
+
+const toP = (r: SupaProspectRow) => ({
   ...r,
   _id: r.id,
   created_at: +new Date(r.created_at),
   updated_at: +new Date(r.updated_at),
 });
-const toSig = (r: any) => ({
+const toSig = (r: SupaSignalRow) => ({
   ...r,
   _id: r.id,
   collected_at: +new Date(r.collected_at),
 });
-const toScore = (r: any) => ({
+const toScore = (r: SupaScoreRow) => ({
   ...r,
   _id: r.id,
   computed_at: +new Date(r.computed_at),
 });
-const toWeight = (r: any) => ({ ...r, _id: r.id });
-const toRun = (r: any) => ({
+const toWeight = (r: SupaRow) => ({ ...r, _id: r.id });
+const toRun = (r: SupaRunRow) => ({
   ...r,
   _id: r.id,
   started_at: +new Date(r.started_at),
@@ -52,8 +71,8 @@ const toRun = (r: any) => ({
 
 // Stable empty references so consumers using `useMemo`/`useEffect` deps don't
 // re-trigger when react-query is still loading.
-const EMPTY_ARRAY: any[] = Object.freeze([]) as any[];
-const EMPTY_RECORD: Record<string, any> = Object.freeze({}) as Record<string, any>;
+const EMPTY_ARRAY: unknown[] = Object.freeze([]) as unknown[];
+const EMPTY_RECORD: Record<string, unknown> = Object.freeze({}) as Record<string, unknown>;
 
 // ─── Snapshot mode ────────────────────────────────────────────────────────────
 // When VITE_USE_SNAPSHOT=true, every bulk read resolves from a one-shot JSON
@@ -65,10 +84,10 @@ const USE_SNAPSHOT =
   HAS_REAL_SUPABASE && (import.meta.env.VITE_USE_SNAPSHOT as string | undefined) === "true";
 
 interface SnapshotShape {
-  prospects: any[];
-  scores: any[];
-  signals: any[];
-  signal_weights: any[];
+  prospects: SupaProspectRow[];
+  scores: SupaScoreRow[];
+  signals: SupaSignalRow[];
+  signal_weights: SupaRow[];
 }
 
 let snapshotPromise: Promise<SnapshotShape> | null = null;
@@ -87,9 +106,11 @@ function loadSnapshot(): Promise<SnapshotShape> {
 // Supabase's REST endpoint defaults to a max of 1000 rows per request. Page
 // through the result set so callers get every row regardless of table size.
 const PAGE = 1000;
-async function fetchAllRows<T = any>(
-  build: () => any,
-): Promise<T[]> {
+// `build` returns a Supabase query builder. We do not pin the chainable
+// type because @supabase/supabase-js doesn't export it publicly and pinning
+// would couple us to internals that change between releases.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function fetchAllRows<T = SupaRow>(build: () => any): Promise<T[]> {
   const all: T[] = [];
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await build().range(from, from + PAGE - 1);
@@ -121,7 +142,7 @@ function useSupaProspects() {
         const snap = await loadSnapshot();
         return snap.prospects.map(toP);
       }
-      const rows = await fetchAllRows<any>(() =>
+      const rows = await fetchAllRows<SupaProspectRow>(() =>
         supabase!
           .from("prospects")
           .select("*")
@@ -131,7 +152,7 @@ function useSupaProspects() {
       // Dedup by id: offset-pagination can return a boundary row on both
       // page N and N+1 when many rows share the same created_at.
       const seen = new Set<string>();
-      const unique: any[] = [];
+      const unique: SupaProspectRow[] = [];
       for (const r of rows) {
         if (seen.has(r.id)) continue;
         seen.add(r.id);
@@ -198,7 +219,7 @@ function useAllSignalsCached() {
         const snap = await loadSnapshot();
         return snap.signals;
       }
-      return fetchAllRows<any>(() =>
+      return fetchAllRows<SupaSignalRow>(() =>
         supabase!
           .from("signals")
           .select("*")
@@ -210,11 +231,11 @@ function useAllSignalsCached() {
 }
 
 function useSupaSignalsForMany(ids: string[]) {
-  const rows = useAllSignalsCached();
+  const rows = useAllSignalsCached() as SupaSignalRow[];
   return useMemo(() => {
     if (!ids.length) return EMPTY_RECORD;
     const wanted = new Set(ids);
-    const out: Record<string, any[]> = {};
+    const out: Record<string, ReturnType<typeof toSig>[]> = {};
     for (const r of rows) {
       if (!wanted.has(r.prospect_id)) continue;
       (out[r.prospect_id] ??= []).push(toSig(r));
@@ -224,12 +245,13 @@ function useSupaSignalsForMany(ids: string[]) {
 }
 
 // Mock fallback: group whatever the in-memory store has by prospect_id.
-function mockSignalsForMany(ids: string[]) {
-  const [data, setData] = useState<Record<string, any[]>>({});
+// Named `use…` so React's hook rules don't fire — this *is* a hook.
+function useMockSignalsForMany(ids: string[]) {
+  const [data, setData] = useState<Record<string, unknown[]>>({});
   const key = ids.length ? `${ids.length}` : "";
   useEffect(() => {
     if (!ids.length) return;
-    const out: Record<string, any[]> = {};
+    const out: Record<string, unknown[]> = {};
     for (const id of ids) out[id] = store.signals.filter((s) => s.prospect_id === id);
     setData(out);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -244,11 +266,13 @@ const MODEL_PRECEDENCE: Record<string, number> = {
   chartreuse_deterministic_v1: 2,
   lightweight_v1: 3,
 };
-const pickBestScoreRow = (rows: any[]): any | null => {
+const pickBestScoreRow = <T extends { model_version?: string; computed_at: string | number }>(
+  rows: T[],
+): T | null => {
   if (!rows?.length) return null;
   const sorted = [...rows].sort((a, b) => {
-    const ta = MODEL_PRECEDENCE[a.model_version] ?? 9;
-    const tb = MODEL_PRECEDENCE[b.model_version] ?? 9;
+    const ta = MODEL_PRECEDENCE[a.model_version ?? ""] ?? 9;
+    const tb = MODEL_PRECEDENCE[b.model_version ?? ""] ?? 9;
     if (ta !== tb) return ta - tb;
     // same tier → newest first
     return +new Date(b.computed_at) - +new Date(a.computed_at);
@@ -257,7 +281,7 @@ const pickBestScoreRow = (rows: any[]): any | null => {
 };
 
 function useSupaLatestScore(id?: string) {
-  const [data, setData] = useState<any | null>(null);
+  const [data, setData] = useState<ReturnType<typeof toScore> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetch = useCallback(async () => {
@@ -313,11 +337,14 @@ function useSupaLatestScore(id?: string) {
 }
 
 function useSupaLatestRun(id?: string) {
-  const [data, setData] = useState<any | null>(null);
+  const [data, setData] = useState<ReturnType<typeof toRun> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetch = useCallback(async () => {
     if (!id) return null;
+    // Snapshot mode never has a "running" scoring_runs row to poll —
+    // the offline JSON is static. Skip the round trip entirely.
+    if (USE_SNAPSHOT) return null;
     const { data: rows } = await supabase!
       .from("scoring_runs")
       .select("*")
@@ -332,7 +359,7 @@ function useSupaLatestRun(id?: string) {
   }, [id]);
 
   useEffect(() => {
-    if (!id) return;
+    if (!id || USE_SNAPSHOT) return;
     fetch().then((run) => {
       if (run && (run.status === "running" || run.status === "pending")) {
         timerRef.current = setInterval(async () => {
@@ -379,7 +406,7 @@ function useAllScoresCached() {
         const snap = await loadSnapshot();
         return snap.scores;
       }
-      return fetchAllRows<any>(() =>
+      return fetchAllRows<SupaScoreRow>(() =>
         supabase!
           .from("scores")
           .select("*")
@@ -391,16 +418,16 @@ function useAllScoresCached() {
 }
 
 function useSupaScoresFor(ids: string[]) {
-  const rows = useAllScoresCached();
+  const rows = useAllScoresCached() as SupaScoreRow[];
   return useMemo(() => {
     if (!ids.length) return EMPTY_RECORD;
     const wanted = new Set(ids);
-    const grouped: Record<string, any[]> = {};
+    const grouped: Record<string, SupaScoreRow[]> = {};
     for (const r of rows) {
       if (!wanted.has(r.prospect_id)) continue;
       (grouped[r.prospect_id] ??= []).push(r);
     }
-    const out: Record<string, any> = {};
+    const out: Record<string, ReturnType<typeof toScore>> = {};
     for (const [pid, list] of Object.entries(grouped)) {
       const best = pickBestScoreRow(list);
       if (best) out[pid] = toScore(best);
@@ -621,10 +648,16 @@ function extractSignalValue(v: unknown): number {
   return 0;
 }
 
+interface WeightRow {
+  signal_type: string;
+  authenticity_weight: number;
+  authority_weight: number;
+  warmth_weight: number;
+}
 async function supaComputeScores(prospectIds: string[]) {
   const { data: weights } = await supabase!.from("signal_weights").select("*");
   const wmap = new Map(
-    (weights ?? []).map((w: any) => [
+    ((weights ?? []) as WeightRow[]).map((w) => [
       w.signal_type,
       { a: w.authenticity_weight, au: w.authority_weight, w: w.warmth_weight },
     ])
@@ -666,7 +699,7 @@ async function supaComputeScores(prospectIds: string[]) {
 export const useProspects = HAS_REAL_SUPABASE ? useSupaProspects : mockProspects;
 export const useProspect = HAS_REAL_SUPABASE ? useSupaProspect : mockProspect;
 export const useSignalsFor = HAS_REAL_SUPABASE ? useSupaSignalsFor : mockSignalsFor;
-export const useSignalsForMany = HAS_REAL_SUPABASE ? useSupaSignalsForMany : mockSignalsForMany;
+export const useSignalsForMany = HAS_REAL_SUPABASE ? useSupaSignalsForMany : useMockSignalsForMany;
 // Signal-value normalizer exposed for the Discover row-enrichment UX.
 export { extractSignalValue };
 export const useLatestScore = HAS_REAL_SUPABASE ? useSupaLatestScore : mockLatestScore;
@@ -684,7 +717,8 @@ export const db = HAS_REAL_SUPABASE
       computeScores: supaComputeScores,
     }
   : {
-      createProspect: (p: any) => Promise.resolve(store.createProspect(p)),
+      createProspect: (p: Parameters<typeof store.createProspect>[0]) =>
+        Promise.resolve(store.createProspect(p)),
       runScoring: (id: string) => store.runScoring(id),
       upsertWeight: (st: string, a: number, au: number, w: number) => {
         store.upsertWeight(st, a, au, w);

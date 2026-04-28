@@ -192,10 +192,68 @@ function notify() {
   for (const l of listeners) l();
 }
 
+// Snapshot mode flag — when set, autocomplete reads from the offline JSON
+// snapshot instead of round-tripping Supabase. Mirrors db.ts::USE_SNAPSHOT
+// so the demo experience doesn't pay 4 round-trips just to populate hints.
+const USE_SNAPSHOT =
+  HAS_REAL_SUPABASE && (import.meta.env.VITE_USE_SNAPSHOT as string | undefined) === "true";
+
+interface SnapshotShape {
+  prospects: Array<{ role?: string | null; company?: string | null; industry?: string | null }>;
+  signals: Array<{ signal_type?: string | null; value?: unknown }>;
+  scores: unknown[];
+  signal_weights: unknown[];
+}
+
+async function loadFromSnapshot(): Promise<void> {
+  const mod = await import("./snapshot.json");
+  const snap = mod.default as SnapshotShape;
+  // Roles
+  const roleCount = new Map<string, number>();
+  for (const r of snap.prospects) {
+    const c = r.role ? canonicalizeTitle(r.role) : null;
+    if (!c) continue;
+    roleCount.set(c, (roleCount.get(c) ?? 0) + 1);
+  }
+  cache.roles = [...roleCount.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 300)
+    .map(([v]) => v);
+
+  // Companies
+  const companySet = new Set<string>();
+  for (const r of snap.prospects) if (r.company) companySet.add(r.company);
+  cache.companies = [...companySet].sort((a, b) => a.localeCompare(b));
+
+  // Keywords from tech_stack signals
+  const kwCount = new Map<string, number>();
+  for (const r of snap.signals) {
+    if (r.signal_type !== "tech_stack") continue;
+    const v = r.value as { tokens?: unknown } | null;
+    const tokens = v?.tokens;
+    if (!Array.isArray(tokens)) continue;
+    for (const t of tokens) {
+      if (typeof t !== "string") continue;
+      const clean = t.trim();
+      if (clean.length < 2 || clean.length > 40) continue;
+      kwCount.set(clean, (kwCount.get(clean) ?? 0) + 1);
+    }
+  }
+  const minedKeywords: string[] = [...kwCount.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 200)
+    .map(([v]) => v);
+  cache.keywords = [...new Set([...SEED_KEYWORDS, ...minedKeywords])];
+}
+
 async function loadOnce() {
   if (loaded || loading) return;
   loading = true;
   try {
+    if (USE_SNAPSHOT) {
+      await loadFromSnapshot();
+      return;
+    }
     if (!HAS_REAL_SUPABASE || !supabase) {
       cache.roles = [];
       cache.keywords = [...new Set(SEED_KEYWORDS)];
@@ -225,7 +283,7 @@ async function loadOnce() {
       .from("prospects")
       .select("company, industry")
       .limit(20000);
-    const companySet = new Map<string, string>(); // name → industry
+    const companySet = new Map<string, string>();
     for (const r of (companyRows ?? []) as { company: string | null; industry: string | null }[]) {
       if (r.company && !companySet.has(r.company)) {
         companySet.set(r.company, r.industry ?? "");
@@ -240,8 +298,8 @@ async function loadOnce() {
       .eq("signal_type", "tech_stack")
       .limit(3000);
     const kwCount = new Map<string, number>();
-    for (const r of (sigRows ?? []) as { value: any }[]) {
-      const tokens = (r.value?.tokens ?? []) as unknown;
+    for (const r of (sigRows ?? []) as { value: { tokens?: unknown } | null }[]) {
+      const tokens = r.value?.tokens;
       if (!Array.isArray(tokens)) continue;
       for (const t of tokens) {
         if (typeof t !== "string") continue;

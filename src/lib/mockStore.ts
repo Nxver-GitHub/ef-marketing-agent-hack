@@ -26,8 +26,8 @@ type Signal = {
   prospect_id: string;
   source: string;
   signal_type: string;
-  value: any;
-  raw_data: any;
+  value: unknown;
+  raw_data: Record<string, unknown>;
   weight: number;
   confidence: number;
   collected_at: number;
@@ -363,6 +363,9 @@ function useStore<T>(selector: (s: Store) => T): T {
     () => store.version,
     () => store.version
   );
+  // `version` is the explicit trigger — when it changes the store mutated and
+  // we need to re-run the selector even if `selector` itself is referentially stable.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   return useMemo(() => selector(store), [selector, version]);
 }
 
