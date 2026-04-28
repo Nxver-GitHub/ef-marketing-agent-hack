@@ -36,8 +36,8 @@ import { cn } from "@/lib/utils";
 
 const HINTS: { label: string; query: string }[] = [
   { label: "Top 5 NVIDIA leaders by score", query: "Top 5 NVIDIA leaders by overall score." },
-  { label: "VPs at Intel", query: "Find VPs at Intel, sorted by score." },
-  { label: "Top semiconductor engineers", query: "Show me the top 8 highest-scoring semiconductor engineers." },
+  { label: "VPs who came from Intel", query: "Find VPs who used to work at Intel." },
+  { label: "MIT engineers, ranked", query: "Show me engineers with MIT education, sorted by score." },
   { label: "Marc Hamilton's network", query: "Find Marc Hamilton and show his 1-hop network." },
   { label: "Highest-trust manufacturing leads", query: "Show me the highest-trust manufacturing leaders by score." },
 ];
