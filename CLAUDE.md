@@ -21,7 +21,7 @@ At the end of every Claude Code session in this repo, push committed work on `ma
 
 ```bash
 npm install
-npm run dev          # Start Vite frontend (http://localhost:5173)
+npm run dev          # Start Vite frontend (http://localhost:8080)
 npm run build        # Production build
 npm run lint         # ESLint
 npm test             # Vitest (run once)

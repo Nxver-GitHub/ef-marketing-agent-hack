@@ -8,7 +8,7 @@ import { chromium } from "@playwright/test";
   page.on("response", async (r) => {
     if (r.status() >= 400 && !r.url().includes("/@vite") && !r.url().includes("hot-update")) {
       let body = "";
-      try { body = (await r.text()).slice(0, 400); } catch {}
+      try { body = (await r.text()).slice(0, 400); } catch { /* ignore body read failure */ }
       errors.push(`${r.status()} ${r.request().method()} ${r.url()}\n  BODY: ${body}`);
     }
   });

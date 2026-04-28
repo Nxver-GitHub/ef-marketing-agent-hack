@@ -7,7 +7,7 @@ import { chromium } from "@playwright/test";
   page.on("console", (m) => { if (m.type() === "error") errors.push(`[console.error] ${m.text()}`); });
   page.on("response", async (r) => {
     if (r.status() >= 400 && !r.url().includes("/@vite")) {
-      let body = ""; try { body = (await r.text()).slice(0, 400); } catch {}
+      let body = ""; try { body = (await r.text()).slice(0, 400); } catch { /* ignore */ }
       errors.push(`${r.status()} ${r.request().method()} ${r.url()}\n  BODY: ${body}`);
     }
   });
