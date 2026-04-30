@@ -1,11 +1,16 @@
-"""Z.AI proxy + tool dispatcher.
+"""Anthropic Claude proxy + tool dispatcher.
 
 Single endpoint: POST /chat. Body:
   { messages: ChatMessage[], snapshot?: {...} }
 
-Loops the OpenAI tool-call protocol until the model returns a final text reply.
-Tools execute server-side against Postgres so the browser never sees the API
-key and the agent can reason over the full 10k-prospect graph.
+Loops Claude's tool-use protocol until the model returns end_turn. Tools
+execute server-side against Postgres so the browser never sees the API key
+and the agent can reason over the full 10k-prospect graph.
+
+Returns a frontend-compatible payload:
+  { messages: [...assistant turns...], tool_results: [{name, arguments, result}] }
+The frontend only inspects the trailing assistant message's `content` and
+the `tool_results` array — wire shape is stable across the provider swap.
 """
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
 
 from .config import get_settings
 from .search import explain_prospect, filter_prospects, focus_node, neighborhood
@@ -38,75 +43,64 @@ Style:
 - Cite signals by (source, signal_type) when available.
 """
 
+# Anthropic tool schema: flat {name, description, input_schema}.
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
-        "type": "function",
-        "function": {
-            "name": "focus_node",
-            "description": "Fuzzy-match a node by free text. Returns top candidates across people, companies, industries.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer", "default": 5},
-                },
-                "required": ["query"],
+        "name": "focus_node",
+        "description": "Fuzzy-match a node by free text. Returns top candidates across people, companies, industries.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "filter",
+        "description": "Return prospects matching the criteria, sorted by overall_score.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "company": {"type": "string"},
+                "role": {"type": "string"},
+                "industry": {"type": "string"},
+                "name_contains": {"type": "string"},
+                "min_score": {"type": "number"},
+                "has_past_employer": {"type": "string"},
+                "has_school": {"type": "string"},
+                "limit": {"type": "integer", "default": 30},
             },
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "filter",
-            "description": "Return prospects matching the criteria, sorted by overall_score.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "company": {"type": "string"},
-                    "role": {"type": "string"},
-                    "industry": {"type": "string"},
-                    "name_contains": {"type": "string"},
-                    "min_score": {"type": "number"},
-                    "has_past_employer": {"type": "string"},
-                    "has_school": {"type": "string"},
-                    "limit": {"type": "integer", "default": 30},
-                },
-            },
+        "name": "explain",
+        "description": "Rich bundle for one prospect: identity, sub-scores, top signals.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "description": "prospect UUID"}},
+            "required": ["id"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "explain",
-            "description": "Rich bundle for one prospect: identity, sub-scores, top signals.",
-            "parameters": {
-                "type": "object",
-                "properties": {"id": {"type": "string", "description": "prospect UUID"}},
-                "required": ["id"],
+        "name": "expand_node",
+        "description": "1-hop neighbors of a person via colleagues / past employers / schools.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "prospect UUID"},
+                "hops": {"type": "integer", "default": 1},
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "expand_node",
-            "description": "1-hop neighbors of a person via colleagues / past employers / schools.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "prospect UUID"},
-                    "hops": {"type": "integer", "default": 1},
-                },
-                "required": ["id"],
-            },
+            "required": ["id"],
         },
     },
 ]
 
 
-def _client() -> AsyncOpenAI:
+def _client() -> AsyncAnthropic:
     s = get_settings()
-    return AsyncOpenAI(api_key=s.zai_api_key, base_url=s.zai_base_url)
+    return AsyncAnthropic(api_key=s.anthropic_api_key)
 
 
 async def _dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -138,16 +132,20 @@ async def _dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
     return {"error": f"unknown tool {name!r}"}
 
 
-def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Coerce ChatMessage models / dicts into OpenAI's expected shape.
+def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Coerce frontend ChatMessages into Anthropic's user/assistant format.
 
-    The frontend sends `{role, content, tool_calls?, tool_call_id?, name?}`.
-    OpenAI accepts that as-is — we just drop None fields.
+    The frontend sends `{role, content}`. System messages are stripped here
+    — the prompt is passed via the top-level `system=` parameter on the API
+    call. Empty turns are dropped.
     """
     out: list[dict[str, Any]] = []
     for m in messages:
-        d = {k: v for k, v in dict(m).items() if v is not None}
-        out.append(d)
+        role = m.get("role")
+        content = m.get("content") or ""
+        if role not in ("user", "assistant") or not content:
+            continue
+        out.append({"role": role, "content": content})
     return out
 
 
@@ -156,71 +154,71 @@ async def run_chat(
     snapshot: dict[str, Any] | None = None,
     max_iters: int = 6,
 ) -> dict[str, Any]:
-    """Run the tool loop until the model emits a final assistant message.
+    """Run the tool loop until Claude emits stop_reason=end_turn.
 
-    Returns: { messages: [...all turns including tool roles...], tool_results: [...] }
+    Returns frontend-compatible payload:
+      { messages: [...assistant turns...], tool_results: [{name, arguments, result}] }
     """
     client = _client()
     s = get_settings()
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    system = SYSTEM_PROMPT
     if snapshot:
-        messages.append(
-            {
-                "role": "system",
-                "content": f"Current canvas snapshot: {json.dumps(snapshot)[:2000]}",
-            }
-        )
-    messages.extend(_to_openai_messages(user_messages))
+        system += f"\n\nCurrent canvas snapshot: {json.dumps(snapshot)[:2000]}"
+
+    # Internal Anthropic-format conversation. The system prompt rides outside.
+    convo: list[dict[str, Any]] = _to_anthropic_messages(user_messages)
 
     tool_results: list[dict[str, Any]] = []
+    out_messages: list[dict[str, Any]] = []
 
     for _ in range(max_iters):
-        resp = await client.chat.completions.create(
-            model=s.zai_model,
-            messages=messages,
+        resp = await client.messages.create(
+            model=s.anthropic_model,
+            system=system,
+            messages=convo,
             tools=TOOL_SCHEMAS,
-            tool_choice="auto",
+            max_tokens=2048,
             temperature=0.2,
         )
-        choice = resp.choices[0]
-        msg = choice.message
 
-        # Append the assistant turn (might be a tool-call request or final text)
-        assistant_msg: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-        if msg.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }
-                for tc in msg.tool_calls
-            ]
-        messages.append(assistant_msg)
+        # Mirror the assistant turn back into the conversation verbatim
+        # (Anthropic requires the original content blocks alongside the
+        # matching tool_result blocks on the next user turn).
+        assistant_blocks = [block.model_dump() for block in resp.content]
+        convo.append({"role": "assistant", "content": assistant_blocks})
 
-        if not msg.tool_calls:
+        text_parts = [b["text"] for b in assistant_blocks if b.get("type") == "text"]
+        tool_uses = [b for b in assistant_blocks if b.get("type") == "tool_use"]
+
+        if resp.stop_reason != "tool_use":
+            out_messages.append({"role": "assistant", "content": "".join(text_parts)})
             break
 
-        for tc in msg.tool_calls:
+        result_blocks: list[dict[str, Any]] = []
+        for tu in tool_uses:
+            name = tu["name"]
+            args = tu.get("input") or {}
             try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            try:
-                result = await _dispatch(tc.function.name, args)
+                result = await _dispatch(name, args)
             except Exception as e:
-                log.warning("tool %s failed: %s", tc.function.name, e)
+                log.warning("tool %s failed: %s", name, e)
                 result = {"error": str(e)}
+            tool_results.append({"name": name, "arguments": args, "result": result})
 
-            tool_results.append({"name": tc.function.name, "arguments": args, "result": result})
-            messages.append(
+            result_blocks.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": tc.function.name,
+                    "type": "tool_result",
+                    "tool_use_id": tu["id"],
                     "content": json.dumps(result, default=str),
                 }
             )
 
-    return {"messages": messages, "tool_results": tool_results}
+        convo.append({"role": "user", "content": result_blocks})
+
+    if not out_messages:
+        out_messages.append(
+            {"role": "assistant", "content": "(stopped after max tool iterations)"}
+        )
+
+    return {"messages": out_messages, "tool_results": tool_results}

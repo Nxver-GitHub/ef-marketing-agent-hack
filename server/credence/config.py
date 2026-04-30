@@ -1,7 +1,7 @@
 """Runtime config — loaded once from env, hard-fails on missing required keys.
 
 Reads `.env.local` from the repo root so the server and frontend share the
-same Supabase project and Z.AI key without duplication.
+same Supabase project and Anthropic key without duplication.
 """
 from __future__ import annotations
 
@@ -25,10 +25,9 @@ class Settings(BaseSettings):
     # for write paths and complex joins.
     database_url: str = Field(..., alias="DATABASE_URL")
 
-    # Z.AI (OpenAI-compatible). Server-side only, never shipped to browser.
-    zai_api_key: str = Field(..., alias="ZAI_API_KEY")
-    zai_base_url: str = Field("https://api.z.ai/api/paas/v4", alias="ZAI_BASE_URL")
-    zai_model: str = Field("glm-4.6", alias="ZAI_MODEL")
+    # Anthropic Claude. Server-side only, never shipped to browser.
+    anthropic_api_key: str = Field(..., alias="ANTHROPIC_API_KEY")
+    anthropic_model: str = Field("claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
 
     # CORS origins for /chat etc. Local dev only for v0.
     cors_origins: list[str] = Field(
