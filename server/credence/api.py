@@ -19,6 +19,7 @@ from .config import get_settings
 from .db import close_pool, fetchrow, get_pool
 from .admin import router as admin_router
 from .enrich import router as enrich_router
+from .icp import router as icp_router
 from .models import ChatRequest, ChatResponse
 from .orgchart.active_sampling import (
     DEFAULT_CONFIDENCE_CEILING,
@@ -470,9 +471,19 @@ def create_app() -> FastAPI:
     # ─── Chat ────────────────────────────────────────────────────────────────
 
     @app.post("/chat", response_model=ChatResponse)
-    async def http_chat(req: ChatRequest) -> ChatResponse:
+    async def http_chat(
+        req: ChatRequest,
+        session: Session = Depends(get_session),  # noqa: B008
+    ) -> ChatResponse:
         msgs = [m.model_dump() for m in req.messages]
-        out = await run_chat(msgs, snapshot=req.snapshot)
+        # Thread the session's account_id into run_chat so build_rep_context
+        # can prepend ICP-specific guidance (named target accounts, product
+        # description, buyer persona) onto the system prompt. Demo / anon
+        # sessions don't carry an account_id and the context builder
+        # returns empty for them — base prompt is used unmodified.
+        out = await run_chat(
+            msgs, snapshot=req.snapshot, account_id=session.account_id,
+        )
         return ChatResponse.model_validate(out)
 
     # ─── Signals (Track J — POST /signals/discover-connections) ──────────────
@@ -483,6 +494,13 @@ def create_app() -> FastAPI:
 
     # ─── Admin (COMPANY_ENRICHMENT_PLAN.md Step 6 — refresh) ─────────────────
     app.include_router(admin_router)
+
+    # ─── ICP (ICP_ENRICHMENT_PLAN.md Phase 1) ────────────────────────────────
+    app.include_router(icp_router)
+
+    # ─── Onboarding (CUSTOMER_ONBOARDING_PLAN.md Wave C — POST /start, GET /status) ──
+    from .onboarding.api import router as onboarding_router
+    app.include_router(onboarding_router)
 
     return app
 

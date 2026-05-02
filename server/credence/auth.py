@@ -286,6 +286,12 @@ EXEMPT_PATH_PREFIXES: tuple[str, ...] = (
     "/docs",
     "/redoc",
     "/openapi.json",
+    # POST /onboarding/start is hit by the Supabase Auth webhook BEFORE the
+    # rep has a session; signature verification happens inside the route via
+    # the X-Webhook-Secret header. GET /onboarding/status is polled by the
+    # frontend during onboarding, also pre-session.
+    "/onboarding/start",
+    "/onboarding/status",
 )
 
 

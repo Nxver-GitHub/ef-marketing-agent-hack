@@ -27,6 +27,7 @@ const Login = lazy(() => import("./pages/Login.tsx"));
 const OrgChart = lazy(() => import("./pages/OrgChart.tsx"));
 const Companies = lazy(() => import("./pages/Companies.tsx"));
 const People = lazy(() => import("./pages/People.tsx"));
+const Onboarding = lazy(() => import("./pages/Onboarding.tsx"));
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -84,6 +85,7 @@ const App = () => {
                 <Route path="/org/:companyId" element={<RequireAuth><OrgChart /></RequireAuth>} />
                 <Route path="/companies" element={<RequireAuth><Companies /></RequireAuth>} />
                 <Route path="/people" element={<RequireAuth><People /></RequireAuth>} />
+                <Route path="/onboarding" element={<RequireAuth><Onboarding /></RequireAuth>} />
                 <Route path="*" element={<NotFound />} />
               </Routes>
             </Suspense>

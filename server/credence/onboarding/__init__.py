@@ -15,7 +15,8 @@ The shared `account_team_members` + `onboarding_jobs` tables are defined in
 account_users membership.
 """
 
+from .api import router as onboarding_router
 from .pipeline import run_onboarding_pipeline
 
-__all__ = ["run_onboarding_pipeline"]
+__all__ = ["onboarding_router", "run_onboarding_pipeline"]
 
