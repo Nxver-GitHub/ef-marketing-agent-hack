@@ -23,7 +23,13 @@ export type ChatMessage =
 
 export type ToolCallTrace = { name: string; args: unknown; result?: unknown };
 
-export type ToolName = "focus_node" | "filter" | "explain" | "expand_node";
+export type ToolName =
+  | "focus_node"
+  | "filter"
+  | "explain"
+  | "expand_node"
+  | "find_warm_paths"
+  | "get_org_context";
 
 export interface AgentContext {
   nodes: GraphNode[];
@@ -131,6 +137,64 @@ function applyToolResult(tr: ServerToolResult, ctx: AgentContext): void {
           ctx.setVisibleNodeIds(new Set([graphId]));
         }
       }
+      break;
+    }
+    case "find_warm_paths": {
+      // Surface the warm-path constellation on the canvas: highlight the
+      // target + every connector found, so the rep visually sees who their
+      // team can route through. We promote ALL path_nodes from each path,
+      // not just the connector tip — the intermediate hops matter for
+      // explaining how the warm chain works.
+      const targetId = r.target_id as string | undefined;
+      const paths = r.paths as
+        | { path_names?: string[]; connector_id?: string; path_strength?: number }[]
+        | undefined;
+      if (!paths || paths.length === 0) break;
+      // Need the actual UUIDs (path_names are display names). The
+      // server returns connector_id at minimum; full UUID chains would
+      // require schema enrichment in find_warm_paths' rendered shape —
+      // for now we anchor on target + connector_ids, which is enough
+      // to draw attention to the people the agent is talking about.
+      const ids = new Set<string>()
+      if (targetId) ids.add(toGraphId(targetId, "person"))
+      for (const p of paths) {
+        if (p.connector_id) ids.add(toGraphId(p.connector_id, "person"))
+      }
+      if (ids.size > 0) {
+        // Anchor selection on the strongest connector so the inspector
+        // opens with their card (paths are pre-sorted by strength desc).
+        const top = paths[0]?.connector_id
+        if (top) ctx.setSelectedId(toGraphId(top, "person"))
+        ctx.setVisibleNodeIds(ids)
+      }
+      break;
+    }
+    case "get_org_context": {
+      // Highlight the org neighborhood: target + managers + direct reports
+      // + cluster peers. Selection anchors on the target so the side panel
+      // shows their identity card.
+      const person = r.person as { id?: string } | undefined;
+      const managers = r.managers as { person_id?: string }[] | undefined;
+      const reports = r.direct_reports as { person_id?: string }[] | undefined;
+      const cluster = r.functional_cluster as
+        | { peers?: { person_id?: string }[] }
+        | undefined;
+      const ids = new Set<string>()
+      if (person?.id) {
+        const pid = toGraphId(person.id, "person")
+        ids.add(pid)
+        ctx.setSelectedId(pid)
+      }
+      for (const m of managers ?? []) {
+        if (m.person_id) ids.add(toGraphId(m.person_id, "person"))
+      }
+      for (const rpt of reports ?? []) {
+        if (rpt.person_id) ids.add(toGraphId(rpt.person_id, "person"))
+      }
+      for (const peer of cluster?.peers ?? []) {
+        if (peer.person_id) ids.add(toGraphId(peer.person_id, "person"))
+      }
+      if (ids.size > 0) ctx.setVisibleNodeIds(ids)
       break;
     }
   }
