@@ -55,6 +55,10 @@ vi.mock("@/lib/db", async () => {
       computed_at: Date.now(),
     }),
     useLatestRun: () => ({ status: "complete", sources_succeeded: [], agent_steps: [] }),
+    // Phase A6 hooks — return empty results so the rich-profile sections
+    // render their omit-when-empty branches.
+    useEmploymentEducation: () => ({ employment: [], education: [], isLoading: false }),
+    useSkillsFor: () => ({ skills: [], isLoading: false }),
     db: { runScoring: vi.fn(), createProspect: vi.fn() },
   };
 });
@@ -161,7 +165,9 @@ describe("ProspectDetail — Tasks 3-A / 3-B / 3-C smoke", () => {
     // entered. This is the cheapest "doesn't crash" assertion that exercises
     // the imports + the new module-level constants (orgNodeTypes, StubNode).
     render(<ProspectDetail />);
-    expect(screen.getByText("Test Prospect")).toBeInTheDocument();
+    // The page renders the prospect name in the h1 header AND in the
+    // PersonProfileCard avatar block (Phase A6). Use a role-scoped query.
+    expect(screen.getByRole("heading", { level: 1, name: "Test Prospect" })).toBeInTheDocument();
   });
 
   it("StubInspector component renders dashed-border panel with ? badge and italic label", async () => {

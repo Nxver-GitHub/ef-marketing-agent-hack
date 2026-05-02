@@ -25,10 +25,9 @@ import { NodeInspector } from "@/components/NodeInspector";
 import {
   EdgeInspector,
   type EdgeInspectorEdge,
-  type EdgeEvidence as InspectorEdgeEvidence,
 } from "@/components/EdgeInspector";
 import { selectActiveEdge } from "@/store/graphStore";
-import { STRENGTH_TABLE } from "@/lib/strength";
+import { adaptGraphEdgeForInspector } from "@/lib/edgeInspectorAdapter";
 import {
   useProspects,
   useScoresFor,
@@ -1275,76 +1274,10 @@ const Discover = () => {
   // in place of <NodeInspector />. selectActiveEdge resolves to null when
   // no edge is pinned (e.g. after a node click clears it).
   const activeEdge = useGraphStore(selectActiveEdge);
-  const inspectorEdge = useMemo<EdgeInspectorEdge | null>(() => {
-    if (!activeEdge) return null;
-    const sourceId =
-      typeof activeEdge.source === "string"
-        ? activeEdge.source
-        : (activeEdge.source as { id: string }).id;
-    const targetId =
-      typeof activeEdge.target === "string"
-        ? activeEdge.target
-        : (activeEdge.target as { id: string }).id;
-    const sourceNode = nodes.find((n) => n.id === sourceId);
-    const targetNode = nodes.find((n) => n.id === targetId);
-    const baseStrength = STRENGTH_TABLE[activeEdge.kind] ?? 0.5;
-    // Pull whatever the GraphEdge.evidence singleton carries; EdgeInspector
-    // tolerates an empty array.
-    const evidence: InspectorEdgeEvidence[] = activeEdge.evidence
-      ? [
-          {
-            source_type:
-              activeEdge.kind.startsWith("patent")
-                ? "patent"
-                : activeEdge.kind.startsWith("academic")
-                  ? "paper"
-                  : activeEdge.kind.startsWith("career_overlap")
-                    ? "career_overlap"
-                    : activeEdge.kind.startsWith("standards")
-                      ? "standards"
-                      : activeEdge.kind.startsWith("conference")
-                        ? "conference"
-                        : activeEdge.kind.includes("cohort") ||
-                            activeEdge.kind.includes("alumni") ||
-                            activeEdge.kind === "executive_education"
-                          ? "cohort"
-                          : "unknown",
-            structured_value:
-              activeEdge.evidence as unknown as Record<string, unknown>,
-          },
-        ]
-      : [];
-    return {
-      id: activeEdge.id,
-      connection_type: activeEdge.kind,
-      base_strength: baseStrength,
-      recency_factor: null,
-      frequency_factor: null,
-      corroboration_factor: null,
-      computed_strength: baseStrength,
-      evidence,
-      source_person: {
-        id: sourceId,
-        canonical_name: sourceNode?.name ?? sourceId,
-        current_title:
-          sourceNode && "role" in sourceNode ? (sourceNode as { role?: string | null }).role : null,
-        current_company_name:
-          sourceNode && "company" in sourceNode
-            ? (sourceNode as { company?: string | null }).company
-            : null,
-      },
-      target_person: {
-        id: targetId,
-        canonical_name: targetNode?.name ?? targetId,
-        current_title:
-          targetNode && "role" in targetNode ? (targetNode as { role?: string | null }).role : null,
-        current_company_name:
-          targetNode && "company" in targetNode
-            ? (targetNode as { company?: string | null }).company
-            : null,
-      },
-    };
-  }, [activeEdge, nodes]);
+  const inspectorEdge = useMemo<EdgeInspectorEdge | null>(
+    () => adaptGraphEdgeForInspector(activeEdge, nodes),
+    [activeEdge, nodes],
+  );
   const onNodeHoverStable = useCallback((node: FGNode | null) => {
     hoveredIdRef.current = node ? (node.id as string) : null;
   }, []);
