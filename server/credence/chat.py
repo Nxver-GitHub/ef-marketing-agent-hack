@@ -22,7 +22,15 @@ from uuid import UUID
 from anthropic import AsyncAnthropic
 
 from .config import get_settings
-from .search import explain_prospect, filter_prospects, focus_node, neighborhood
+from .search import (
+    explain_company,
+    explain_prospect,
+    filter_prospects,
+    find_warm_paths,
+    focus_node,
+    get_org_context,
+    neighborhood,
+)
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +49,24 @@ Style:
 - Always call `explain` before describing a person in detail.
 - Keep replies under three short paragraphs unless the user asks for more.
 - Cite signals by (source, signal_type) when available.
+
+You also have two warm-introduction tools beyond the original four:
+
+find_warm_paths(target_id) — Use this whenever the user asks how to get
+introduced to a person, who knows a person, or how warm a connection is.
+Always call this before suggesting cold outreach. If paths are found, lead
+your response with the strongest path's explanation and suggested opener.
+If no paths are found, say so explicitly.
+
+get_org_context(person_id) — Use this whenever the user asks about
+reporting relationships, org chart position, scope of responsibility, or
+budget ownership. When edge confidence is below 0.5, qualify the response:
+"This is inferred from job posting language and may not reflect current
+reality."
+
+Combine tools when needed: if a user asks "who at my team knows the person
+who manages NVIDIA's HBM program?", first use get_org_context to find who
+manages HBM, then use find_warm_paths to find connections to that person.
 """
 
 # Anthropic tool schema: flat {name, description, input_schema}.
@@ -95,6 +121,73 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["id"],
         },
     },
+    {
+        "name": "find_warm_paths",
+        "description": (
+            "Find warm introduction paths between the user's team and a target prospect. "
+            "Use when asked 'who knows this person?', 'how can I get introduced to X?', "
+            "or 'find a warm path to [name]'. Returns ranked paths with explanation and "
+            "suggested outreach opener for each."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_id": {
+                    "type": "string",
+                    "description": "UUID of the target person node.",
+                },
+                "max_hops": {
+                    "type": "integer",
+                    "description": "Maximum path length (default 3, max 4).",
+                    "default": 3,
+                },
+                "min_strength": {
+                    "type": "number",
+                    "description": "Minimum path strength threshold (default 0.30).",
+                    "default": 0.30,
+                },
+                "connection_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Filter to specific connection types. Valid values "
+                        "(must match WARM_CONNECTION_TYPES in search.py exactly): "
+                        "patent_co_inventor, academic_co_author_multi, "
+                        "academic_co_author_single, career_overlap_same_team, "
+                        "career_overlap_same_domain, career_overlap_general, "
+                        "conference_co_presenter, standards_committee_peer, "
+                        "same_phd_advisor, co_board_member, co_investor. "
+                        "Omit to include all warm types."
+                    ),
+                },
+            },
+            "required": ["target_id"],
+        },
+    },
+    {
+        "name": "get_org_context",
+        "description": (
+            "Get the org chart context for a person: their manager, direct reports, "
+            "functional peers, and scope/budget estimates. Use when asked 'who does X report to?', "
+            "'who are X's direct reports?', 'what does X own?', 'what is X's budget authority?', "
+            "or 'where does X sit in the org?'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "person_id": {
+                    "type": "string",
+                    "description": "UUID of the person to get org context for.",
+                },
+                "include_peers": {
+                    "type": "boolean",
+                    "description": "Whether to include functional cluster peers (default true).",
+                    "default": True,
+                },
+            },
+            "required": ["person_id"],
+        },
+    },
 ]
 
 
@@ -123,11 +216,45 @@ async def _dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return {"count": len(results), "prospects": results}
 
     if name == "explain":
-        bundle = await explain_prospect(UUID(args["id"]))
+        # COMPANY_ENRICHMENT_PLAN.md Step 5 — route company nodes to
+        # `explain_company` instead of crashing on `UUID(args["id"])` for
+        # `co:<slug>` handles. The dispatch is by id-prefix because the
+        # GraphCanvas mixes UUID-resolved company nodes (v3) with legacy
+        # slug handles (v0). UUIDs that turn out to be companies fall
+        # through to the company path via `explain_company`'s internal
+        # resolver — saves a per-request DB lookup to disambiguate.
+        node_id = args["id"]
+        if isinstance(node_id, str) and node_id.startswith("co:"):
+            bundle = await explain_company(node_id)
+            return {"node": bundle}
+        try:
+            uuid_obj = UUID(node_id)
+        except (ValueError, TypeError):
+            return {"node": None, "error": f"invalid node id {node_id!r}"}
+        bundle = await explain_prospect(uuid_obj)
+        if bundle is None:
+            # Person lookup miss — try the company path before giving up.
+            # Common when the GraphCanvas hands a UUID that the v3
+            # resolver minted for a company node.
+            bundle = await explain_company(node_id)
         return {"node": bundle}
 
     if name == "expand_node":
         return await neighborhood(UUID(args["id"]), hops=int(args.get("hops", 1)))
+
+    if name == "find_warm_paths":
+        return await find_warm_paths(
+            target_person_id=args["target_id"],
+            max_hops=min(4, max(1, int(args.get("max_hops", 3)))),
+            min_strength=min(1.0, max(0.0, float(args.get("min_strength", 0.30)))),
+            connection_types=args.get("connection_types"),
+        )
+
+    if name == "get_org_context":
+        return await get_org_context(
+            person_id=args["person_id"],
+            include_peers=bool(args.get("include_peers", True)),
+        )
 
     return {"error": f"unknown tool {name!r}"}
 
