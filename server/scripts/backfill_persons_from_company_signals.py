@@ -178,8 +178,15 @@ def _looks_like_person_name(name: str) -> bool:
     # Must have at least one capitalized alphabetic token.
     if not any(re.match(r"^[A-Z][a-zA-Z\-']+$", t) for t in tokens):
         return False
-    # Reject obvious company/role tokens.
-    blacklist = {"inc", "llc", "corp", "corporation", "ltd", "company", "co"}
+    # Reject obvious company/role/non-person tokens. Catches values like
+    # "Press Release", "Acme Inc", "CEO Update" that bleed into the
+    # generic ``name`` key on poorly-typed signal payloads.
+    blacklist = {
+        "inc", "llc", "corp", "corporation", "ltd", "company", "co",
+        "press", "release", "update", "news", "announcement",
+        "ceo", "cfo", "cto", "coo", "cro", "cmo", "vp", "svp", "evp",
+        "officer", "executive", "appointment",
+    }
     if any(t.lower().strip(".,") in blacklist for t in tokens):
         return False
     return True
