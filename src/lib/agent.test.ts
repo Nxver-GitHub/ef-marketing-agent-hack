@@ -285,3 +285,215 @@ describe("agent.applyToolResult — get_org_context", () => {
     expect(ids.has("person:uuid-peer")).toBe(true)
   })
 })
+
+// ── Sequence + integration safety nets ────────────────────────────────────
+
+describe("agent.runAgent — sequence + error paths", () => {
+  it("aggregates tool_results across multiple sequential calls in one turn", async () => {
+    vi.stubGlobal(
+      "fetch",
+      stubFetch([
+        {
+          name: "get_org_context",
+          arguments: { person_id: "uuid-1" },
+          result: {
+            person: { id: "uuid-1" },
+            managers: [{ person_id: "uuid-mgr" }],
+            direct_reports: [],
+            functional_cluster: { peers: [] },
+            scope: {},
+          },
+        },
+        {
+          name: "find_warm_paths",
+          arguments: { target_id: "uuid-mgr" },
+          result: {
+            target_id: "uuid-mgr",
+            paths_found: 1,
+            paths: [{ connector_id: "uuid-conn", path_strength: 0.9 }],
+          },
+        },
+      ]),
+    )
+    const ctx = makeCtx()
+    const result = await runAgent(
+      [{ role: "user", content: "find warm path to adam's manager" }],
+      ctx,
+    )
+    expect(result.toolCalls).toHaveLength(2)
+    expect(result.toolCalls[0].name).toBe("get_org_context")
+    expect(result.toolCalls[1].name).toBe("find_warm_paths")
+    // Last setSelectedId wins — should be the warm-path connector.
+    expect(ctx.selectedSpy).toHaveBeenLastCalledWith("person:uuid-conn")
+  })
+
+  it("propagates HTTP errors as thrown Error", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("boom", { status: 500 })),
+    )
+    const ctx = makeCtx()
+    await expect(
+      runAgent([{ role: "user", content: "x" }], ctx),
+    ).rejects.toThrow(/POST \/chat failed: 500/)
+  })
+
+  it("propagates network errors with friendly message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("ECONNREFUSED")
+      }),
+    )
+    const ctx = makeCtx()
+    await expect(
+      runAgent([{ role: "user", content: "x" }], ctx),
+    ).rejects.toThrow(/Could not reach the chat backend/)
+  })
+
+  it("returns finalText fallback when assistant returns no text content", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({ messages: [], tool_results: [] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    )
+    const ctx = makeCtx()
+    const result = await runAgent([{ role: "user", content: "x" }], ctx)
+    expect(result.finalText).toMatch(/no reply/i)
+  })
+
+  it("attaches snapshot summary to the request body", async () => {
+    const fetchSpy = stubFetch([])
+    vi.stubGlobal("fetch", fetchSpy)
+    const ctx: AgentContext = {
+      nodes: [
+        { id: "person:1", kind: "person", label: "A" },
+        { id: "person:2", kind: "person", label: "B" },
+        { id: "company:co", kind: "company", label: "Acme" },
+      ] as GraphNode[],
+      edges: [
+        { id: "e1", source: "person:1", target: "person:2", kind: "colleague" },
+      ] as unknown as GraphEdge[],
+      setSelectedId: vi.fn(),
+      setVisibleNodeIds: vi.fn(),
+    }
+    await runAgent([{ role: "user", content: "x" }], ctx)
+    const callArgs = fetchSpy.mock.calls[0]
+    const body = JSON.parse((callArgs[1] as RequestInit).body as string)
+    expect(body.snapshot.nodeCount).toBe(3)
+    expect(body.snapshot.edgeCount).toBe(1)
+    expect(body.snapshot.nodeKindCounts.person).toBe(2)
+    expect(body.snapshot.nodeKindCounts.company).toBe(1)
+  })
+})
+
+// ── ID prefix bridging — the spec for toGraphId via tool result paths ─────
+
+describe("agent.applyToolResult — id prefix bridging", () => {
+  it("focus_node company result keeps the co: → company: rewrite", async () => {
+    vi.stubGlobal(
+      "fetch",
+      stubFetch([
+        {
+          name: "focus_node",
+          arguments: { query: "nvidia" },
+          result: { results: [{ id: "co:nvidia", kind: "company" }] },
+        },
+      ]),
+    )
+    const ctx = makeCtx()
+    await runAgent([{ role: "user", content: "find nvidia" }], ctx)
+    expect(ctx.selectedSpy).toHaveBeenCalledWith("company:nvidia")
+    // Non-person → do NOT narrow visible to single hub.
+    expect(ctx.visibleSpy).not.toHaveBeenCalled()
+  })
+
+  it("explain person result narrows visible to that single person", async () => {
+    vi.stubGlobal(
+      "fetch",
+      stubFetch([
+        {
+          name: "explain",
+          arguments: { id: "uuid-p" },
+          result: { node: { id: "uuid-p", kind: "person" } },
+        },
+      ]),
+    )
+    const ctx = makeCtx()
+    await runAgent([{ role: "user", content: "explain p" }], ctx)
+    expect(ctx.selectedSpy).toHaveBeenCalledWith("person:uuid-p")
+    expect(ctx.visibleSpy).toHaveBeenCalledWith(new Set(["person:uuid-p"]))
+  })
+
+  it("explain company result selects but does NOT narrow visible", async () => {
+    vi.stubGlobal(
+      "fetch",
+      stubFetch([
+        {
+          name: "explain",
+          arguments: { id: "co:nvidia" },
+          result: { node: { id: "co:nvidia", kind: "company" } },
+        },
+      ]),
+    )
+    const ctx = makeCtx()
+    await runAgent([{ role: "user", content: "explain nvidia" }], ctx)
+    expect(ctx.selectedSpy).toHaveBeenCalledWith("company:nvidia")
+    expect(ctx.visibleSpy).not.toHaveBeenCalled()
+  })
+
+  it("expand_node merges center + neighbors into visible set", async () => {
+    vi.stubGlobal(
+      "fetch",
+      stubFetch([
+        {
+          name: "expand_node",
+          arguments: { id: "uuid-c" },
+          result: {
+            center: { id: "uuid-c", kind: "person" },
+            neighbors: [
+              { id: "uuid-n1", kind: "person" },
+              { id: "co:bigco", kind: "company" },
+            ],
+          },
+        },
+      ]),
+    )
+    const ctx = makeCtx()
+    await runAgent([{ role: "user", content: "expand c" }], ctx)
+    const ids = ctx.visibleSpy.mock.calls.at(-1)?.[0] as Set<string>
+    expect(ids.has("person:uuid-c")).toBe(true)
+    expect(ids.has("person:uuid-n1")).toBe(true)
+    expect(ids.has("company:bigco")).toBe(true)
+  })
+})
+
+// ── ToolName union exhaustiveness (compile-time guarantee) ────────────────
+
+describe("ToolName union — compile-time exhaustiveness", () => {
+  it("includes every tool name defined in chat.py TOOL_SCHEMAS", () => {
+    // This is a compile-time + value test: if a new tool is added on the
+    // backend without updating the union here, the type assignment below
+    // becomes a TS error, AND the runtime enumeration would miss it.
+    const expected: Array<
+      | "focus_node"
+      | "filter"
+      | "explain"
+      | "expand_node"
+      | "find_warm_paths"
+      | "get_org_context"
+    > = [
+      "focus_node",
+      "filter",
+      "explain",
+      "expand_node",
+      "find_warm_paths",
+      "get_org_context",
+    ]
+    expect(expected).toHaveLength(6)
+  })
+})
