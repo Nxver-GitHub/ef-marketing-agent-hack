@@ -34,6 +34,7 @@
 | 11 | `POST /orgchart/correction` — `component_attributions` field | `server/credence/api.py` + `org_chart_corrections` table | SHIPPED (Phase D.1 — additive) |
 | 12 | `prospect_warm_paths` read-cache shape + invalidation | migration `20260501_v3_prospect_warm_paths.sql` + `materialize_prospect_warm_paths.py` | SHIPPED |
 | 13 | `EdgeInspectorEdge` shape + `GraphEdge` adapter | `EdgeInspector.tsx` + `edgeInspectorAdapter.ts` | SHIPPED |
+| 14 | `run_onboarding_pipeline()` — customer onboarding state machine | `server/credence/onboarding/pipeline.py` | TO BE IMPLEMENTED |
 
 ---
 
@@ -1214,6 +1215,113 @@ The kind→source_type mapping (L30-48) is order-dependent. Future kinds must be
 3. A `GraphEdge` with an unknown `kind: "frobnicated_xyzzy"` produces `base_strength: 0.5` and `source_type: "unknown"` — adapter never throws on novel kinds.
 4. A `GraphEdge` whose `source.id` is an object (post-tick state) and whose `target` is a raw string (pre-tick) resolves both endpoints correctly.
 5. The component's strength bar renders `—` for `recency_factor: null`, never `0.00` (covered by `EdgeInspector.test.tsx`).
+
+---
+
+## Contract 14: `run_onboarding_pipeline()` — customer onboarding state machine
+
+**Owner module:** `server/credence/onboarding/pipeline.py`
+**Implementers:** TBD (onboarding track)
+**Consumers:** `server/routes/onboarding.py` (POST /onboarding/start dispatches it as a background task), the Supabase `auth.users` insert webhook (kicks off Stage 0 synchronously on signup), `Onboarding.tsx` (polls `GET /onboarding/status/:account_id` for stage transitions surfaced by this pipeline)
+
+`run_onboarding_pipeline` is the orchestrator that takes a freshly-signed-up rep and turns their company into a fully populated tenant — rep identity resolved, company enriched, team scraped, warm paths materialised. It is **not** a request handler; it is a long-running coroutine dispatched as a background task by the `/onboarding/start` route after Stage 0 has already returned to the frontend (Stage 0 must be synchronous so the rep can enter the app immediately; Stages 1–3 run async and the UI polls for their progress).
+
+The pipeline is the only writer that drives `onboarding_jobs.stage` forward through the state machine. Every other reader (`GET /onboarding/status`, frontend polling, retry hooks) treats the row as read-only.
+
+### Signature
+
+```python
+async def run_onboarding_pipeline(
+    job_id: str,
+    user_id: str,
+    email: str,
+    full_name: str,
+    account_id: str,
+) -> None: ...
+```
+
+### Input
+
+| Field | Type | Purpose |
+|---|---|---|
+| `job_id` | `str` (UUID) | Primary key of the `onboarding_jobs` row already created by Stage 0. The pipeline mutates this row's `stage`, `status`, `strategy`, `progress`, `error_message`, and `completed_at` fields — never re-creates it. |
+| `user_id` | `str` (UUID) | Supabase `auth.users.id` for the signing-up rep. Used by RLS-scoped writes that need `auth.uid()` context propagated through the service-role client. |
+| `email` | `str` | Rep's signup email. Domain segment is the canonical anchor for the `companies` lookup in Stage 1 (`sarah@nvidia.com` → `nvidia.com`); local-part is forwarded to `rep_resolver` as a name disambiguator. |
+| `full_name` | `str` | Rep's display name from Supabase `raw_user_meta_data.full_name`. Forwarded to `rep_resolver.find_linkedin_profile(name, company)` in Stage 0 and used as the `persons.canonical_name` fallback when no LinkedIn match exists. |
+| `account_id` | `str` (UUID) | Tenant root. Every row written by the pipeline (`account_team_members`, `person_connections`, `prospect_warm_paths` materialisations, signals) must carry this tenant scope. RLS depends on it. |
+
+Returns `None`. The pipeline communicates exclusively through side-effects on `onboarding_jobs` and the tenant tables; callers (the route's `BackgroundTasks`) do not await a value.
+
+### Output (side-effects)
+
+The pipeline writes — in order, one stage at a time:
+
+1. `onboarding_jobs.stage` advances `identity → company → team → connections → complete`.
+2. `onboarding_jobs.strategy` is set during Stage 1 to `'all_employees'` (employee_count < 500) or `'gtm_only'` (≥ 500).
+3. `onboarding_jobs.progress` is updated incrementally during Stage 2 with the JSONB shape `{ "total": N, "scraped": N, "matched": N, "new_persons": N }`.
+4. `onboarding_jobs.status` transitions `running → done` on Stage 3 success, or `running → error` with `error_message` populated on Stage 0 HALT.
+5. `onboarding_jobs.completed_at` is set when `status` becomes `done` or `error`.
+6. `account_team_members` rows are inserted/upserted in Stage 0 (the rep, `role='owner'`) and Stage 2 (scraped team, `role='member'`); the `(account_id, person_id)` UNIQUE constraint absorbs duplicates.
+7. `person_connections` rows are written via the existing extractors in Stage 3.
+8. `prospect_warm_paths` is refreshed via `materialize_prospect_warm_paths_account(account_id)` (Contract 12) at the end of Stage 3, after `find_warm_paths` has been called for every team member.
+
+### State machine
+
+```
+[entry] ──► identity ──► company ──► team ──► connections ──► complete
+              │             │          │            │
+            HALT          catch       catch        catch
+        (status=error)   continue    continue     continue
+```
+
+| Stage | Writer | Duration | Failure semantics |
+|---|---|---|---|
+| `identity` (Stage 0) | `rep_resolver.find_linkedin_profile()` + `entity_resolver.upsert_person()` | synchronous, < 5s | **HALT.** On any exception, set `status='error'`, `error_message=<exception text>`, `completed_at=now()`, and return without dispatching downstream stages. The `/onboarding/start` route must surface this to the frontend; the rep cannot enter the app without an identity row. |
+| `company` (Stage 1) | `scrape_company_site()` + employee-count detection | async, ~5 min | **CATCH.** On exception, persist `error_message` (without flipping `status`), default `strategy='gtm_only'`, log to telemetry, advance to `team`. The rep can still use the product with the company partially enriched. |
+| `team` (Stage 2) | `team_scraper.scrape_company_employees()` + `entity_resolver.resolve_or_insert()` per row | async, 10–60 min | **CATCH.** Partial-success is the norm: some Apify rows resolve cleanly, others fail entity resolution. The stage commits whatever resolved, updates `progress` with actuals, and advances to `connections` even on a 100% scrape failure (Stage 3 will simply have an empty team to operate on, which the route layer surfaces as "no warm paths yet"). |
+| `connections` (Stage 3) | `patents_extractor` + `scholar_extractor` + `career_extractor` (parallel) → `find_warm_paths(team_ids)` → `materialize_prospect_warm_paths_account` | async, 30–120 min | **CATCH.** Each extractor's failure is isolated (`asyncio.gather(..., return_exceptions=True)`). The pipeline commits whatever connections succeeded, runs the cache materialiser unconditionally so readers see *something*, and sets `status='done'` even with partial extractor coverage. Total extractor failure still flips to `done` (with `progress.connections_found = 0`); the `error` status is reserved for Stage 0 HALT. |
+
+The Stage 0 HALT-vs-Stages 1–3 catch-and-continue split is deliberate: identity is load-bearing for every downstream tenant write, while company / team / connections data is additive — a tenant with a partial team is still a usable tenant.
+
+### Idempotency
+
+`run_onboarding_pipeline(job_id, ...)` may be re-entered (manual replay, retry-on-restart, webhook redelivery) without producing duplicates or regressing state. The contract:
+
+1. **Re-entry skips already-completed stages.** The pipeline reads `onboarding_jobs.stage` on entry. If `stage in {'team', 'connections', 'complete'}`, Stages 0–1 are skipped; if `stage == 'connections'` or `'complete'`, Stage 2 is also skipped. The pipeline resumes at the first not-yet-completed stage.
+2. **`stage='complete'` short-circuits to a no-op return.** Re-running a finished job neither rewrites rows nor re-dispatches background work.
+3. **Per-row writes use `ON CONFLICT DO NOTHING` (or DO UPDATE for mutable fields).** `account_team_members(account_id, person_id)` is the unique key in Stage 0 and Stage 2; `person_connections` re-uses Contract 7's merge semantics. Re-running Stage 2 on a partially-scraped team adds only new rows; existing rows are untouched.
+4. **`prospect_warm_paths` materialisation is wipe-and-reload per tenant** (per Contract 12), so re-running Stage 3's finalisation always converges on the current snapshot, never an additive duplicate.
+5. **`status='error'` is recoverable.** A retry that succeeds clears `error_message` and advances `status` back to `running` before transitioning to `done`. Callers that observe `status='error'` may safely re-dispatch the same `(job_id, user_id, email, full_name, account_id)` tuple.
+
+### Cross-contract dependencies
+
+- **Contract 12 (`prospect_warm_paths`).** Stage 3 finalisation calls `materialize_prospect_warm_paths_account(account_id)` after every team member's connections have been written. Without this call, the `/discover` page reads a stale cache and the rep sees no warm paths until the next clustering job. The pipeline owns this trigger; no other component should call the materialiser for a freshly onboarded tenant.
+- **`find_warm_paths(target_person_id, source_person_ids, ...)`.** Stage 3 calls this with `source_person_ids = [m.person_id for m in account_team_members WHERE account_id = $1 AND scrape_status = 'done']`. The `source_person_ids` parameter (added as part of this contract's implementation — see plan `CUSTOMER_ONBOARDING_PLAN.md` L222-238) constrains the BFS terminus to the rep's actual team; before this filter existed the BFS terminated at any person, which produced unusable "warm paths" via random third parties. The `scrape_status = 'done'` predicate is load-bearing: passing in a still-scraping person's ID would surface paths via a half-resolved profile.
+- **Contract 7 (`person_connections` invariants).** The Stage 3 extractors write through Contract 7's merge semantics (`person_a_id < person_b_id` enforced, corroboration counts merged on conflict). The pipeline does not re-implement these; it depends on the extractor layer to honour them.
+
+### Invariants
+
+- **`account_team_members.role`.** The signing-up rep is `'owner'` (written in Stage 0); every scraped employee is `'member'` (written in Stage 2). `'admin'` is reserved for future invite flows and is never written by this pipeline.
+- **`scrape_status = 'done'` precedes warm-path use.** A team member's `person_id` may only be passed into `find_warm_paths` as a source after their `account_team_members.scrape_status` has been flipped to `'done'`. Pending / scraping / error rows are excluded from the Stage 3 source set.
+- **`UNIQUE(account_id, person_id)`** on `account_team_members` is enforced at the DB level. The pipeline relies on this — no application-level dedup is performed.
+- **Stage advancement is monotonic.** `stage` only moves forward in the order `identity → company → team → connections → complete`. The pipeline never writes an earlier stage value, even on retry; idempotency is achieved by skipping, not by rewinding.
+- **Stage 0 is the only HALT path.** `status='error'` may only be written from Stage 0. Stages 1–3 catch, log, and continue; their failures appear in `error_message` and telemetry but do not flip `status`.
+- **Tenancy.** Every row written by every stage carries `account_id`. The pipeline never writes cross-tenant data, even in failure paths.
+
+### Error behavior
+
+- **Stage 0 exception → HALT.** Catch all exceptions; write `status='error'`, `error_message=<str(exception)>[:1000]`, `completed_at=now()`; return. Do not dispatch Stages 1–3. The `/onboarding/start` route checks for this status and surfaces it to the frontend (the rep sees an error screen instead of the app shell).
+- **Stage 1/2/3 exception → catch + persist + continue.** Catch, append `error_message=<truncated str>`, advance `stage` anyway, dispatch the next stage. Telemetry must record the exception with the `job_id` for triage.
+- **Apify / USPTO / Scholar timeout → partial commit.** Each extractor in Stage 3 is wrapped in `asyncio.wait_for(..., timeout=...)`; on timeout the partial result set is written and the next extractor proceeds. The pipeline does not re-try external APIs synchronously — re-runs are the retry path.
+- **DB write conflict.** `ON CONFLICT DO NOTHING` on `account_team_members` and Contract 7's merge on `person_connections`; the pipeline never sees a duplicate-key exception in normal operation. Any other DB exception bubbles out of the current stage's catch block per the Stage 0/1-3 split above.
+
+### Test condition
+
+1. Call `run_onboarding_pipeline(job_id, ...)` with a fresh `onboarding_jobs` row at `stage='identity'`. After return, the row is at `stage='complete'`, `status='done'`, `account_team_members` has the rep (`role='owner'`) plus the scraped team (`role='member'`), and `prospect_warm_paths` for `account_id` is non-empty.
+2. Force a Stage 0 failure (e.g., mock `rep_resolver.find_linkedin_profile` to raise). After return, `status='error'`, `error_message` is populated, `stage='identity'`, no downstream rows exist for the tenant.
+3. Re-enter `run_onboarding_pipeline` with the same `job_id` after a Stage 2 row has been manually written to `stage='team'`. Stages 0 and 1 are skipped (no duplicate writes to `account_team_members` for the rep, no duplicate `companies` enrichment); Stage 2 resumes; final state is `stage='complete'`.
+4. Force a Stage 3 extractor to raise. The other extractors still write their connections; `materialize_prospect_warm_paths_account` still runs; final `status='done'`, `progress.connections_found > 0`, `error_message` notes the failed extractor.
+5. Re-call the pipeline on a row already at `stage='complete'`. No rows are touched, no background work is dispatched, function returns within milliseconds.
 
 ---
 
