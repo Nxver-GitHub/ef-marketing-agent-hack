@@ -210,6 +210,17 @@ _COMPANY_ALIASES: dict[str, list[str]] = {
     "Arm Holdings": ["Arm", "ARM Holdings", "ARM Limited"],
     "SK Hynix": ["SK hynix", "Hynix"],
     "Samsung Semiconductor": ["Samsung Electronics", "Samsung Semi"],
+    "ON Semiconductor": [
+        "onsemi", "ONsemi", "ON SEMI", "ON Semi", "ON SEMICONDUCTOR",
+        "Onsemi", "ONSemiconductor",
+        # Acquired entity — surfaces frequently in employment history
+        "fairchild now onsemi", "Onsemi (Former Aptina Imaging)",
+    ],
+    "Microchip Technology": [
+        "Microchip", "Microchip Technology Inc",
+    ],
+    "GlobalFoundries": ["Global Foundries", "GLOBALFOUNDRIES"],
+    "STMicroelectronics": ["ST Microelectronics", "ST Micro", "STM"],
 
     # Tier 2 — Defense
     "Lockheed Martin": ["Lockheed Martin Corporation", "Lockheed",
