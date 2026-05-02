@@ -985,14 +985,14 @@ function useSupaEmploymentEducation(prospectId: string | null): PersonHistoryRes
           )
           .eq("person_id", personId)
           .order("is_current", { ascending: false })
-          .order("start_year", { ascending: false, nullsLast: true }),
+          .order("start_year", { ascending: false, nullsFirst: false }),
         supabase!
           .from("education_periods")
           .select(
             "school_name,school_linkedin_url,degree,start_year,end_year,field_of_study",
           )
           .eq("person_id", personId)
-          .order("start_year", { ascending: false, nullsLast: true }),
+          .order("start_year", { ascending: false, nullsFirst: false }),
       ]);
       if (empRes.error)
         console.error("[db] employment_periods fetch error:", empRes.error);

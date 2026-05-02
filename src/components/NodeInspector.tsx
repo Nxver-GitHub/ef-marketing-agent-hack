@@ -31,6 +31,14 @@ import { findWarmPaths, type WarmPath } from "@/lib/warmPaths";
 import { OrgCorrectionDialog } from "@/components/OrgCorrectionDialog";
 import { useGraphStore } from "@/store/graphStore";
 import type { HubStats } from "@/lib/aggregations";
+import {
+  useEmploymentEducation,
+  useSkillsFor,
+} from "@/lib/db";
+import { PersonProfileCard } from "@/components/PersonProfileCard";
+import { CareerTimeline } from "@/components/CareerTimeline";
+import { EducationTimeline } from "@/components/EducationTimeline";
+import { SkillsChipCloud } from "@/components/SkillsChipCloud";
 
 export interface NodeInspectorProps {
   node: GraphNode | null;
@@ -416,6 +424,12 @@ function PersonInspector({
   const personId = prospect?._id ?? node.id;
   const synth = useMemo(() => synthesizeSubScores(personId), [personId]);
   const displayedVersionId = useDisplayedWeightVersion(prospect?._id);
+  // Rich Tier-1 enrichment: full work + education history + LinkedIn skills.
+  // Hooks no-op gracefully in demo / mock modes — the panel just renders the
+  // empty placeholders.
+  const enrichmentTargetId = prospect?._id ?? null;
+  const { employment, education } = useEmploymentEducation(enrichmentTargetId);
+  const { skills } = useSkillsFor(enrichmentTargetId);
 
   const rawOverall = score?.overall_score ?? node.score ?? 0;
   // The snapshot has many high-overall prospects whose sub-score columns
@@ -539,6 +553,41 @@ function PersonInspector({
           { label: "Evidence", value: String(evidenceCount) },
         ]}
       />
+
+      {/* Rich Tier-1 enrichment surface — Phase A integration (msg 245).
+          PersonProfileCard fields default to null when only basic Prospect
+          data is available; CareerTimeline/EducationTimeline/SkillsChipCloud
+          render placeholders for empty arrays. */}
+      <Separator className="my-4" />
+      <PersonProfileCard
+        person={{
+          canonical_name: prospect?.name ?? node.name,
+          current_title: prospect?.role ?? node.role ?? null,
+          current_company_name: prospect?.company ?? null,
+          linkedin_url: prospect?.linkedin_url ?? null,
+        }}
+      />
+      {employment.length > 0 ? (
+        <>
+          <Separator className="my-4" />
+          <Eyebrow>Career history</Eyebrow>
+          <CareerTimeline employment={employment} maxRows={5} className="mt-2" />
+        </>
+      ) : null}
+      {education.length > 0 ? (
+        <>
+          <Separator className="my-4" />
+          <Eyebrow>Education</Eyebrow>
+          <EducationTimeline education={education} maxRows={3} className="mt-2" />
+        </>
+      ) : null}
+      {skills.length > 0 ? (
+        <>
+          <Separator className="my-4" />
+          <Eyebrow>Top skills</Eyebrow>
+          <SkillsChipCloud skills={skills} topN={8} className="mt-2" />
+        </>
+      ) : null}
 
       {breakdown ? (
         <BreakdownSections
