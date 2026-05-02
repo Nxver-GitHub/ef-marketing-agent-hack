@@ -10,6 +10,7 @@ import { DemoScript } from "@/components/DemoScript";
 import { initDemoMode } from "@/store/graphStore";
 import { DEMO_GRAPH_NODES, DEMO_EDGES } from "@/lib/demoData";
 import { AccountProvider } from "@/contexts/AccountContext";
+import { RequireAuth } from "@/components/RequireAuth";
 import Index from "./pages/Index.tsx";
 import NotFound from "./pages/NotFound.tsx";
 // /discover is the hero route — keep it eager so the graph doesn't suspend
@@ -67,12 +68,16 @@ const App = () => {
           <AccountProvider>
             <Suspense fallback={<RouteFallback />}>
               <Routes>
+                {/* Public routes — no auth required */}
                 <Route path="/login" element={<Login />} />
-                <Route path="/" element={<Index />} />
-                <Route path="/validate" element={<Validate />} />
-                <Route path="/discover" element={<Discover />} />
-                <Route path="/settings" element={<Settings />} />
-                <Route path="/prospect/:id" element={<ProspectDetail />} />
+                {/* Protected routes — RequireAuth redirects to /login when
+                    account is null AND demo mode is off. Demo mode
+                    (?demo=true) bypasses the guard inside the component. */}
+                <Route path="/" element={<RequireAuth><Index /></RequireAuth>} />
+                <Route path="/validate" element={<RequireAuth><Validate /></RequireAuth>} />
+                <Route path="/discover" element={<RequireAuth><Discover /></RequireAuth>} />
+                <Route path="/settings" element={<RequireAuth><Settings /></RequireAuth>} />
+                <Route path="/prospect/:id" element={<RequireAuth><ProspectDetail /></RequireAuth>} />
                 <Route path="*" element={<NotFound />} />
               </Routes>
             </Suspense>
