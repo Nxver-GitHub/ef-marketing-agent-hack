@@ -32,6 +32,8 @@
 | 7 | `person_connections` invariants + warm-path BFS query | Supabase + `server/lib/scoring.py` | SCHEMA EXISTS — query contract to be enforced |
 | 10 | `GET /orgchart/uncertain-edges` | `server/credence/api.py` + `credence.orgchart.active_sampling` | SHIPPED (Phase D.3 backend) |
 | 11 | `POST /orgchart/correction` — `component_attributions` field | `server/credence/api.py` + `org_chart_corrections` table | SHIPPED (Phase D.1 — additive) |
+| 12 | `prospect_warm_paths` read-cache shape + invalidation | migration `20260501_v3_prospect_warm_paths.sql` + `materialize_prospect_warm_paths.py` | SHIPPED |
+| 13 | `EdgeInspectorEdge` shape + `GraphEdge` adapter | `EdgeInspector.tsx` + `edgeInspectorAdapter.ts` | SHIPPED |
 
 ---
 
@@ -1026,6 +1028,192 @@ Existing endpoint, additive optional field. Backward-compatible.
 ### Used by
 
 Phase D.2 optimizer reads attributions to nudge specific scoring components rather than applying a uniform multiplier when corrections accumulate.
+
+---
+
+## Contract 12: `prospect_warm_paths` read-cache shape + invalidation
+
+**Owner module:** Supabase migration `20260501_v3_prospect_warm_paths.sql` + writer `server/credence/jobs/materialize_prospect_warm_paths.py`
+**Implementers:** SwiftElk (schema), DarkBeaver (materializer)
+**Consumers:** `/discover` page (top-K warm-path read path), `CompanyCoverageDashboard.tsx` (warm-paths-per-company rollup), any component currently joining `person_connections` twice through `persons`
+
+`prospect_warm_paths` is a denormalized, per-prospect, top-K (K=20) view of the
+strongest connections that flow out of `person_connections`. It is **not a new
+source of truth** — `person_connections` remains the canonical write target for
+every clustering / enrichment job. This table is a read-cache that exists so
+the frontend `/discover` page can fetch a 40-prospect viewport without paginating
+the full edge table (currently ~46k rows, projected ~150k+ at Apify scale).
+
+### Schema (read contract — see migration for canonical SQL)
+
+```sql
+prospect_warm_paths(
+  prospect_id          uuid NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+  rank                 smallint NOT NULL CHECK (rank BETWEEN 1 AND 20),
+  partner_prospect_id  uuid NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+  connection_type      text NOT NULL,
+  computed_strength    numeric NOT NULL CHECK (computed_strength BETWEEN 0 AND 0.99),
+  evidence             jsonb NOT NULL DEFAULT '{}',  -- highest-strength evidence row
+  partner_name         text,                          -- denormalized display field
+  partner_company      text,                          -- denormalized display field
+  partner_title        text,                          -- denormalized display field
+  account_id           uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  refreshed_at         timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (prospect_id, rank),
+  CONSTRAINT prospect_warm_paths_no_self_edge CHECK (prospect_id <> partner_prospect_id),
+  CONSTRAINT prospect_warm_paths_unique_partner UNIQUE (prospect_id, partner_prospect_id)
+);
+```
+
+Producer file: `server/credence/jobs/materialize_prospect_warm_paths.py`
+(`INSERT INTO prospect_warm_paths` at L184; full-tenant wipe-and-reload at L207).
+
+### Read API
+
+The recommended read pattern is a single query per viewport:
+
+```sql
+SELECT prospect_id, rank, partner_prospect_id, connection_type, computed_strength,
+       evidence, partner_name, partner_company, partner_title
+FROM prospect_warm_paths
+WHERE account_id = $1
+  AND prospect_id = ANY($2::uuid[])
+ORDER BY prospect_id, rank;
+```
+
+- The `(account_id, prospect_id)` index covers this lookup.
+- Reads must include `account_id` in the predicate even when RLS is enforcing it — the index expects the column.
+- Consumers must **never** compute strength on the fly from this table; `computed_strength` here is a snapshot of `person_connections.computed_strength` at `refreshed_at`. If a consumer needs the live value, query `person_connections` directly.
+
+### Invariants
+
+- **Top-K only.** `rank` is bounded `[1, 20]` per the CHECK constraint. The `materialize_prospect_warm_paths_account` writer truncates to K=20 before insert; consumers must not assume rank > 20 ever appears.
+- **`prospect_id <> partner_prospect_id`** — the writer filters self-edges that `person_connections.a_lt_b` cannot catch (ranking is per-prospect, not per-pair).
+- **One partner per prospect.** The `prospect_warm_paths_unique_partner` constraint catches duplicate-partner writes — if the same `(prospect, partner)` pair surfaces under two `connection_type`s, the higher-strength row wins and the other is dropped at write time.
+- **Tenancy.** `account_id` is non-null and RLS-enforced (`prospect_warm_paths_tenant_isolation` for authenticated; `prospect_warm_paths_anon_default_select` for `anon` against the demo tenant `00000000-0000-0000-0000-000000000001`).
+- **Denormalised display fields are best-effort.** `partner_name / partner_company / partner_title` may be `NULL` if the writer couldn't resolve them; consumers must tolerate `NULL` and fall back to a second `prospects` fetch (this is the failure mode the cache was built to avoid, so log when it happens).
+
+### Invalidation rules
+
+The cache is **wipe-and-reload per tenant**, not row-level invalidated:
+
+1. After every clustering / enrichment job that writes to `person_connections` for tenant T, the orchestrator (`server/credence/jobs/runner.py` L207-224) calls `materialize_prospect_warm_paths_account(account_id=T)`.
+2. The materializer wraps a single transaction:
+   - `DELETE FROM prospect_warm_paths WHERE account_id = $1`
+   - `INSERT INTO prospect_warm_paths …` selecting top-K from `person_connections` for that tenant.
+3. Readers see either the pre-job snapshot or the post-job snapshot — never a half-written intermediate state.
+
+There is **no row-level update path**. Writers that need to bump a single edge call the materializer's per-account method, not a row-level UPSERT. This trades write efficiency for read consistency, and is the right trade at 20k–500k prospects per tenant.
+
+### Error behavior
+
+- If `materialize_prospect_warm_paths_account` raises mid-transaction, the `DELETE` is rolled back and the prior snapshot remains visible. Readers never see an empty cache as a transient state.
+- A reader that observes `refreshed_at` older than its expected freshness window must either (a) tolerate stale data, or (b) read `person_connections` directly. There is no synchronous-refresh API by design — the cache is asynchronous and the producer schedule is part of the contract.
+
+### Test condition
+
+1. Insert ~50 `person_connections` rows for tenant T1, run `materialize_prospect_warm_paths_account(T1)`, verify exactly 20 rows per `prospect_id` (or fewer for prospects with <20 partners) appear in `prospect_warm_paths`.
+2. Re-run the materializer with the same input; row count is unchanged (idempotent).
+3. Insert a `(A, B)` self-edge candidate (forced via direct `person_connections` write where `A_id < B_id` but the rank-by-prospect picks A as both ends — only possible if a writer is broken); the no-self-edge CHECK blocks it.
+4. Read with `account_id = T2` while logged in as a T1 user — RLS returns zero rows.
+5. Anon read with `account_id = '00000000-0000-0000-0000-000000000001'` returns the demo tenant's rows.
+
+---
+
+## Contract 13: `EdgeInspectorEdge` shape + `GraphEdge` adapter
+
+**Owner module:** `src/components/EdgeInspector.tsx` (interface) + `src/lib/edgeInspectorAdapter.ts` (bridge)
+**Implementers:** SunnyRidge (component), SunnyRidge (adapter extraction)
+**Consumers:** `Discover.tsx` (passes a selected edge into the inspector), `EdgeInspector.test.tsx`, future loaders that emit edges into the inspector
+
+The `EdgeInspector` is the right-rail counterpart to `NodeInspector` — it takes a single edge and renders the source ↔ target pair, the strength breakdown (base / recency / frequency / corroboration / computed), evidence rows grouped by `source_type`, and the "Use this connection" CTA. It is purely presentational; the component never fetches.
+
+### `EdgeInspectorEdge` interface (canonical shape)
+
+Defined at `src/components/EdgeInspector.tsx` L43-57:
+
+```ts
+interface EdgeInspectorEdge {
+  id: string;
+  /** e.g. "patent_co_inventor", "career_overlap_general" — must match an EdgeKind from Contract 3. */
+  connection_type: string;
+  /** [0, 1] base strength from STRENGTH_TABLE. */
+  base_strength: number;
+  recency_factor?: number | null;
+  frequency_factor?: number | null;
+  corroboration_factor?: number | null;
+  /** [0, 0.99] computed strength used for ranking. */
+  computed_strength: number;
+  evidence: EdgeEvidence[];
+  source_person: EdgeInspectorPerson;
+  target_person: EdgeInspectorPerson;
+}
+
+interface EdgeEvidence {
+  source_type: "patent" | "paper" | "career_overlap" | "standards" | "conference" | "cohort" | "unknown";
+  source_id?: string | null;
+  structured_value?: Record<string, unknown> | null;
+  collected_at?: string | null;
+  url?: string | null;
+}
+
+interface EdgeInspectorPerson {
+  id: string;
+  canonical_name: string;
+  current_title?: string | null;
+  current_company_name?: string | null;
+}
+```
+
+### Invariants
+
+- **`connection_type` strings are drawn from Contract 3's `EdgeKind` union.** Adding a new kind requires extending `EdgeKind` first; the inspector tolerates unknown strings (renders the underscore-cased label literally) but the strength bar will fall back to `0.5` if the kind isn't in `STRENGTH_TABLE`.
+- **`source_person` ↔ `target_person` is undirected.** `EdgeInspector` renders them as `X ↔ Y` (no arrow). The adapter does not attempt to canonicalise which is "source" — that's a Contract 7 (`person_connections.a_lt_b`) concern at the storage layer, not the UI layer.
+- **Optional factors render as `—`.** `recency_factor / frequency_factor / corroboration_factor` are nullable; when `null` or non-finite, the inspector prints an em-dash rather than `0.00`. This is critical: a future loader that hasn't backfilled factors must not show misleading "0%" pills.
+- **`evidence` is an array, never `null`.** Empty array is valid and renders the "no evidence yet" placeholder. The adapter ensures this — a `GraphEdge` with no `evidence` produces `[]`, never `undefined`.
+- **`computed_strength` is the canonical sort key.** The inspector displays it prominently; consumers ranking edges (e.g. for top-K warm-path lists) must read this field, not re-derive from `base_strength * factors`.
+
+### `adaptGraphEdgeForInspector` adapter contract
+
+Defined at `src/lib/edgeInspectorAdapter.ts` L94-122. This is the bridge that `Discover.tsx` uses to convert a `GraphEdge` (the canvas-friendly shape produced by the force-graph layer) into an `EdgeInspectorEdge`:
+
+```ts
+function adaptGraphEdgeForInspector(
+  edge: GraphEdge | null | undefined,
+  nodes: ReadonlyArray<GraphNode>,
+): EdgeInspectorEdge | null
+```
+
+#### Bridge rules
+
+- **`null` in → `null` out.** The hosting component uses `null` to switch back to `NodeInspector`. Adapter must not throw on null.
+- **`base_strength` lookup.** Resolved via `STRENGTH_TABLE[edge.kind]`; defaults to `0.5` for unknown kinds. Defined at L101.
+- **Factor passthrough.** `recency_factor / frequency_factor / corroboration_factor` are forwarded as `null` — the canvas `GraphEdge` doesn't carry factor breakdowns yet (Contract 7 stores them at the DB level, but the canvas only sees `kind` + endpoints + `evidence`). Future loaders that populate these on `GraphEdge` will surface them automatically; the adapter does not need to change.
+- **Evidence wrapping.** The canvas carries at most one `evidence` blob per edge (a singleton). The adapter wraps it into the inspector's array shape with the correct `source_type` discriminator (computed by `inferSourceType` at L30-48).
+- **Endpoint resolution.** `resolveEndpointId` (L56-62) handles ForceGraph2D's quirk where `source` / `target` may be either string ids (pre-tick) or hydrated node objects (post-mount). Always call this helper, never destructure directly.
+- **Person resolution.** `resolvePerson` (L71-86) is shape-tolerant — non-person hub nodes (companies, locations) resolve with `null` role/company instead of throwing. The fallback is `canonical_name = id` so the inspector still renders something readable when a node isn't in the lookup array.
+
+### `inferSourceType` mapping
+
+The kind→source_type mapping (L30-48) is order-dependent. Future kinds must be added with the more-specific prefix matched **before** more-general ones:
+
+| `kind` prefix / pattern | `source_type` |
+|---|---|
+| `patent*` | `patent` |
+| `academic*` | `paper` |
+| `career_overlap*` | `career_overlap` |
+| `standards*` | `standards` |
+| `conference*` | `conference` |
+| `*cohort*`, `alumni*`, `executive_education`, `same_*` | `cohort` |
+| anything else | `unknown` |
+
+### Test condition
+
+1. `adaptGraphEdgeForInspector(null, [])` returns `null` (covered by `edgeInspectorAdapter.test.ts`).
+2. A `GraphEdge` with `kind: "patent_co_inventor"` produces `source_type: "patent"`, `base_strength: 0.95`, and a single-element `evidence` array.
+3. A `GraphEdge` with an unknown `kind: "frobnicated_xyzzy"` produces `base_strength: 0.5` and `source_type: "unknown"` — adapter never throws on novel kinds.
+4. A `GraphEdge` whose `source.id` is an object (post-tick state) and whose `target` is a raw string (pre-tick) resolves both endpoints correctly.
+5. The component's strength bar renders `—` for `recency_factor: null`, never `0.00` (covered by `EdgeInspector.test.tsx`).
 
 ---
 
