@@ -1,5 +1,6 @@
 import { Link, useLocation } from "react-router-dom";
 import { memo, useEffect, useState } from "react";
+import { useAccount } from "@/contexts/AccountContext";
 
 const tz = (timeZone: string) =>
   new Intl.DateTimeFormat("en-US", {
@@ -53,12 +54,56 @@ const NavItem = memo(function NavItem({
   );
 });
 
+/**
+ * Account chip — shows the active account's display name, plus a
+ * sign-out affordance for live-mode users. Demo mode gets a static
+ * "DEMO" label to make the demo origin obvious.
+ */
+const AccountChip = memo(function AccountChip() {
+  const { account, user, loading, signOut } = useAccount();
+  if (loading) return null;
+  if (!account)
+    return (
+      <Link
+        to="/login"
+        className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground hover:text-foreground"
+      >
+        Sign in
+      </Link>
+    );
+  // Demo mode — distinctive styling, no sign-out (there's nothing to sign out of)
+  if (account.id === "00000000-0000-0000-0000-000000000fff")
+    return (
+      <span className="text-[10px] uppercase tracking-[0.16em] text-warning">
+        Demo
+      </span>
+    );
+  return (
+    <div className="flex items-center gap-3">
+      <span
+        className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground"
+        title={user?.email ?? account.displayName}
+      >
+        {account.displayName}
+      </span>
+      <button
+        type="button"
+        onClick={() => void signOut()}
+        className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground hover:text-foreground"
+        aria-label="Sign out"
+      >
+        ↩
+      </button>
+    </div>
+  );
+});
+
 const TopBarInner = () => {
   const { pathname } = useLocation();
 
   return (
     <header className="fixed top-0 inset-x-0 z-40 border-b border-border bg-background/80 backdrop-blur">
-      <div className="grid grid-cols-2 md:grid-cols-4 items-center px-6 md:px-10 h-12 text-xs">
+      <div className="grid grid-cols-2 md:grid-cols-5 items-center px-6 md:px-10 h-12 text-xs">
         <Link to="/" className="font-medium tracking-tight">
           CREDENCE<sup className="text-[8px] ml-0.5">®</sup>
         </Link>
@@ -81,6 +126,9 @@ const TopBarInner = () => {
             active={pathname.startsWith("/settings")}
           />
         </nav>
+        <div className="flex justify-end">
+          <AccountChip />
+        </div>
       </div>
     </header>
   );

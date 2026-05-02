@@ -9,11 +9,13 @@
  * land — search for "TODO(real-data)" below to find the seams.
  */
 import type { JSX } from "react";
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { ChevronDown, X } from "lucide-react";
-import type { GraphNode } from "@/lib/graph";
+import { EDGE_CONFIGS, type GraphEdge, type GraphNode } from "@/lib/graph";
 import type { Prospect, Score, Signal, SignalWeight } from "@/lib/mockStore";
 import { scoreColor } from "@/components/ScoreBar";
+import { WeightVersionBanner } from "@/components/WeightVersionBanner";
+import { useDisplayedWeightVersion } from "@/lib/useDisplayedWeightVersion";
 import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -25,6 +27,9 @@ import {
   type SignalContribution,
   type SubScoreKey,
 } from "@/lib/scoreMath";
+import { findWarmPaths, type WarmPath } from "@/lib/warmPaths";
+import { OrgCorrectionDialog } from "@/components/OrgCorrectionDialog";
+import { useGraphStore } from "@/store/graphStore";
 import type { HubStats } from "@/lib/aggregations";
 
 export interface NodeInspectorProps {
@@ -189,6 +194,67 @@ const Avatar = ({ kind }: { kind: GraphNode["kind"] }) => {
   }
 };
 
+// ── StubInspector — Decision 4: unknown nodes are rendered, not omitted. ───
+//
+// Renders a minimal panel for `is_unresolved_target=TRUE` org chart nodes.
+// Used by ProspectDetail's v3 org chart when the operator clicks a stub
+// (placeholder role inferred from job postings / press releases). NOT the
+// full identity card — the person is unknown by definition.
+
+export interface StubInspectorProps {
+  canonicalName: string;            // e.g. '[Unknown VP of Manufacturing]'
+  currentTitle?: string | null;     // e.g. 'VP of Manufacturing'
+  inferenceMethod: string;          // e.g. 'job_posting_nlp'
+  companyName: string;
+  onClose?: () => void;
+}
+
+export function StubInspector({
+  canonicalName,
+  currentTitle,
+  inferenceMethod,
+  companyName,
+  onClose,
+}: StubInspectorProps): JSX.Element {
+  const sourceLine = `Inferred from ${inferenceMethod.replace(/_/g, " ")}${
+    companyName ? ` · ${companyName}` : ""
+  }`;
+  return (
+    <aside className="border border-dashed border-border bg-muted/10 p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <Eyebrow>Unresolved role</Eyebrow>
+        {onClose && (
+          <button
+            onClick={onClose}
+            className="text-muted-foreground hover:text-foreground transition-colors p-1 -m-1"
+            aria-label="Close inspector"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+      <div>
+        <div className="text-base italic font-medium">{canonicalName}</div>
+        {currentTitle && (
+          <div className="text-xs text-muted-foreground mt-0.5">{currentTitle}</div>
+        )}
+        <div className="text-[11px] text-muted-foreground mt-2">{sourceLine}</div>
+      </div>
+      <p className="text-xs text-foreground/85 leading-relaxed">
+        We know this role exists at this company but have not yet identified the
+        person. Credence will resolve this automatically as more signals are
+        collected.
+      </p>
+      <button
+        type="button"
+        className="w-full text-[11px] border border-border px-3 py-1.5 hover:bg-muted/40 transition-colors"
+      >
+        Flag for manual review
+      </button>
+    </aside>
+  );
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 export function NodeInspector(props: NodeInspectorProps): JSX.Element | null {
@@ -204,6 +270,28 @@ export function NodeInspector(props: NodeInspectorProps): JSX.Element | null {
     onNavigateToProspect,
   } = props;
   if (!node) return null;
+
+  // Stub guard — when the selected node is an unresolved org-chart placeholder
+  // (Decision 4 from CLAUDE.md), render the minimal StubInspector regardless
+  // of `node.kind`. The flag is carried on `(node as any).data` because the
+  // GraphNode type union doesn't (yet) model unresolved targets — we keep it
+  // as a runtime check until the type catches up.
+  const stubData = (node as unknown as {
+    data?: { is_unresolved_target?: boolean; canonical_name?: string; current_title?: string | null; inference_method?: string; company_name?: string };
+  }).data;
+  if (stubData && stubData.is_unresolved_target === true) {
+    return (
+      <PanelShell>
+        <StubInspector
+          canonicalName={stubData.canonical_name ?? node.name ?? "Unknown role"}
+          currentTitle={stubData.current_title ?? null}
+          inferenceMethod={stubData.inference_method ?? "inferred"}
+          companyName={stubData.company_name ?? ""}
+          onClose={onClose}
+        />
+      </PanelShell>
+    );
+  }
 
   const Header = (
     <div className="flex items-center justify-between mb-4">
@@ -327,6 +415,7 @@ function PersonInspector({
 }: PersonInspectorProps): JSX.Element {
   const personId = prospect?._id ?? node.id;
   const synth = useMemo(() => synthesizeSubScores(personId), [personId]);
+  const displayedVersionId = useDisplayedWeightVersion(prospect?._id);
 
   const rawOverall = score?.overall_score ?? node.score ?? 0;
   // The snapshot has many high-overall prospects whose sub-score columns
@@ -441,6 +530,7 @@ function PersonInspector({
         )}
       </div>
       <Separator className="my-4" />
+      <WeightVersionBanner displayedVersionId={displayedVersionId} />
       <SubScoreGrid
         cells={[
           { label: "Authenticity", value: authenticity.toFixed(1) },
@@ -495,6 +585,15 @@ function PersonInspector({
         return null;
       })()}
 
+      <WarmPathPanel targetNodeId={node.id} />
+
+      {prospect && (
+        <OrgChartCorrectionAffordance
+          personId={prospect._id}
+          personName={prospect.name}
+        />
+      )}
+
       {prospect && onNavigateToProspect && (
         <Button
           variant="outline"
@@ -505,6 +604,44 @@ function PersonInspector({
         </Button>
       )}
     </PanelShell>
+  );
+}
+
+// ── Org-chart correction affordance ────────────────────────────────────────
+//
+// A4 UI half (V3_PT2.md L196-204). Until the org chart is rendered as edges
+// in the graph (post-A0 schema apply + A2 hierarchy population), the simplest
+// surface is a button at the bottom of PersonInspector that lets the operator
+// flag wrong-reporting-line input even without a specific edge in view.
+//
+// When org_reporting_edges is populated and the graph renders reports_to
+// edges, callers can pass `defaultPersonBId` + `defaultEdgeId` for a more
+// contextual correction. The dialog supports both flows.
+
+function OrgChartCorrectionAffordance({
+  personId,
+  personName,
+}: {
+  personId: string;
+  personName: string;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        type="button"
+        className="w-full mt-3 text-[11px] text-muted-foreground hover:text-foreground underline underline-offset-2 transition-colors"
+        onClick={() => setOpen(true)}
+      >
+        Flag wrong reporting line
+      </button>
+      <OrgCorrectionDialog
+        open={open}
+        onOpenChange={setOpen}
+        personAId={personId}
+        personAName={personName}
+      />
+    </>
   );
 }
 
@@ -851,4 +988,174 @@ function TallyBlock({
       </ul>
     </>
   );
+}
+
+// ── WarmPathPanel — Track K (CLAUDE.md L976-981, Contract 2 consumer) ───────
+//
+// Renders the highest-strength warm paths from the user's "team" (every other
+// person node in the current graph view) to the selected prospect. Pulls graph
+// state from `useGraphStore` (vanilla impl from Track L), invokes
+// `findWarmPaths` (Track I), and renders one card per path.
+//
+// Per CLAUDE.md L981 the panel is person-only — already enforced by being
+// rendered inside `PersonInspector`.
+
+function WarmPathPanel({ targetNodeId }: { targetNodeId: string }): JSX.Element | null {
+  const nodes = useGraphStore((s) => s.nodes);
+  const edges = useGraphStore((s) => s.edges);
+
+  const sourceNodeIds = useMemo(
+    () =>
+      nodes
+        .filter((n) => n.kind === "person" && n.id !== targetNodeId)
+        .map((n) => n.id),
+    [nodes, targetNodeId],
+  );
+
+  const paths = useMemo<WarmPath[]>(() => {
+    if (sourceNodeIds.length === 0) return [];
+    return findWarmPaths(targetNodeId, sourceNodeIds, { nodes, edges });
+  }, [targetNodeId, sourceNodeIds, nodes, edges]);
+
+  // Hide entirely when the graph is empty (e.g., before first load) — the
+  // panel is meaningful only when there's at least one candidate connector.
+  if (sourceNodeIds.length === 0) return null;
+
+  return (
+    <div className="mt-5">
+      <div className="flex items-baseline justify-between mb-2">
+        <Eyebrow>Warm paths</Eyebrow>
+        <span className="text-mono text-[11px] text-muted-foreground">{paths.length}</span>
+      </div>
+      {paths.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground leading-relaxed border-l-2 border-border pl-3">
+          No warm paths in current view. Expand graph.
+        </p>
+      ) : (
+        <ul className="space-y-3">
+          {paths.map((path, i) => (
+            <WarmPathCard key={pathKey(path, i)} path={path} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function pathKey(path: WarmPath, index: number): string {
+  // Stable per-path identity for React reconciliation: source id + edge ids
+  // covers both node-set and edge-set dedup policies. Index suffix is a
+  // tiebreaker for the rare collision (same edge set under edge-set policy
+  // would already be deduped, but defensive).
+  const edgeIds = path.edges.map((e) => e.id).join("·");
+  return `${path.nodes[0]?.id ?? "src"}|${edgeIds}|${index}`;
+}
+
+function WarmPathCard({ path }: { path: WarmPath }): JSX.Element {
+  const [copied, setCopied] = useState(false);
+  const strengthPct = Math.round(path.strength * 100);
+
+  const onUseThisPath = async () => {
+    try {
+      await navigator.clipboard.writeText(path.suggested_opener);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      // Clipboard write is gated on user gesture + secure context. If it fails
+      // (Safari without permission, file://, etc.) fall back to a console warn
+      // so the demo doesn't break silently. Production would surface a toast.
+      console.warn("WarmPathCard: clipboard write failed", err);
+    }
+  };
+
+  return (
+    <li className="border border-border bg-card p-3">
+      {/* Person chain */}
+      <div className="flex items-center flex-wrap text-[11px] gap-x-1 gap-y-0.5">
+        {path.nodes.map((n, i) => (
+          <Fragment key={`${n.id}|${i}`}>
+            {i > 0 && (
+              <span aria-hidden="true" className="text-muted-foreground">
+                →
+              </span>
+            )}
+            <span className="font-medium truncate">{warmPathNodeLabel(n)}</span>
+          </Fragment>
+        ))}
+      </div>
+
+      {/* Edge type pills */}
+      <div className="flex flex-wrap gap-1 mt-2">
+        {path.edges.map((edge, i) => (
+          <span
+            key={`${edge.id}|${i}`}
+            className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 border border-border"
+            style={edgePillStyle(edge)}
+          >
+            {edgeKindLabel(edge.kind)}
+          </span>
+        ))}
+      </div>
+
+      {/* Strength bar */}
+      <div className="mt-3">
+        <div className="flex items-baseline justify-between text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+          <span>Strength</span>
+          <span className="text-mono">{strengthPct}%</span>
+        </div>
+        <div className="h-1 bg-muted mt-1 overflow-hidden">
+          <div
+            className="h-full bg-foreground"
+            style={{ width: `${Math.min(100, Math.max(0, strengthPct))}%` }}
+          />
+        </div>
+      </div>
+
+      {/* Explanation */}
+      <p className="mt-2 text-[11px] text-foreground/80 leading-relaxed">
+        {path.explanation}
+      </p>
+
+      {/* Use this path */}
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        className="mt-3 w-full text-[11px] h-7"
+        onClick={onUseThisPath}
+        disabled={path.suggested_opener.length === 0}
+      >
+        {copied ? "Copied ✓" : "Use this path"}
+      </Button>
+    </li>
+  );
+}
+
+function warmPathNodeLabel(n: GraphNode): string {
+  if ("name" in n && typeof n.name === "string" && n.name.length > 0) return n.name;
+  return n.id;
+}
+
+function edgeKindLabel(kind: GraphEdge["kind"]): string {
+  // EDGE_CONFIGS in graph.ts is the source of truth for display labels per
+  // Contract 3. The fallback returns a humanised version of the literal kind
+  // string in case a future EdgeKind is added without a config entry — the
+  // exhaustive `Record<EdgeKind, EdgeConfig>` type makes that a compile-time
+  // error in practice.
+  const cfg = EDGE_CONFIGS[kind];
+  if (cfg) return cfg.displayLabel;
+  return String(kind).replace(/_/g, " ");
+}
+
+function edgePillStyle(edge: GraphEdge): React.CSSProperties {
+  // Reuse the edge color baked onto the edge by buildGraph (when a theme was
+  // passed). Falls back to subtle muted styling when no color is present —
+  // the WarmPathPanel can be rendered before graph theming runs.
+  if (typeof edge.color === "string" && edge.color.length > 0) {
+    return {
+      borderColor: edge.color,
+      color: edge.color,
+    };
+  }
+  return {};
 }

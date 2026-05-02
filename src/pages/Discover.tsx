@@ -27,10 +27,13 @@ import {
   useScoresFor,
   useSignalsFor,
   useSignalsForMany,
+  usePersonConnections,
   useWeights,
 } from "@/lib/db";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import {
+  ALL_EDGE_KINDS,
+  EDGE_CONFIGS,
   buildGraph,
   canonicalizeRole,
   type EdgeKind,
@@ -44,35 +47,13 @@ import {
   type AggregationProspect,
 } from "@/lib/aggregations";
 import type { AgentContext } from "@/lib/agent";
+import { useGraphStore, isDemoMode } from "@/store/graphStore";
 
 // ─── CSS-var color helpers ───────────────────────────────────────────────────
-
-const slugifyEdge = (kind: EdgeKind): string => {
-  // index.css maps EdgeKind -> --edge-<slug>; mapping is the post-fix part.
-  switch (kind) {
-    case "reports_to":
-      return "reports";
-    case "works_at":
-      return "employer";
-    case "located_in":
-      return "location";
-    case "evidence_cited":
-      return "evidence";
-    case "scope_signal":
-      return "scope";
-    case "partnership":
-      return "partnership";
-    case "past_employer":
-      return "past-empl";
-    case "education":
-      return "education";
-    case "vertical":
-      return "vertical";
-    case "colleague":
-      // Not defined as its own token — borrow employer.
-      return "employer";
-  }
-};
+//
+// Edge → CSS-variable resolution moved into `EDGE_CONFIGS` (`graph.ts`,
+// per Contract 3). Read `EDGE_CONFIGS[kind].cssVarName` instead of building
+// the var name in this file.
 
 function hslFromVar(varName: string): string {
   if (typeof window === "undefined") return "hsl(0 0% 50%)";
@@ -98,19 +79,8 @@ type FGLink = LinkObject<
   { kind: EdgeKind; id: string; color?: string; width?: number }
 >;
 
-// All edge kinds — used for the edge-color theme map.
-const ALL_EDGE_KINDS: EdgeKind[] = [
-  "works_at",
-  "colleague",
-  "located_in",
-  "reports_to",
-  "past_employer",
-  "partnership",
-  "education",
-  "scope_signal",
-  "vertical",
-  "evidence_cited",
-];
+// `ALL_EDGE_KINDS` now lives in `graph.ts` (derived from `EDGE_CONFIGS`).
+// See Contract 3 for the registry pattern. Imported above.
 
 // react-force-graph mutates source/target to NodeObjects after init; this
 // narrows safely whether we're pre- or post-init.
@@ -318,6 +288,14 @@ const DEFAULT_EDGE_KINDS: EdgeKind[] = [
   // the "see structure" view degenerates to a sparse hub-and-spoke. On by
   // default; user toggles off if it's too noisy.
   "vertical",
+  // Education-cohort kinds (V3_PT2.md §"New Edge Kinds"). Live in
+  // EDGE_CONFIGS since Phase 1.1; on by default so the
+  // bulk_education_signals output (283+ edges live as of 2026-04-30)
+  // surfaces without users needing to toggle them on.
+  "same_mba_cohort",
+  "same_phd_program",
+  "same_undergrad_cohort",
+  "executive_education",
 ];
 
 // Cap how many prospects we let into the force-directed canvas at the
@@ -419,36 +397,56 @@ function seniorityRank(role: string | undefined): number {
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
-// Edge-pill order — duplicated from TopBar so the legend renders the same
-// kinds in the same order. Kept local to avoid a one-import dep on TopBar.
-const EDGE_LEGEND: ReadonlyArray<{ kind: EdgeKind; label: string }> = [
-  { kind: "reports_to", label: "Reports" },
-  { kind: "works_at", label: "Employer" },
-  { kind: "located_in", label: "Location" },
-  { kind: "evidence_cited", label: "Evidence" },
-  { kind: "scope_signal", label: "Scope" },
-  { kind: "partnership", label: "Partnership" },
-  { kind: "past_employer", label: "Past empl." },
-  { kind: "education", label: "Education" },
-  { kind: "vertical", label: "Vertical" },
+// Edge-pill order — drives the toggle row beneath the legend (rendered at
+// EDGE_LEGEND.map below). Order: structural kinds first (matching v2 layout)
+// then the four hidden-connection kinds at the end, baseline-strength desc
+// within the warm group (patent 0.95 → co-author 0.85 → standards 0.82 →
+// conference 0.80) so the strongest warm-path edges read left-to-right.
+//
+// Derived from `EDGE_CONFIGS` (single source of truth, Contract 3) — labels
+// and ordering preserved exactly to avoid visual drift from the previous
+// hand-maintained list.
+const EDGE_LEGEND_ORDER: ReadonlyArray<EdgeKind> = [
+  "reports_to",
+  "works_at",
+  "located_in",
+  "evidence_cited",
+  "scope_signal",
+  "partnership",
+  "past_employer",
+  "education",
+  "vertical",
+  "patent_co_inventor",
+  "academic_co_author",
+  "standards_committee",
+  "conference_co_presenter",
+  // Education-cohort kinds — appended after the v3 hidden-connection group.
+  // These are stronger than the generic `education` kind (mba 0.85 / phd 0.78
+  // vs alumni 0.25) but distinct from `academic_co_author` — they represent
+  // structural cohort overlap, not paper co-authorship.
+  "same_mba_cohort",
+  "same_phd_program",
+  "executive_education",
+  "same_undergrad_cohort",
 ];
+const EDGE_LEGEND: ReadonlyArray<{ kind: EdgeKind; label: string }> =
+  EDGE_LEGEND_ORDER.map((kind) => ({
+    kind,
+    label: EDGE_CONFIGS[kind].displayLabel,
+  }));
 
 // Compact mid-edge labels — drawn by linkCanvasObject in zoomed-in views so
 // the user can tell apart works_at / past_employer / education / partnership
-// without consulting the legend. `colleague` is intentionally suppressed: it
-// would carpet the canvas with redundant "Colleague" tags between every pair
-// of co-workers.
-const EDGE_LABEL_SHORT: Partial<Record<EdgeKind, string>> = {
-  reports_to: "REPORTS",
-  works_at: "WORKS AT",
-  located_in: "LOCATED IN",
-  past_employer: "EX",
-  partnership: "PARTNER",
-  education: "EDUCATED AT",
-  vertical: "VERTICAL",
-  scope_signal: "SCOPE",
-  evidence_cited: "EVIDENCE",
-};
+// without consulting the legend. `colleague` is intentionally suppressed
+// (`EDGE_CONFIGS.colleague.suppressCanvasLabel === true`) — it would carpet
+// the canvas with redundant "Colleague" tags between every pair of co-workers.
+const EDGE_LABEL_SHORT: Partial<Record<EdgeKind, string>> = Object.freeze(
+  Object.fromEntries(
+    ALL_EDGE_KINDS.filter((k) => !EDGE_CONFIGS[k].suppressCanvasLabel).map(
+      (k) => [k, EDGE_CONFIGS[k].displayLabelShort],
+    ),
+  ),
+);
 
 // Encode/decode helpers for URL-sync. Unknown values are dropped so a hand-
 // edited URL can't crash the page.
@@ -536,10 +534,11 @@ const Discover = () => {
     return out;
   }, [visibleNodeIds]);
 
-  // Cap how many prospects feed the RENDERED force graph. ForceGraph2D + dense
-  // colleague meshes become unworkable past a few hundred. The chat copilot
-  // sees the FULL prospect set in agent builds (colleague edges skipped).
-  const RENDER_CAP = 250;
+  // Render caps removed 2026-04-30 by user direction — every prospect feeds
+  // the force graph regardless of count. ForceGraph2D performance past a few
+  // thousand nodes is the new known constraint; revisit if/when frame rates
+  // become unworkable on the target hardware. The chat copilot already sees
+  // the full prospect set; this aligns the rendered graph with that set.
 
   // Hub matching for focal expansion — shared with NodeInspector counts via
   // `lib/aggregations.ts`. Person nodes return null here; colleague drill-down
@@ -558,74 +557,44 @@ const Discover = () => {
 
     if (chatPromotedIds) {
       const matched = allProspects.filter((p) => chatPromotedIds.has(p._id));
-      if (matched.length > 0) return matched.slice(0, RENDER_CAP);
+      if (matched.length > 0) return matched;
     }
 
     const colonIdx = focusId?.indexOf(":") ?? -1;
     const focusKind = focusId && colonIdx > 0 ? focusId.slice(0, colonIdx) : null;
     const focusName = focusId && colonIdx > 0 ? focusId.slice(colonIdx + 1) : null;
 
-    // Person focus: the clicked prospect + same-company colleagues merged
-    // into the global top-N slice. Critical: include `me` himself — without
-    // it, clicking a person whose score is outside the top-250 left him
-    // absent from `prospects` so buildGraph never emitted a person:<id>
-    // node, and focalNodes collapsed to "0 of N candidates" with stale
-    // company nodes from prior state.
+    // Person focus: ensure the clicked prospect is present, then everyone
+    // else sorted by score. Same-company colleagues are no longer specially
+    // promoted because every prospect renders unconditionally now.
     if (focusKind === "person" && focusName) {
-      const norm = (s: string) => s.trim().toLowerCase();
       const me = allProspects.find((p) => p._id === focusName);
       if (me) {
-        const colleagues = allProspects.filter(
-          (p) => p._id !== me._id && norm(p.company) === norm(me.company),
-        );
-        if (allProspects.length <= RENDER_CAP && colleagues.length === 0) {
-          // Whole DB fits and no colleagues — still ensure `me` is present.
-          return allProspects.some((p) => p._id === me._id)
-            ? allProspects
-            : [me, ...allProspects];
-        }
         const ranked = [...allProspects].sort(byScoreDesc);
-        const baseTopN = ranked.slice(0, RENDER_CAP);
-        const FOCAL_EXPAND_CAP = 60;
-        const rankedColleagues = [...colleagues].sort(byScoreDesc);
-        const seen = new Set(baseTopN.map((p) => p._id));
-        // Always include the focal person himself first — non-negotiable.
-        if (!seen.has(me._id)) {
-          baseTopN.push(me);
-          seen.add(me._id);
-        }
-        let added = 0;
-        for (const p of rankedColleagues) {
-          if (added >= FOCAL_EXPAND_CAP) break;
-          if (!seen.has(p._id)) {
-            baseTopN.push(p);
-            seen.add(p._id);
-            added++;
-          }
-        }
-        return baseTopN;
+        if (ranked.some((p) => p._id === me._id)) return ranked;
+        return [me, ...ranked];
       }
     }
 
     if (focalAggregationIds) {
-      const FOCAL_MATCH_RENDER_CAP = 100;
       const matched = allProspects
         .filter((p) => focalAggregationIds.has(p._id))
-        .sort(byScoreDesc)
-        .slice(0, FOCAL_MATCH_RENDER_CAP);
+        .sort(byScoreDesc);
       const remaining = allProspects
         .filter((p) => !focalAggregationIds.has(p._id))
         .sort(byScoreDesc);
-      const ambientCap = Math.max(0, RENDER_CAP - matched.length);
-      return [...matched, ...remaining.slice(0, ambientCap)];
+      return [...matched, ...remaining];
     }
 
-    if (allProspects.length <= RENDER_CAP) return allProspects;
-    return [...allProspects].sort(byScoreDesc).slice(0, RENDER_CAP);
+    return [...allProspects].sort(byScoreDesc);
   }, [allProspects, scores, chatPromotedIds, focalAggregationIds, focusId]);
 
   const prospectIds = useMemo(() => prospects.map((p) => p._id), [prospects]);
   const signalsById = useSignalsForMany(prospectIds);
+  // Pre-materialized person↔person edges from `person_connections` (Decision 7).
+  // Empty until the persons↔prospects ID linkage migration lands; harmless
+  // no-op against current DB.
+  const personConnections = usePersonConnections(prospectIds);
 
   // Per-kind cached colors. Recomputed once per mount; theme switch would
   // need to bust this — fine for v1 since the theme toggle isn't on Discover.
@@ -640,7 +609,7 @@ const Discover = () => {
   // Edge color cache — same caveat as above.
   const edgeColorByKind = useMemo<Record<EdgeKind, string>>(() => {
     const out = {} as Record<EdgeKind, string>;
-    for (const k of ALL_EDGE_KINDS) out[k] = hslFromVar(`--edge-${slugifyEdge(k)}`);
+    for (const k of ALL_EDGE_KINDS) out[k] = hslFromVar(EDGE_CONFIGS[k].cssVarName);
     return out;
   }, []);
 
@@ -658,9 +627,16 @@ const Discover = () => {
   const labelHalo = useMemo(() => hslFromVar("--background"), []);
 
   // Build graph (memoized). Pre-bakes color on every node + edge.
+  // Skip the O(n²) colleague-edge mesh on the rendered build. With caps removed
+  // (2026-04-30 user direction) the prospect set is up to ~20k; a single
+  // company with 446 prospects emits ~99k colleague edges by itself, which
+  // tanks ForceGraph2D's tick into multi-second frames. Chat copilot already
+  // does the skipColleagueEdges build at line 969 — same flag, same reason.
+  // Hidden-connection edges (patent/paper/conference/standards) + works_at +
+  // located_in + partnership + vertical all still render.
   const { nodes, edges } = useMemo(
-    () => buildGraph({ prospects, scores, signalsById, theme }),
-    [prospects, scores, signalsById, theme],
+    () => buildGraph({ prospects, scores, signalsById, personConnections, theme, skipColleagueEdges: true }),
+    [prospects, scores, signalsById, personConnections, theme],
   );
 
   // Push state -> URL (replace, not push — the user said no back-button feel,
@@ -675,6 +651,41 @@ const Discover = () => {
       setSearchParams(next, { replace: true });
     }
   }, [focusId, edgeKindsActive, searchParams, setSearchParams]);
+
+  // ─── graphStore mirror (Track L2) ────────────────────────────────────────
+  // Local state (focusId / selectedId / edgeKindsActive / built nodes+edges)
+  // remains canonical for now; we mirror it into graphStore so that
+  // downstream consumers — warmPaths.ts (Track I), NodeInspector v2,
+  // demo-mode plumbing (Wave 3) — can read from a single source of truth
+  // without coupling back into this page's local React state. Full
+  // replacement of the local hooks with store reads is staged for L3.
+  //
+  // Demo-mode skip: when `?demo=true`, App.tsx has already called
+  // `initDemoMode([...DEMO_GRAPH_NODES], [...DEMO_EDGES])` which seeds the
+  // store with the canonical pre-built demo graph. Mirroring Discover's
+  // local buildGraph output on top would clobber that seed (Bug 2 in
+  // SunnyRidge's [REPORT demo-smoke] — buildGraph fires before useProspects
+  // resolves, writing `{[], []}` and overwriting the demo data). Skipping
+  // the mirror in demo mode preserves the seed for warmPaths / banner
+  // consumers that read from the store. The selection + edge-kind mirrors
+  // still run because those are user-driven and harmless in demo mode.
+  const storeSetGraph = useGraphStore((s) => s.setGraph);
+  const storeSelectNode = useGraphStore((s) => s.selectNode);
+  const storeSetVisibleEdgeKinds = useGraphStore((s) => s.setVisibleEdgeKinds);
+  const _DEMO_MIRROR_SKIP = isDemoMode();
+
+  useEffect(() => {
+    storeSelectNode(selectedId);
+  }, [selectedId, storeSelectNode]);
+
+  useEffect(() => {
+    storeSetVisibleEdgeKinds(edgeKindsActive);
+  }, [edgeKindsActive, storeSetVisibleEdgeKinds]);
+
+  useEffect(() => {
+    if (_DEMO_MIRROR_SKIP) return;
+    storeSetGraph({ nodes, edges });
+  }, [nodes, edges, storeSetGraph, _DEMO_MIRROR_SKIP]);
 
   // Derived: neighbor map for halo / fade.
   const neighborByNode = useMemo(() => {
@@ -706,9 +717,44 @@ const Discover = () => {
   }, [nodes]);
 
   const focalNodes = useMemo<GraphNode[]>(() => {
-    if (!focusId) return nodes;
+    // Hierarchical default (2026-04-30): when nothing is focused, render the
+    // top of the tree — verticals (industry) + companies + city + country +
+    // tech root. Person/role/school stay hidden until the user drills in.
+    // Keeps the cold-load force-graph small instead of 20k. Defensively
+    // falls back to all nodes if the filter would yield <10 (catches
+    // sparse-COMPANY_META scenarios where industries didn't get emitted).
+    const topLevelKinds: ReadonlySet<string> = new Set([
+      "industry",
+      "company",
+      "city",
+      "country",
+    ]);
+    const buildTopLevel = (): GraphNode[] => {
+      const filtered = nodes.filter(
+        (n) => topLevelKinds.has(n.kind) || n.id === TECH_ROOT_ID,
+      );
+      // Fallback: if the hierarchy didn't materialize enough hubs, return
+      // the full set — better an over-dense graph than a near-empty one.
+      return filtered.length >= 10 ? filtered : nodes;
+    };
+    if (!focusId) return buildTopLevel();
     const focal = nodeById.get(focusId);
-    if (!focal) return nodes; // stale focus id (e.g. from URL) — show all
+    if (!focal) return buildTopLevel();
+    // Industry-focus drill-down: show the focused industry + every company
+    // that rolls up to it + the tech root. Companies open the next level
+    // when clicked (existing company-focus path, line ~715).
+    if (focal.kind === "industry") {
+      const visible = new Set<string>([focal.id]);
+      if (nodeById.has(TECH_ROOT_ID)) visible.add(TECH_ROOT_ID);
+      const neighbors = neighborByNode.get(focal.id);
+      if (neighbors) {
+        for (const id of neighbors) {
+          const n = nodeById.get(id);
+          if (n && n.kind === "company") visible.add(id);
+        }
+      }
+      return nodes.filter((n) => visible.has(n.id));
+    }
     const visible = new Set<string>([focusId]);
     if (nodeById.has(TECH_ROOT_ID)) visible.add(TECH_ROOT_ID);
     const neighbors = neighborByNode.get(focusId);
@@ -780,7 +826,12 @@ const Discover = () => {
   }, [focusId, nodes, nodeById, neighborByNode, activeViewNodes, allProspects, scores]);
 
   const focalEdges = useMemo(() => {
-    if (!focusId) return edges;
+    if (!focusId) {
+      // Match the hierarchical default node filter — keep only edges
+      // between visible top-level nodes (industry/company/tech root).
+      const visible = new Set(focalNodes.map((n) => n.id));
+      return edges.filter((e) => visible.has(e.source) && visible.has(e.target));
+    }
     const visible = new Set(focalNodes.map((n) => n.id));
     const focal = nodeById.get(focusId);
     // For person focus we want the org-chart shape, not just an ego graph.
@@ -987,10 +1038,11 @@ const Discover = () => {
         prospects: allProspects,
         scores,
         signalsById,
+        personConnections,
         theme,
         skipColleagueEdges: true,
       }),
-    [allProspects, scores, signalsById, theme],
+    [allProspects, scores, signalsById, personConnections, theme],
   );
   const ctx: AgentContext = useMemo(
     () => ({
@@ -1221,17 +1273,24 @@ const Discover = () => {
   // only the very middle was clickable.
   const nodeRadius = useCallback(
     (gn: GraphNode, isSelected: boolean): number => {
+      // Hierarchical sizing (2026-04-30): top-of-tree nodes get a real
+      // size boost so the cold-load (verticals + companies only) reads
+      // as a clean, clickable hub-and-spoke instead of a dot field.
       const isRoot = gn.id === "industry:technology";
       const baseR = isRoot
-        ? 12
-        : gn.kind === "industry" || gn.kind === "city"
-          ? 8
-          : gn.kind === "company" || gn.kind === "role"
-            ? 7
-            : gn.kind === "school" || gn.kind === "conference"
-              ? 5.5
-              : 5; // person
-      return isSelected ? baseR + 2 : baseR;
+        ? 28
+        : gn.kind === "industry"
+          ? 22
+          : gn.kind === "city"
+            ? 14
+            : gn.kind === "company"
+              ? 14
+              : gn.kind === "role"
+                ? 9
+                : gn.kind === "school" || gn.kind === "conference"
+                  ? 6
+                  : 5; // person
+      return isSelected ? baseR + 3 : baseR;
     },
     [],
   );

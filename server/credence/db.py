@@ -47,18 +47,37 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
     )
 
 
+def _select_dsn(s: Any) -> str:
+    """Prefer the transaction-pooler DSN when configured.
+
+    The session pooler caps client connections (~15 on Supabase free tier;
+    higher on paid). Heavy parallel-agent workloads hit MaxClientsInSessionMode
+    and stall. The transaction pooler has no such cap and is safe with
+    `statement_cache_size=0` (already set below). Operators opt in by setting
+    `DATABASE_URL_TRANSACTION_POOLER`; absent that, we fall back to the
+    legacy `DATABASE_URL`.
+    """
+    pooler = getattr(s, "database_url_transaction_pooler", None)
+    return pooler or s.database_url
+
+
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
         s = get_settings()
+        dsn = _select_dsn(s)
         _pool = await asyncpg.create_pool(
-            dsn=_normalize_dsn(s.database_url),
+            dsn=_normalize_dsn(dsn),
             min_size=s.db_pool_min,
             max_size=s.db_pool_max,
             init=_init_connection,
             statement_cache_size=0,  # Supabase pgbouncer transaction-mode safety
         )
-        logger.info("DB pool initialized")
+        using_pooler = bool(getattr(s, "database_url_transaction_pooler", None))
+        logger.info(
+            "DB pool initialized (%s)",
+            "transaction pooler" if using_pooler else "session pooler",
+        )
     return _pool
 
 

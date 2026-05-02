@@ -10,11 +10,20 @@ import {
   type ScoringRun,
 } from "@/lib/db";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
+import { getCredenceHeaders } from "@/lib/credenceHeaders";
 import { BigScore, ScoreBar, scoreColor } from "@/components/ScoreBar";
 import { ENABLE_ORG_CHART, supabase } from "@/lib/supabase";
 import { WebPresence } from "@/components/WebPresence";
-import ReactFlow, { Background, Controls, type Node, type Edge } from "reactflow";
+import ReactFlow, {
+  Background,
+  Controls,
+  type Node,
+  type Edge,
+  type NodeProps,
+  type NodeTypes,
+} from "reactflow";
 import "reactflow/dist/style.css";
+import { StubInspector } from "@/components/NodeInspector";
 
 // ─── Org chart helpers ──────────────────────────────────────────────────────
 // Seniority rank derived from role-title tokens. Used to place peers around
@@ -498,7 +507,10 @@ async function fetchFastApiPeers(
       const url = `${API_BASE}/convex/prospects?industry=${encodeURIComponent(
         ind,
       )}&limit=500`;
-      const resp = await fetch(url);
+      // `getCredenceHeaders()` attaches `X-Credence-Demo: true` in demo mode
+      // (Wave 6 M5) and will attach `Authorization: Bearer <jwt>` once M3
+      // wires authenticated live mode.
+      const resp = await fetch(url, { headers: getCredenceHeaders() });
       if (!resp.ok) continue;
       const body = (await resp.json()) as FastApiProspectsResp;
       for (const p of body.prospects ?? []) {
@@ -610,24 +622,481 @@ function useOrgPeers(
   return { peers, loading, source };
 }
 
+// ─── v3 Org reporting edges (Task 3-A/3-B/3-C) ─────────────────────────────
+//
+// Reads from `org_reporting_edges` with stub-aware joins. Returns the raw
+// edge rows + a person-id → person record map so the chart layer can render
+// both real persons and `is_unresolved_target` stubs without re-querying.
+//
+// Resolution path (prospect → person → company → org_reporting_edges):
+//   1. Find the `persons` row by linkedin_url (preferred) then canonical_name.
+//   2. Read that person's current company from employment_periods (is_current).
+//   3. Pull every is_current employment_period for the same company → person ids.
+//   4. Query org_reporting_edges where BOTH endpoints sit in that person id set,
+//      is_current=TRUE, ordered by path_confidence desc nulls last.
+//   5. Re-join persons (manager_id + report_id) to get name/title/stub flag.
+//
+// Returns { edges: [], persons: Map<id, OrgPersonRecord>, ready: bool }.
+// `ready=false` means we couldn't resolve the prospect → person yet (or we
+// did and the company has 0 v3 edges — caller falls back to v2).
+
+interface OrgPersonRecord {
+  id: string;
+  canonical_name: string;
+  current_title: string | null;
+  is_unresolved_target: boolean;
+}
+
+interface OrgReportingEdgeRow {
+  id: string;
+  manager_id: string;
+  report_id: string;
+  confidence: number | null;
+  path_confidence: number | null;
+  inference_method: string;
+  valid_from: string | null;
+  is_current: boolean;
+}
+
+interface OrgV3Result {
+  edges: OrgReportingEdgeRow[];
+  persons: Map<string, OrgPersonRecord>;
+  companyName: string | null;
+}
+
+async function fetchOrgV3(
+  prospect: OrgPerson,
+): Promise<OrgV3Result | null> {
+  if (!supabase) return null;
+  // The Database type generated for the supabase client only knows about v2
+  // tables (prospects/signals/scores). v3 tables (persons, employment_periods,
+  // org_reporting_edges) exist in the database but aren't in the generated
+  // types yet, so we go through an untyped client for these reads. Once
+  // database.types.ts is regenerated this can be removed.
+  const sb = supabase as unknown as {
+    from: (table: string) => {
+      select: (cols: string) => {
+        eq: (col: string, v: unknown) => {
+          limit: (n: number) => Promise<{ data: unknown; error: unknown }>;
+          maybeSingle?: () => Promise<{ data: unknown; error: unknown }>;
+          eq: (col: string, v: unknown) => {
+            order: (col: string, opts?: unknown) => {
+              limit: (n: number) => Promise<{ data: unknown; error: unknown }>;
+            };
+          };
+          in?: (col: string, v: unknown[]) => Promise<{ data: unknown; error: unknown }>;
+        };
+        in: (col: string, v: unknown[]) => {
+          eq: (col: string, v: unknown) => {
+            order: (col: string, opts?: unknown) => {
+              limit: (n: number) => Promise<{ data: unknown; error: unknown }>;
+            };
+          };
+        };
+        ilike: (col: string, v: string) => {
+          limit: (n: number) => Promise<{ data: unknown; error: unknown }>;
+        };
+      };
+    };
+  };
+
+  try {
+    // 1. Resolve prospect → person.
+    let personRow: { id: string; current_company_id: string | null } | null = null;
+    if (prospect.linkedin_url) {
+      const r = (await sb
+        .from("persons")
+        .select("id, current_company_id")
+        .eq("linkedin_url", prospect.linkedin_url)
+        .limit(1)) as { data: unknown; error: unknown };
+      if (Array.isArray(r.data) && r.data.length > 0) {
+        personRow = r.data[0] as typeof personRow;
+      }
+    }
+    if (!personRow) {
+      const r = (await sb
+        .from("persons")
+        .select("id, current_company_id")
+        .ilike("canonical_name", prospect.name)
+        .limit(1)) as { data: unknown; error: unknown };
+      if (Array.isArray(r.data) && r.data.length > 0) {
+        personRow = r.data[0] as typeof personRow;
+      }
+    }
+    if (!personRow) return null;
+
+    // 2. Resolve company id (prefer employment_periods.is_current).
+    let companyId: string | null = personRow.current_company_id;
+    if (!companyId) {
+      const r = (await sb
+        .from("employment_periods")
+        .select("company_id")
+        .eq("person_id", personRow.id)
+        .eq("is_current", true)
+        .order("start_year", { ascending: false })
+        .limit(1)) as { data: unknown; error: unknown };
+      if (Array.isArray(r.data) && r.data.length > 0) {
+        companyId = (r.data[0] as { company_id: string }).company_id ?? null;
+      }
+    }
+    if (!companyId) return null;
+
+    // 3. All current employees of that company.
+    const empResp = (await sb
+      .from("employment_periods")
+      .select("person_id")
+      .eq("company_id", companyId)
+      .eq("is_current", true)
+      .order("seniority_score", { ascending: false })
+      .limit(500)) as { data: unknown; error: unknown };
+    const personIds = Array.isArray(empResp.data)
+      ? Array.from(
+          new Set(
+            (empResp.data as { person_id: string }[])
+              .map((r) => r.person_id)
+              .filter((v): v is string => typeof v === "string"),
+          ),
+        )
+      : [];
+    if (personIds.length === 0) {
+      return { edges: [], persons: new Map(), companyName: null };
+    }
+
+    // 4. Query org_reporting_edges where both endpoints sit in personIds.
+    //    org_reporting_edges has no company_id; we filter in JS after fetching
+    //    edges that touch the persons we care about.
+    const edgesResp = (await sb
+      .from("org_reporting_edges")
+      .select(
+        "id, manager_id, report_id, confidence, path_confidence, inference_method, valid_from, is_current",
+      )
+      .in("manager_id", personIds)
+      .eq("is_current", true)
+      .order("path_confidence", { ascending: false, nullsFirst: false } as unknown as undefined)
+      .limit(500)) as { data: unknown; error: unknown };
+
+    const personIdSet = new Set(personIds);
+    const rawEdges: OrgReportingEdgeRow[] = Array.isArray(edgesResp.data)
+      ? (edgesResp.data as OrgReportingEdgeRow[]).filter(
+          (e) =>
+            typeof e.report_id === "string" &&
+            typeof e.manager_id === "string" &&
+            personIdSet.has(e.report_id) &&
+            personIdSet.has(e.manager_id),
+        )
+      : [];
+
+    if (rawEdges.length === 0) {
+      return { edges: [], persons: new Map(), companyName: null };
+    }
+
+    // 5. Re-join persons for endpoint metadata.
+    const endpointIds = Array.from(
+      new Set(rawEdges.flatMap((e) => [e.manager_id, e.report_id])),
+    );
+    const personsResp = (await (
+      sb
+        .from("persons")
+        .select(
+          "id, canonical_name, current_title, is_unresolved_target",
+        ) as unknown as {
+        in: (col: string, v: unknown[]) => Promise<{ data: unknown; error: unknown }>;
+      }
+    ).in("id", endpointIds)) as { data: unknown; error: unknown };
+    const personsMap = new Map<string, OrgPersonRecord>();
+    if (Array.isArray(personsResp.data)) {
+      for (const row of personsResp.data as Array<{
+        id: string;
+        canonical_name: string;
+        current_title: string | null;
+        is_unresolved_target: boolean | null;
+      }>) {
+        personsMap.set(row.id, {
+          id: row.id,
+          canonical_name: row.canonical_name,
+          current_title: row.current_title ?? null,
+          is_unresolved_target: row.is_unresolved_target === true,
+        });
+      }
+    }
+
+    return { edges: rawEdges, persons: personsMap, companyName: null };
+  } catch (err) {
+    console.error("[OrgChart] v3 fetch failed:", err);
+    return null;
+  }
+}
+
+function useOrgV3(prospect: OrgPerson): {
+  data: OrgV3Result | null;
+  loading: boolean;
+} {
+  const [data, setData] = useState<OrgV3Result | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    void fetchOrgV3(prospect).then((res) => {
+      if (cancelled) return;
+      setData(res);
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [prospect.id, prospect.linkedin_url, prospect.name]);
+
+  return { data, loading };
+}
+
+// Layered tree layout — roots (no manager among current edges) at the top,
+// reports flow downward by BFS depth. Pure layout; no side effects on the
+// graph data model.
+function layoutOrgTree(
+  edges: OrgReportingEdgeRow[],
+  persons: Map<string, OrgPersonRecord>,
+): Map<string, { x: number; y: number; depth: number }> {
+  const layout = new Map<string, { x: number; y: number; depth: number }>();
+  const childrenOf = new Map<string, string[]>();
+  const hasManager = new Set<string>();
+  const allIds = new Set<string>();
+  for (const e of edges) {
+    allIds.add(e.manager_id);
+    allIds.add(e.report_id);
+    hasManager.add(e.report_id);
+    const arr = childrenOf.get(e.manager_id) ?? [];
+    arr.push(e.report_id);
+    childrenOf.set(e.manager_id, arr);
+  }
+  const roots = Array.from(allIds).filter((id) => !hasManager.has(id));
+  if (roots.length === 0 && allIds.size > 0) {
+    // Cycle-only edge set — pick the first id as a synthetic root.
+    roots.push(Array.from(allIds)[0]);
+  }
+  // BFS to assign depth.
+  const depth = new Map<string, number>();
+  const queue: string[] = [];
+  for (const r of roots) {
+    depth.set(r, 0);
+    queue.push(r);
+  }
+  while (queue.length > 0) {
+    const id = queue.shift() as string;
+    const d = depth.get(id) ?? 0;
+    for (const child of childrenOf.get(id) ?? []) {
+      if (!depth.has(child)) {
+        depth.set(child, d + 1);
+        queue.push(child);
+      }
+    }
+  }
+  // Ensure every node has a depth (orphans land on row 0).
+  for (const id of allIds) {
+    if (!depth.has(id)) depth.set(id, 0);
+  }
+  // Place by depth row, x = horizontal slot.
+  const byDepth = new Map<number, string[]>();
+  for (const [id, d] of depth) {
+    const arr = byDepth.get(d) ?? [];
+    arr.push(id);
+    byDepth.set(d, arr);
+  }
+  // Stable order within each row by canonical_name for determinism.
+  for (const arr of byDepth.values()) {
+    arr.sort((a, b) => {
+      const an = persons.get(a)?.canonical_name ?? a;
+      const bn = persons.get(b)?.canonical_name ?? b;
+      return an.localeCompare(bn);
+    });
+  }
+  const ROW_H = 150;
+  const COL_W = 220;
+  for (const [d, ids] of byDepth) {
+    const mid = (ids.length - 1) / 2;
+    ids.forEach((id, i) => {
+      layout.set(id, { x: (i - mid) * COL_W, y: d * ROW_H, depth: d });
+    });
+  }
+  return layout;
+}
+
+// Confidence band → stroke color (3-tier traffic light).
+function confidenceColor(conf: number): string {
+  if (conf >= 0.8) return "#10B981";
+  if (conf >= 0.5) return "#F59E0B";
+  return "#EF4444";
+}
+
+function relativeTime(iso: string | null): string {
+  if (!iso) return "unknown";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "unknown";
+  const days = Math.max(1, Math.round((Date.now() - t) / 86_400_000));
+  if (days < 30) return `${days}d ago`;
+  if (days < 365) return `${Math.round(days / 30)}mo ago`;
+  return `${Math.round(days / 365)}y ago`;
+}
+
+// ── Stub node — Decision 4: unknown nodes are rendered, not omitted. ────────
+const stubNodeStyle: React.CSSProperties = {
+  border: "2px dashed #9CA3AF",
+  background: "#F8F8F8",
+  fontStyle: "italic",
+  padding: "8px 12px",
+  borderRadius: 4,
+  position: "relative",
+  minWidth: 160,
+  maxWidth: 220,
+  fontSize: 11,
+  fontFamily: "Inter",
+  color: "#374151",
+};
+
+const StubNode = ({ data }: NodeProps) => {
+  const d = data as { label: string };
+  return (
+    <div style={stubNodeStyle}>
+      <span
+        style={{
+          position: "absolute",
+          top: -8,
+          right: -8,
+          background: "#9CA3AF",
+          color: "white",
+          borderRadius: "50%",
+          width: 18,
+          height: 18,
+          fontSize: 12,
+          textAlign: "center",
+          lineHeight: "18px",
+        }}
+        aria-label="Unresolved person"
+      >
+        ?
+      </span>
+      <div>{d.label}</div>
+      <div style={{ fontSize: 10, color: "#6B7280", marginTop: 2, fontStyle: "normal" }}>
+        Role inferred · Person not yet identified
+      </div>
+    </div>
+  );
+};
+
+const PersonNode = ({ data }: NodeProps) => {
+  const d = data as { label: string; isCenter?: boolean };
+  return (
+    <div
+      style={nodeStyle(d.isCenter ? "center" : "peer")}
+      title={d.label}
+    >
+      {d.label}
+    </div>
+  );
+};
+
+const orgNodeTypes: NodeTypes = {
+  stubNode: StubNode,
+  personNode: PersonNode,
+};
+
 const OrgChart = ({ prospect }: { prospect: OrgPerson & { industry?: string } }) => {
   const navigate = useNavigate();
-  const { peers, loading, source } = useOrgPeers(
+
+  // 1. Try v3 first — read from org_reporting_edges.
+  const { data: v3, loading: v3Loading } = useOrgV3(prospect);
+
+  // 2. v2 fallback path — used when org_reporting_edges has no edges for this
+  //    company. Will be deleted post-Phase-A.7 live run.
+  const { peers, loading: v2Loading, source } = useOrgPeers(
     prospect.company,
     prospect.industry,
     prospect.id,
   );
-  const { nodes, edges } = useMemo(
-    () => buildOrgFromData(prospect, peers),
-    [prospect, peers],
-  );
 
-  // Click a peer node → navigate to their /prospect/:id page. Supabase-sourced
-  // peers route directly by id. FastAPI-sourced peers don't exist in
-  // `public.prospects` yet; we upsert them first (so `/prospect/:id` resolves)
-  // and kick off scoring, then route.
+  // Confidence-threshold filter (Task 3-B). Hidden but not removed from state.
+  const [minConfidence, setMinConfidence] = useState<number>(0.45);
+  const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null);
+  const [selectedStubId, setSelectedStubId] = useState<string | null>(null);
+
+  const hasV3 = !!v3 && v3.edges.length > 0;
+  const loading = v3Loading || (!hasV3 && v2Loading);
+
+  // Build the v3 ReactFlow nodes/edges if we have v3 data.
+  const v3Graph = useMemo(() => {
+    if (!v3 || v3.edges.length === 0) return null;
+    const layout = layoutOrgTree(v3.edges, v3.persons);
+    const nodes: Node[] = [];
+    for (const [id, pos] of layout) {
+      const p = v3.persons.get(id);
+      const isStub = p?.is_unresolved_target === true;
+      const label = p
+        ? `${p.canonical_name}${p.current_title ? `\n${p.current_title}` : ""}`
+        : id;
+      nodes.push({
+        id,
+        position: { x: pos.x, y: pos.y },
+        type: isStub ? "stubNode" : "personNode",
+        data: {
+          label,
+          person: p,
+          is_unresolved_target: isStub,
+          canonical_name: p?.canonical_name ?? "",
+          current_title: p?.current_title ?? null,
+        },
+      });
+    }
+    const edges: Edge[] = v3.edges.map((e) => {
+      const conf = e.path_confidence ?? e.confidence ?? 0.5;
+      const opacity = Math.max(0.3, conf);
+      const strokeWidth = 1 + conf * 2.5;
+      const color = confidenceColor(conf);
+      const hidden = conf < minConfidence;
+      return {
+        id: e.id,
+        source: e.manager_id,
+        target: e.report_id,
+        data: {
+          confidence: e.confidence,
+          path_confidence: e.path_confidence,
+          inference_method: e.inference_method,
+          valid_from: e.valid_from,
+        },
+        style: hidden
+          ? { opacity: 0, pointerEvents: "none" as const }
+          : { stroke: color, strokeWidth, opacity },
+        // title attribute on edge path for native tooltip fallback —
+        // react-tooltip is not in deps; this still gives the operator
+        // source/confidence/recency info on hover.
+        label:
+          hoveredEdgeId === e.id
+            ? `Source: ${e.inference_method} · Confidence: ${Math.round(conf * 100)}% · Last updated: ${relativeTime(e.valid_from)}`
+            : undefined,
+        labelStyle: { fontSize: 10, fill: "hsl(var(--muted-foreground))" },
+      };
+    });
+    return { nodes, edges };
+  }, [v3, minConfidence, hoveredEdgeId]);
+
+  // Click a node → navigate to that prospect (real persons only).
+  // Stub nodes open the StubInspector panel instead.
   const [importing, setImporting] = useState<string | null>(null);
   const onNodeClick = async (_e: React.MouseEvent, node: Node) => {
+    if (hasV3) {
+      const data = node.data as {
+        is_unresolved_target?: boolean;
+        canonical_name?: string;
+        current_title?: string | null;
+      };
+      if (data.is_unresolved_target) {
+        setSelectedStubId(node.id);
+        return;
+      }
+      // Real person — navigate via id.
+      navigate(`/prospect/${node.id}`);
+      return;
+    }
+    // v2 fallback path (legacy peer nav + import).
     const data = node.data as { person?: OrgPerson; clickable?: boolean };
     const person = data.person;
     if (!data.clickable || !person) return;
@@ -635,7 +1104,6 @@ const OrgChart = ({ prospect }: { prospect: OrgPerson & { industry?: string } })
       navigate(`/prospect/${person.id}`);
       return;
     }
-    // FastAPI peer — import into Supabase, then navigate.
     if (importing) return;
     setImporting(person.id);
     try {
@@ -661,6 +1129,71 @@ const OrgChart = ({ prospect }: { prospect: OrgPerson & { industry?: string } })
       </div>
     );
   }
+
+  if (hasV3 && v3Graph) {
+    const selectedStub = selectedStubId
+      ? v3?.persons.get(selectedStubId)
+      : null;
+    return (
+      <div className="space-y-3">
+        <div className="border border-border relative" style={{ height: 520 }}>
+          <ReactFlow
+            nodes={v3Graph.nodes}
+            edges={v3Graph.edges}
+            nodeTypes={orgNodeTypes}
+            fitView
+            proOptions={{ hideAttribution: true }}
+            onNodeClick={onNodeClick}
+            onEdgeMouseEnter={(_e, edge) => setHoveredEdgeId(edge.id)}
+            onEdgeMouseLeave={() => setHoveredEdgeId(null)}
+            nodesDraggable={false}
+            nodesConnectable={false}
+          >
+            <Background color="hsl(var(--border))" gap={24} />
+            <Controls className="!bg-secondary !border-border" />
+          </ReactFlow>
+          <div className="absolute top-2 right-2 text-[10px] uppercase tracking-[0.16em] text-muted-foreground/60 bg-background/80 border border-border px-2 py-1">
+            source: org_reporting_edges
+          </div>
+        </div>
+        <div className="flex items-center gap-3 px-1">
+          <input
+            type="range"
+            min="0.40"
+            max="0.99"
+            step="0.01"
+            value={minConfidence}
+            onChange={(e) => setMinConfidence(parseFloat(e.target.value))}
+            className="flex-1 max-w-xs"
+            aria-label="Minimum edge confidence"
+          />
+          <span className="text-[11px] text-muted-foreground text-mono">
+            Min confidence: {Math.round(minConfidence * 100)}%
+          </span>
+          <span className="text-[11px] text-muted-foreground">
+            · {v3Graph.edges.filter((e) => e.style && (e.style as { opacity?: number }).opacity !== 0).length}/{v3Graph.edges.length} edges visible
+          </span>
+        </div>
+        {selectedStub && (
+          <StubInspector
+            canonicalName={selectedStub.canonical_name}
+            currentTitle={selectedStub.current_title}
+            inferenceMethod={
+              v3?.edges.find(
+                (e) =>
+                  e.manager_id === selectedStubId ||
+                  e.report_id === selectedStubId,
+              )?.inference_method ?? "inferred"
+            }
+            companyName={prospect.company ?? ""}
+            onClose={() => setSelectedStubId(null)}
+          />
+        )}
+      </div>
+    );
+  }
+
+  // ─── v2 fallback path (used when org_reporting_edges has no edges) ───────
   if (peers.length === 0) {
     return (
       <div className="border border-border h-[520px] flex items-center justify-center text-sm text-muted-foreground text-center px-8">
@@ -669,6 +1202,7 @@ const OrgChart = ({ prospect }: { prospect: OrgPerson & { industry?: string } })
       </div>
     );
   }
+  const { nodes, edges } = buildOrgFromData(prospect, peers);
   return (
     <div className="border border-border relative" style={{ height: 520 }}>
       <ReactFlow

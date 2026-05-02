@@ -12,6 +12,7 @@
  *   VITE_API_URL — backend base, defaults to http://localhost:8000
  */
 import type { GraphEdge, GraphNode } from "./graph";
+import { getCredenceHeaders } from "./credenceHeaders";
 
 // ─── Public types (unchanged — UI imports these) ─────────────────────────────
 
@@ -170,7 +171,10 @@ export async function runAgent(
   try {
     resp = await fetch(`${API_URL}/chat`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      // `getCredenceHeaders()` attaches `X-Credence-Demo: true` in demo mode
+      // (Wave 6 M5) and will attach `Authorization: Bearer <jwt>` once M3
+      // wires authenticated live mode.
+      headers: { "content-type": "application/json", ...getCredenceHeaders() },
       body: JSON.stringify({
         messages: toServerMessages(messages),
         snapshot: buildSnapshot(ctx),

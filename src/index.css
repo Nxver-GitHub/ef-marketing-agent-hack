@@ -79,6 +79,17 @@
     --edge-past-empl:    200 70% 50%;
     --edge-education:     90 55% 42%;
     --edge-vertical:     215 14% 65%;
+    /* Hidden-connection edges (v3 warm-path engine). */
+    --edge-patent:        50 75% 50%;
+    --edge-coauthor:     178 60% 42%;
+    --edge-conference:   295 55% 55%;
+    --edge-standards:     12 70% 50%;
+    /* Education-cohort edges (V3_PT2.md L427-430). HSL conversions of
+     * #7c3aed / #2563eb / #0891b2 / #64748b for theme-compat. */
+    --edge-same-mba-cohort:        258 90% 66%;  /* violet */
+    --edge-same-phd-program:       221 83% 53%;  /* blue */
+    --edge-executive-education:    189 94% 36%;  /* cyan */
+    --edge-same-undergrad-cohort:  215 14% 47%;  /* slate */
 
     /* Score buckets */
     --score-strong:    142 71% 45%;
@@ -110,6 +121,16 @@
     --edge-past-empl:    200 85% 68%;
     --edge-education:     90 75% 60%;
     --edge-vertical:     215 35% 76%;
+    /* Hidden-connection edges (v3 warm-path engine). */
+    --edge-patent:        50 95% 65%;
+    --edge-coauthor:     178 75% 60%;
+    --edge-conference:   295 80% 72%;
+    --edge-standards:     12 90% 65%;
+    /* Education-cohort edges (V3_PT2.md L427-430), lifted L for dark canvas. */
+    --edge-same-mba-cohort:        258 90% 75%;  /* violet */
+    --edge-same-phd-program:       221 83% 68%;  /* blue */
+    --edge-executive-education:    189 80% 55%;  /* cyan */
+    --edge-same-undergrad-cohort:  215 22% 65%;  /* slate */
 
     /* Score buckets — lifted L for dark canvas */
     --score-strong:    142 71% 60%;

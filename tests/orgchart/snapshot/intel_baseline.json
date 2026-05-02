@@ -1,0 +1,35 @@
+{
+  "_documentation": {
+    "purpose": "Frozen 'known good' state of the Intel org chart, captured 2026-05-01 after the full-fleet pipeline ran. Used by test_snapshot_diff.py to detect unexpected drift.",
+    "rebaseline_protocol": "If a deliberate change to the inference algorithm causes drift, re-capture this file using the same query as conftest's capture script and update _documentation.captured_at + _documentation.captured_after. Then bump the tolerance bands in test_snapshot_diff.py if necessary.",
+    "captured_at": "2026-05-01",
+    "captured_after": "Step A re-run (full-fleet pipeline post Step B backfill); 1,065 clusters / 7,094 edges total across all tenants.",
+    "tolerance_policy": "Asserted as ranges, not exact equality. Intel's chart will drift slightly each pipeline run as new persons/employment_periods are added. The test enforces floor-and-ceiling bands documented in test_snapshot_diff.py."
+  },
+  "company_id": "e6c126a6-5a70-4968-b37a-3648292e60ab",
+  "company_name": "intel",
+  "cluster_count": 9,
+  "cluster_member_count": 346,
+  "ic_track_count": 26,
+  "edges_count": 250,
+  "clusters": [
+    {"functional_domain": "hardware_engineering", "sub_domain": null, "member_count": 128},
+    {"functional_domain": "sales_marketing",      "sub_domain": null, "member_count": 55},
+    {"functional_domain": "software_engineering", "sub_domain": null, "member_count": 55},
+    {"functional_domain": "manufacturing_ops",    "sub_domain": null, "member_count": 51},
+    {"functional_domain": "general_management",   "sub_domain": null, "member_count": 22},
+    {"functional_domain": "product_management",   "sub_domain": null, "member_count": 13},
+    {"functional_domain": "finance_legal",        "sub_domain": null, "member_count": 9},
+    {"functional_domain": "people_ops",           "sub_domain": null, "member_count": 6},
+    {"functional_domain": "research",             "sub_domain": null, "member_count": 6}
+  ],
+  "confidence_stats": {
+    "mean_confidence": 0.758,
+    "mean_path_confidence": 0.452,
+    "min_confidence": 0.50,
+    "max_confidence": 0.78
+  },
+  "inference_method_breakdown": {
+    "implicit_scoring": 251
+  }
+}

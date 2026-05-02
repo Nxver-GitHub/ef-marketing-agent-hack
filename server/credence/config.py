@@ -25,9 +25,27 @@ class Settings(BaseSettings):
     # for write paths and complex joins.
     database_url: str = Field(..., alias="DATABASE_URL")
 
+    # Optional transaction-pooler DSN (Supabase port 6543).
+    # When set, `credence.db.get_pool()` prefers this over `database_url`. The
+    # transaction pooler doesn't enforce the session-pooler MaxClients ceiling
+    # that's been tripping under heavy parallel-agent load, and asyncpg's
+    # `statement_cache_size=0` already makes us pgbouncer-transaction-mode safe.
+    # Leave unset locally; set in deployments where multiple workers contend
+    # for the same Supabase project.
+    database_url_transaction_pooler: str | None = Field(
+        default=None, alias="DATABASE_URL_TRANSACTION_POOLER"
+    )
+
     # Anthropic Claude. Server-side only, never shipped to browser.
     anthropic_api_key: str = Field(..., alias="ANTHROPIC_API_KEY")
     anthropic_model: str = Field("claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
+
+    # Supabase Auth — used by `credence.auth` (Wave 6 M2) to verify the
+    # `Authorization: Bearer <jwt>` header. Project Settings → API → JWT
+    # Secret in the Supabase dashboard; HS256 by default.
+    supabase_jwt_secret: str = Field(..., alias="SUPABASE_JWT_SECRET")
+    supabase_jwt_audience: str = Field("authenticated", alias="SUPABASE_JWT_AUDIENCE")
+    supabase_jwt_algorithm: str = Field("HS256", alias="SUPABASE_JWT_ALGORITHM")
 
     # CORS origins for /chat etc. Local dev only for v0.
     cors_origins: list[str] = Field(

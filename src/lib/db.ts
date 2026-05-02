@@ -11,6 +11,9 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { supabase, HAS_REAL_SUPABASE } from "./supabase";
+import { getCredenceHeaders } from "./credenceHeaders";
+import { isDemoMode } from "@/store/graphStore";
+import { DEMO_PROSPECTS } from "./demoData";
 import {
   store,
   useProspects as mockProspects,
@@ -21,7 +24,10 @@ import {
   useWeights as mockWeights,
   useScoresFor as mockScoresFor,
 } from "./mockStore";
+import type { Prospect, Signal, Score, SignalWeight, ScoringRun } from "./mockStore";
+import type { PersonConnectionRecord } from "./graph";
 export type { Prospect, Signal, Score, SignalWeight, ScoringRun } from "./mockStore";
+export type { PersonConnectionRecord } from "./graph";
 
 // ─── Type normalizers ────────────────────────────────────────────────────────
 // Supabase rows use `id` (UUID string) and ISO timestamps.
@@ -546,7 +552,10 @@ async function supaRunScoring(prospect_id: string): Promise<void> {
     try {
       const resp = await fetch(`${API_BASE}/validate`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        // `getCredenceHeaders()` attaches `X-Credence-Demo: true` in demo mode
+        // (Wave 6 M5) and will attach `Authorization: Bearer <jwt>` once M3
+        // wires authenticated live mode.
+        headers: { "Content-Type": "application/json", ...getCredenceHeaders() },
         body: JSON.stringify({
           name: prospect.name,
           industry: prospect.industry,
@@ -695,17 +704,243 @@ async function supaComputeScores(prospectIds: string[]) {
 }
 
 // ─── Exported unified hooks ───────────────────────────────────────────────────
+//
+// Three-way dispatch on demo / real-Supabase / mock:
+//   1. `?demo=true` → return canned data from `demoData.ts` (no network)
+//   2. real Supabase env configured → hit the live REST API
+//   3. otherwise → in-memory mock store
+//
+// The demo-mode short-circuit (per CONTRACTS.md Contract 5: "Demo mode
+// performs zero Supabase queries") must be checked BEFORE the
+// `HAS_REAL_SUPABASE` flag, because Supabase env vars are typically
+// configured in real deploys even when a viewer flips `?demo=true`.
 
-export const useProspects = HAS_REAL_SUPABASE ? useSupaProspects : mockProspects;
-export const useProspect = HAS_REAL_SUPABASE ? useSupaProspect : mockProspect;
-export const useSignalsFor = HAS_REAL_SUPABASE ? useSupaSignalsFor : mockSignalsFor;
-export const useSignalsForMany = HAS_REAL_SUPABASE ? useSupaSignalsForMany : useMockSignalsForMany;
+// Demo-mode stand-ins. Hooks must remain callable (React rules-of-hooks
+// don't allow conditional invocation), so we wrap the constants in
+// minimal hooks that always run but return stable references.
+const useDemoProspects = (): Prospect[] => useMemo(() => [...DEMO_PROSPECTS], []);
+const useDemoProspect = (id: string | null | undefined): Prospect | undefined => {
+  return useMemo(
+    () => (id ? DEMO_PROSPECTS.find((p) => p._id === id) : undefined),
+    [id],
+  );
+};
+const _emptySignalArray: Signal[] = [];
+const _emptySignalsByProspect: Record<string, Signal[]> = {};
+const _emptyScoresByProspect: Record<string, Score> = {};
+const _emptyWeightsArray: SignalWeight[] = [];
+const _emptyConnectionsByProspect: Record<string, PersonConnectionRecord[]> = {};
+const useDemoSignalsFor = (_prospectId: string | null | undefined): Signal[] => _emptySignalArray;
+const useDemoSignalsForMany = (_ids: string[]): Record<string, Signal[]> => _emptySignalsByProspect;
+const useDemoLatestScore = (_prospectId: string | null | undefined): Score | undefined => undefined;
+const useDemoLatestRun = (_prospectId: string | null | undefined): ScoringRun | undefined => undefined;
+const useDemoWeights = (): SignalWeight[] => _emptyWeightsArray;
+const useDemoScoresFor = (_ids: string[]): Record<string, Score> => _emptyScoresByProspect;
+const useDemoPersonConnections = (
+  _ids: string[],
+): Record<string, PersonConnectionRecord[]> => _emptyConnectionsByProspect;
+const useMockPersonConnections = (
+  _ids: string[],
+): Record<string, PersonConnectionRecord[]> => _emptyConnectionsByProspect;
+// Supabase row shape: person_connections embedded with both endpoints'
+// persons rows (PostgREST FK-embed pattern). The `!person_a_id` /
+// `!person_b_id` disambiguators tell PostgREST which FK to follow — both
+// FKs target persons, so the alias is required.
+type SupaPersonConnectionRow = {
+  id: string;
+  person_a_id: string;
+  person_b_id: string;
+  connection_type: string;
+  computed_strength: number;
+  base_strength: number;
+  recency_factor: number;
+  frequency_factor: number;
+  corroboration_factor: number;
+  last_active_year: number | null;
+  corroboration_count: number;
+  source_type_count: number;
+  evidence_ids: string[];
+  person_a: { source_prospect_id: string | null } | null;
+  person_b: { source_prospect_id: string | null } | null;
+};
+
+// Single full-table fetch + cache. Mirror useAllSignalsCached / useAllScoresCached.
+// Once SwiftElk's career_overlap_clustering ramps to all 51k+ pairs, this
+// table grows but stays bounded — current size 523, expected steady-state
+// 5-30k. PAGE-size pagination handles it cleanly.
+function useAllPersonConnectionsCached() {
+  const { data } = useQuery({
+    queryKey: ["person_connections", "all", USE_SNAPSHOT ? "snapshot" : "live"],
+    enabled: HAS_REAL_SUPABASE,
+    staleTime: USE_SNAPSHOT ? Infinity : BULK_STALE_MS,
+    queryFn: async () => {
+      if (USE_SNAPSHOT) return [] as SupaPersonConnectionRow[];
+      return fetchAllRows<SupaPersonConnectionRow>(() =>
+        supabase!
+          .from("person_connections")
+          .select(
+            "*,person_a:persons!person_a_id(source_prospect_id),person_b:persons!person_b_id(source_prospect_id)",
+          )
+          .order("computed_strength", { ascending: false }),
+      );
+    },
+  });
+  return data ?? EMPTY_ARRAY;
+}
+
+// Companion: full table of connection_evidence (~5-30k expected steady-
+// state, ~3k current). Indexed by id so the per-prospect-connection
+// merge below can pull rich payload (company_name, overlap years, etc.)
+// keyed off person_connections.evidence_ids[0]. Without this join, the
+// sixth pass renders edges with synthesized strength fields only, and
+// warmPaths.ts's templates fall back to generic "shared tenure" text.
+type SupaConnectionEvidenceRow = {
+  id: string;
+  source_type: string;
+  // SwiftElk's career_overlap_clustering currently writes structured_value
+  // double-encoded (jsonb-typed string containing JSON object) — see msg
+  // 191 follow-up. Tolerate both shapes here so the FE doesn't depend on
+  // a server-side fix landing first.
+  structured_value: Record<string, unknown> | string | null;
+};
+function useAllConnectionEvidenceCached() {
+  const { data } = useQuery({
+    queryKey: ["connection_evidence", "all", USE_SNAPSHOT ? "snapshot" : "live"],
+    enabled: HAS_REAL_SUPABASE,
+    staleTime: USE_SNAPSHOT ? Infinity : BULK_STALE_MS,
+    queryFn: async () => {
+      if (USE_SNAPSHOT) return [] as SupaConnectionEvidenceRow[];
+      return fetchAllRows<SupaConnectionEvidenceRow>(() =>
+        supabase!
+          .from("connection_evidence")
+          .select("id,source_type,structured_value"),
+      );
+    },
+  });
+  return data ?? EMPTY_ARRAY;
+}
+
+// SwiftElk's W9 read-cache (msg 204): denormalized top-K-per-prospect view
+// with partner display fields + pre-merged evidence. Read path is now a
+// single bounded query keyed on visible prospect_ids — no full-table scan
+// of person_connections, no JS-side persons-JOIN. ~10,000× faster
+// (43-page paginated → 2.2ms top-K fetch).
+type SupaProspectWarmPathRow = {
+  prospect_id: string;
+  rank: number;
+  partner_prospect_id: string;
+  connection_type: string;
+  computed_strength: number;
+  evidence: Record<string, unknown> | string | null;
+  partner_name: string | null;
+  partner_company: string | null;
+  partner_title: string | null;
+};
+
+function useSupaPersonConnections(
+  ids: string[],
+): Record<string, PersonConnectionRecord[]> {
+  const idsKey = ids.join(",");
+  const { data } = useQuery({
+    queryKey: ["prospect_warm_paths", idsKey, USE_SNAPSHOT ? "snapshot" : "live"],
+    enabled: HAS_REAL_SUPABASE && ids.length > 0,
+    staleTime: USE_SNAPSHOT ? Infinity : BULK_STALE_MS,
+    queryFn: async () => {
+      if (USE_SNAPSHOT || !ids.length) return [] as SupaProspectWarmPathRow[];
+      // PostgREST .in() caps URL length at ~7-8k chars. UUIDs are 36 chars
+      // each + comma, so ~200 ids per request. Chunk if needed.
+      const CHUNK = 200;
+      const out: SupaProspectWarmPathRow[] = [];
+      for (let i = 0; i < ids.length; i += CHUNK) {
+        const chunk = ids.slice(i, i + CHUNK);
+        const { data, error } = await supabase!
+          .from("prospect_warm_paths")
+          .select(
+            "prospect_id,rank,partner_prospect_id,connection_type,computed_strength,evidence,partner_name,partner_company,partner_title",
+          )
+          .in("prospect_id", chunk)
+          .order("rank", { ascending: true });
+        if (error) {
+          console.error("[db] prospect_warm_paths fetch error:", error);
+          continue;
+        }
+        if (data) out.push(...(data as SupaProspectWarmPathRow[]));
+      }
+      return out;
+    },
+  });
+
+  return useMemo(() => {
+    const rows = (data ?? []) as SupaProspectWarmPathRow[];
+    if (!ids.length || !rows.length) return _emptyConnectionsByProspect;
+    const out: Record<string, PersonConnectionRecord[]> = {};
+    for (const r of rows) {
+      // evidence may be a parsed object, a JSON-stringified blob (legacy
+      // double-encode), or null. Tolerate all.
+      let sv: Record<string, unknown> = {};
+      const raw = r.evidence;
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        sv = { ...raw };
+      } else if (typeof raw === "string" && raw.length > 0) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            sv = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      // Bridge server-side keys to evidenceFromSignal's expected shape.
+      if (sv.overlap_start !== undefined && sv.overlap_start_year === undefined) {
+        sv.overlap_start_year = sv.overlap_start;
+      }
+      if (sv.overlap_end !== undefined && sv.overlap_end_year === undefined) {
+        sv.overlap_end_year = sv.overlap_end;
+      }
+      const rec: PersonConnectionRecord = {
+        connected_prospect_id: r.partner_prospect_id,
+        connection_type: r.connection_type,
+        computed_strength: Number(r.computed_strength) || 0,
+        structured_value: sv,
+      };
+      (out[r.prospect_id] ??= []).push(rec);
+    }
+    return out;
+  }, [ids, data]);
+}
+
+const _DEMO = isDemoMode();
+
+export const useProspects = _DEMO
+  ? useDemoProspects
+  : (HAS_REAL_SUPABASE ? useSupaProspects : mockProspects);
+export const useProspect = _DEMO
+  ? useDemoProspect
+  : (HAS_REAL_SUPABASE ? useSupaProspect : mockProspect);
+export const useSignalsFor = _DEMO
+  ? useDemoSignalsFor
+  : (HAS_REAL_SUPABASE ? useSupaSignalsFor : mockSignalsFor);
+export const useSignalsForMany = _DEMO
+  ? useDemoSignalsForMany
+  : (HAS_REAL_SUPABASE ? useSupaSignalsForMany : useMockSignalsForMany);
 // Signal-value normalizer exposed for the Discover row-enrichment UX.
 export { extractSignalValue };
-export const useLatestScore = HAS_REAL_SUPABASE ? useSupaLatestScore : mockLatestScore;
-export const useLatestRun = HAS_REAL_SUPABASE ? useSupaLatestRun : mockLatestRun;
-export const useWeights = HAS_REAL_SUPABASE ? useSupaWeights : mockWeights;
-export const useScoresFor = HAS_REAL_SUPABASE ? useSupaScoresFor : mockScoresFor;
+export const useLatestScore = _DEMO
+  ? useDemoLatestScore
+  : (HAS_REAL_SUPABASE ? useSupaLatestScore : mockLatestScore);
+export const useLatestRun = _DEMO
+  ? useDemoLatestRun
+  : (HAS_REAL_SUPABASE ? useSupaLatestRun : mockLatestRun);
+export const useWeights = _DEMO
+  ? useDemoWeights
+  : (HAS_REAL_SUPABASE ? useSupaWeights : mockWeights);
+export const useScoresFor = _DEMO
+  ? useDemoScoresFor
+  : (HAS_REAL_SUPABASE ? useSupaScoresFor : mockScoresFor);
+export const usePersonConnections = _DEMO
+  ? useDemoPersonConnections
+  : (HAS_REAL_SUPABASE ? useSupaPersonConnections : useMockPersonConnections);
 
 // ─── Exported unified mutations ───────────────────────────────────────────────
 

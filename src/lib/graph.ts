@@ -9,6 +9,15 @@
  */
 import type { Prospect, Score, Signal } from "./mockStore";
 import { GENERATED_COMPANY_META } from "./company-meta.generated";
+import {
+  STRENGTH_TABLE,
+  DECAY_RATES,
+  type ConnectionType,
+} from "./strength";
+import {
+  evidenceFromSignal,
+  RECOGNIZED_CONNECTION_SIGNAL_TYPES,
+} from "./evidenceFromSignal";
 
 // ─── Node + edge schema ──────────────────────────────────────────────────────
 
@@ -31,7 +40,23 @@ export type EdgeKind =
   | "education"
   | "scope_signal"
   | "vertical"
-  | "evidence_cited";
+  | "evidence_cited"
+  // Hidden-connection edges (CLAUDE.md v3 §"Current State" / §"What is missing").
+  // Sourced from public records (USPTO, Semantic Scholar, conference programs,
+  // standards rosters) — the warm-path engine reads these with the highest
+  // base strengths in STRENGTH_TABLE. Renderers + filters fall through to the
+  // EdgeKind exhaustive switches, so adding here gates downstream wiring.
+  | "patent_co_inventor"
+  | "academic_co_author"
+  | "conference_co_presenter"
+  | "standards_committee"
+  // Education-cohort kinds (V3_PT2.md L376-381). Surfaced from PDL
+  // education[] data. Same EDGE_CONFIGS pattern; baseStrength + decayRate
+  // delegated to STRENGTH_TABLE / DECAY_RATES via warmFromTable().
+  | "same_mba_cohort"
+  | "same_phd_program"
+  | "executive_education"
+  | "same_undergrad_cohort";
 
 // `color` is pre-baked per node/edge when a `theme` is passed to buildGraph().
 // Render hot-paths (ForceGraph2D linkColor/nodeColor accessors) read it as a
@@ -69,17 +94,391 @@ export type GraphEdge = {
   kind: EdgeKind;
   color?: string;
   width?: number;
+  /**
+   * Optional evidence backing this edge. Shapes mirror the
+   * `structured_value` payloads in CONTRACTS.md Contract 1 §"structured_value
+   * shapes". Populated when an extractor (Track J) writes a real signal;
+   * absent for v2 mock graph data and the placeholder demo edges.
+   *
+   * Consumers (warmPaths.ts explanation/opener generators) MUST tolerate
+   * `evidence === undefined` and fall back to generic strings — never
+   * fabricate values to fill missing fields (CLAUDE.md "Common Mistakes" #6).
+   */
+  evidence?: EdgeEvidence | null;
 };
+
+// ─── EdgeEvidence — discriminated union per Contract 1 ──────────────────────
+//
+// Each variant's `kind` matches both the CONTRACTS.md Contract 1 `signal_type`
+// and the EdgeKind. When extractors land (J.4 USPTO, J.5 Scholar, future
+// standards/conference scrapers), they marshal Contract 1 `structured_value`
+// dicts into these shapes and attach them to the GraphEdge they emit.
+//
+// Field naming: camelCase here (frontend convention). When the bridge from
+// the backend's snake_case structured_value to this shape is wired (a future
+// data-loader concern), it can use a small mapping function — kept out of
+// this type so the type itself stays pure.
+
+export interface PatentCoInventorEvidence {
+  readonly kind: "patent_co_inventor";
+  /** US patent number, e.g. "10,234,567". */
+  readonly patentNumber: string;
+  /** Patent title from the USPTO record. */
+  readonly patentTitle: string;
+  /** ISO date string (YYYY-MM-DD). */
+  readonly filingDate: string;
+  /** ISO date string; null when not yet granted. */
+  readonly grantDate?: string | null;
+  /** Assignee organization (the company that holds the patent). */
+  readonly assignee: string;
+  /** Public USPTO URL for citation. */
+  readonly usptoUrl?: string | null;
+}
+
+export interface AcademicCoAuthorEvidence {
+  readonly kind: "academic_co_author";
+  readonly paperTitle: string;
+  /** Venue (conference / journal name). */
+  readonly venue: string;
+  readonly year: number;
+  /** Citation count at time of extraction. */
+  readonly citationCount: number;
+  readonly semanticScholarId?: string | null;
+  readonly doi?: string | null;
+}
+
+export interface ConferenceCoPresenterEvidence {
+  readonly kind: "conference_co_presenter";
+  /** Event name, e.g., "SPIE Advanced Lithography 2024". */
+  readonly event: string;
+  readonly year: number;
+}
+
+export interface StandardsCommitteeEvidence {
+  readonly kind: "standards_committee";
+  /** Committee name, e.g., "JEDEC JC-42.4 / Memory Module Subcommittee". */
+  readonly committee: string;
+  /** Active years window, e.g., "2018-2022" (free-form for now). */
+  readonly years: string;
+}
+
+export interface CareerOverlapEvidence {
+  /** Catches all three career_overlap_* sub-types. The connection_type lives
+   *  on the GraphEdge.kind via `colleague` / `past_employer` already; this
+   *  evidence shape carries the per-overlap details. */
+  readonly kind: "career_overlap";
+  readonly companyName: string;
+  readonly overlapStartYear: number;
+  readonly overlapEndYear: number;
+  readonly overlapYears: number;
+  readonly teamA?: string | null;
+  readonly teamB?: string | null;
+  readonly domainA?: string | null;
+  readonly domainB?: string | null;
+  readonly seniorityGap?: number | null;
+}
+
+export interface EducationCohortEvidence {
+  /** Catches all 4 education-cohort sub-types
+   *  (same_mba_cohort, same_phd_program, executive_education,
+   *  same_undergrad_cohort). The specific kind is on GraphEdge.kind. */
+  readonly kind: "education_cohort";
+  readonly institution: string;
+  readonly program?: string | null;
+  readonly overlapStartYear?: number | null;
+  readonly overlapEndYear?: number | null;
+}
+
+export type EdgeEvidence =
+  | PatentCoInventorEvidence
+  | AcademicCoAuthorEvidence
+  | ConferenceCoPresenterEvidence
+  | StandardsCommitteeEvidence
+  | CareerOverlapEvidence
+  | EducationCohortEvidence;
 
 export interface ThemeTokens {
   nodeColors: Record<NodeKind, string>;
   edgeColors: Record<EdgeKind, string>;
 }
 
+// ─── EDGE_CONFIGS — single source of truth for edge metadata ──────────────────
+//
+// Per CONTRACTS.md Contract 3 §"Single source of truth": every consumer of
+// EdgeKind metadata (display labels, CSS variable lookups, default visibility,
+// strength model wiring) reads from this one record. Adding a new edge kind
+// requires four updates IN THIS ORDER:
+//   1. Add to the `EdgeKind` union above
+//   2. Add a row to `EDGE_CONFIGS` here
+//   3. Add a `--edge-<slug>` CSS variable in `src/index.css` (both `:root` and `.dark`)
+//   4. Done — TopBar pills, canvas labels, NodeInspector pills, warmPaths.ts
+//      strength lookups all derive from this record. No other files need edits.
+//
+// `connectionType` maps the edge to a key in strength.ts's `STRENGTH_TABLE` so
+// the warm-path BFS can look up `baseStrength` and `decayRate` without
+// duplicating the values here. Structural edges (works_at, located_in, etc.)
+// have `connectionType: null` and are excluded from warm-path traversal.
+
+export interface EdgeConfig {
+  readonly kind: EdgeKind;
+  /** Long-form label, used in NodeInspector pills + Discover legend block. */
+  readonly displayLabel: string;
+  /** Compact uppercase label, used for canvas mid-edge tags + TopBar pills. */
+  readonly displayLabelShort: string;
+  /** Slug used to derive the CSS variable name (`--edge-<slug>`). */
+  readonly slug: string;
+  /** CSS custom property name; must match a definition in src/index.css. */
+  readonly cssVarName: string;
+  /** Initial visibility in the TopBar filter. */
+  readonly defaultVisible: boolean;
+  /** Whether warmPaths.ts should traverse this edge by default (baseStrength >= 0.50). */
+  readonly isWarmByDefault: boolean;
+  /** Mapping into strength.ts. Null for structural edges; warm kinds map to a real key. */
+  readonly connectionType: ConnectionType | null;
+  /** Base strength from STRENGTH_TABLE; 0 for structural edges. */
+  readonly baseStrength: number;
+  /** Decay rate per year inactive from DECAY_RATES; 0 for structural edges. */
+  readonly decayRate: number;
+  /** Suppress canvas mid-edge labels (e.g., colleague would carpet the graph). */
+  readonly suppressCanvasLabel: boolean;
+}
+
+function warmFromTable(type: ConnectionType, suppressCanvasLabel = false) {
+  const baseStrength = STRENGTH_TABLE[type];
+  const decayRate = DECAY_RATES[type];
+  return {
+    isWarmByDefault: baseStrength >= 0.5,
+    connectionType: type,
+    baseStrength,
+    decayRate,
+    suppressCanvasLabel,
+  } as const;
+}
+
+const STRUCTURAL = {
+  isWarmByDefault: false,
+  connectionType: null,
+  baseStrength: 0,
+  decayRate: 0,
+  suppressCanvasLabel: false,
+} as const;
+
+export const EDGE_CONFIGS: Readonly<Record<EdgeKind, EdgeConfig>> = Object.freeze({
+  works_at: {
+    kind: "works_at",
+    displayLabel: "Employer",
+    displayLabelShort: "WORKS AT",
+    slug: "employer",
+    cssVarName: "--edge-employer",
+    defaultVisible: true,
+    ...STRUCTURAL,
+  },
+  colleague: {
+    kind: "colleague",
+    displayLabel: "Colleague",
+    displayLabelShort: "COLLEAGUE",
+    slug: "employer", // borrows employer color; no own CSS var
+    cssVarName: "--edge-employer",
+    defaultVisible: true,
+    // Suppressed on canvas: would carpet the layout with redundant tags
+    // between every pair of co-workers.
+    ...warmFromTable("career_overlap_same_team", true),
+  },
+  located_in: {
+    kind: "located_in",
+    displayLabel: "Location",
+    displayLabelShort: "LOCATED IN",
+    slug: "location",
+    cssVarName: "--edge-location",
+    defaultVisible: true,
+    ...STRUCTURAL,
+  },
+  reports_to: {
+    kind: "reports_to",
+    displayLabel: "Reports",
+    displayLabelShort: "REPORTS",
+    slug: "reports",
+    cssVarName: "--edge-reports",
+    defaultVisible: true,
+    ...STRUCTURAL,
+  },
+  past_employer: {
+    kind: "past_employer",
+    displayLabel: "Past empl.",
+    displayLabelShort: "EX",
+    slug: "past-empl",
+    cssVarName: "--edge-past-empl",
+    defaultVisible: true,
+    ...warmFromTable("career_overlap_general"),
+  },
+  partnership: {
+    kind: "partnership",
+    displayLabel: "Partnership",
+    displayLabelShort: "PARTNER",
+    slug: "partnership",
+    cssVarName: "--edge-partnership",
+    defaultVisible: true,
+    ...STRUCTURAL,
+  },
+  education: {
+    kind: "education",
+    displayLabel: "Education",
+    displayLabelShort: "EDUCATED AT",
+    slug: "education",
+    cssVarName: "--edge-education",
+    defaultVisible: true,
+    // alumni_network's baseStrength (0.25) is below the warm threshold, so
+    // warmPaths.ts won't traverse education edges by default. Still rendered.
+    ...warmFromTable("alumni_network"),
+  },
+  scope_signal: {
+    kind: "scope_signal",
+    displayLabel: "Scope",
+    displayLabelShort: "SCOPE",
+    slug: "scope",
+    cssVarName: "--edge-scope",
+    defaultVisible: true,
+    ...STRUCTURAL,
+  },
+  vertical: {
+    kind: "vertical",
+    displayLabel: "Vertical",
+    displayLabelShort: "VERTICAL",
+    slug: "vertical",
+    cssVarName: "--edge-vertical",
+    defaultVisible: true,
+    ...STRUCTURAL,
+  },
+  evidence_cited: {
+    kind: "evidence_cited",
+    displayLabel: "Evidence",
+    displayLabelShort: "EVIDENCE",
+    slug: "evidence",
+    cssVarName: "--edge-evidence",
+    defaultVisible: true,
+    ...STRUCTURAL,
+  },
+  // Hidden-connection edges (v3 warm-path engine).
+  patent_co_inventor: {
+    kind: "patent_co_inventor",
+    displayLabel: "Patent",
+    displayLabelShort: "PATENT",
+    slug: "patent",
+    cssVarName: "--edge-patent",
+    defaultVisible: true,
+    ...warmFromTable("patent_co_inventor"),
+  },
+  academic_co_author: {
+    kind: "academic_co_author",
+    displayLabel: "Co-author",
+    displayLabelShort: "CO-AUTHOR",
+    slug: "coauthor",
+    cssVarName: "--edge-coauthor",
+    defaultVisible: true,
+    // Default to the single-paper variant; multi-paper detection happens at
+    // edge-write time when corroboration count is known.
+    ...warmFromTable("academic_co_author_single"),
+  },
+  standards_committee: {
+    kind: "standards_committee",
+    displayLabel: "Standards",
+    displayLabelShort: "STANDARDS",
+    slug: "standards",
+    cssVarName: "--edge-standards",
+    defaultVisible: true,
+    ...warmFromTable("standards_committee_peer"),
+  },
+  conference_co_presenter: {
+    kind: "conference_co_presenter",
+    displayLabel: "Conference",
+    displayLabelShort: "CONFERENCE",
+    slug: "conference",
+    cssVarName: "--edge-conference",
+    defaultVisible: true,
+    ...warmFromTable("conference_co_presenter"),
+  },
+  // ── Education-cohort kinds (V3_PT2.md §"New Edge Kinds") ─────────────────
+  same_mba_cohort: {
+    kind: "same_mba_cohort",
+    displayLabel: "MBA Cohort",
+    displayLabelShort: "MBA",
+    slug: "same-mba-cohort",
+    cssVarName: "--edge-same-mba-cohort",
+    defaultVisible: true,
+    ...warmFromTable("same_mba_cohort"),
+  },
+  same_phd_program: {
+    kind: "same_phd_program",
+    displayLabel: "PhD Program",
+    displayLabelShort: "PHD",
+    slug: "same-phd-program",
+    cssVarName: "--edge-same-phd-program",
+    defaultVisible: true,
+    ...warmFromTable("same_phd_program"),
+  },
+  executive_education: {
+    kind: "executive_education",
+    displayLabel: "Executive Education",
+    displayLabelShort: "EXEC ED",
+    slug: "executive-education",
+    cssVarName: "--edge-executive-education",
+    defaultVisible: true,
+    ...warmFromTable("executive_education"),
+  },
+  same_undergrad_cohort: {
+    kind: "same_undergrad_cohort",
+    displayLabel: "Undergrad Cohort",
+    displayLabelShort: "UNDERGRAD",
+    slug: "same-undergrad-cohort",
+    cssVarName: "--edge-same-undergrad-cohort",
+    defaultVisible: true,
+    ...warmFromTable("same_undergrad_cohort"),
+    // Promoted to warm-by-default 2026-04-30. The earlier V3_PT2.md L421
+    // override held undergrad cohorts back pending school-size + same-major
+    // refinement, but the bulk_education_signals output (283 cohort edges
+    // shipped, 204 of which are undergrad) is the dominant cohort source
+    // today. Without this flip, every Hock-Tan-class node ("WARM PATHS: 0")
+    // looks edgeless to warm-path BFS even though the data is there.
+    // baseStrength remains 0.62 — above the 0.5 threshold. School-size
+    // refinement is a future filter at edge-write time, not a gate on
+    // traversal.
+  },
+});
+
+/** Every defined edge kind, in declaration order. Stable iteration order — UIs rely on it. */
+export const ALL_EDGE_KINDS: ReadonlyArray<EdgeKind> = Object.freeze(
+  Object.keys(EDGE_CONFIGS) as EdgeKind[],
+);
+
+/**
+ * Default warm-set: kinds whose baseStrength is high enough to be worth
+ * traversing in `findWarmPaths`. Equivalent to `[k for k in ALL_EDGE_KINDS
+ * if EDGE_CONFIGS[k].isWarmByDefault]`. Kept as a precomputed export so
+ * warmPaths.ts doesn't have to build it on every call.
+ */
+export const DEFAULT_WARM_EDGE_KINDS: ReadonlyArray<EdgeKind> = Object.freeze(
+  ALL_EDGE_KINDS.filter((k) => EDGE_CONFIGS[k].isWarmByDefault),
+);
+
 export interface BuildGraphArgs {
   prospects: Prospect[];
   scores: Record<string, Score>;
   signalsById?: Record<string, Signal[]>;
+  /**
+   * Optional pre-materialized person↔person connection records, keyed by the
+   * "from" prospect_id (the row already filtered to the current viewer's set).
+   * Sourced from the `person_connections` table (CLAUDE.md Decision 7) via
+   * `usePersonConnections` in db.ts. The hook owns the persons↔prospects ID
+   * translation; buildGraph consumes prospect-id-shaped records exclusively.
+   *
+   * Each record carries `connection_type` (matching STRENGTH_TABLE keys),
+   * `connected_prospect_id` (the partner endpoint), `computed_strength`
+   * (0..0.99 from `compute_strength`), and the same Contract-1-shaped
+   * `structured_value` payload that `signalsById` carries — this lets the
+   * sixth pass reuse `evidenceFromSignal` + `signalTypeToEdgeKind` without
+   * adding a parallel mapping path.
+   */
+  personConnections?: Record<string, PersonConnectionRecord[]>;
   /**
    * Optional theme tokens. When supplied, every node gets `color` and every
    * edge gets `color` set so the consumer can use property-name accessors
@@ -96,6 +495,28 @@ export interface BuildGraphArgs {
    */
   skipColleagueEdges?: boolean;
 }
+
+/**
+ * A row from `person_connections` (Postgres) translated into prospect-id
+ * space by `usePersonConnections`. The fields mirror Contract 1's
+ * structured_value shapes so `evidenceFromSignal` works unmodified.
+ */
+export interface PersonConnectionRecord {
+  readonly connected_prospect_id: string;
+  readonly connection_type: string;
+  readonly computed_strength: number;
+  readonly structured_value: Record<string, unknown>;
+}
+
+/**
+ * Per-prospect cap on edges materialized from `person_connections`. A single
+ * dense node (e.g., a long-tenured engineer at a 5,000-person company) can
+ * have hundreds of `career_overlap_*` rows — rendering all of them buries
+ * the higher-strength edges that drive warm-path BFS. Cap at top-K by
+ * `computed_strength` desc. Picked at 8: matches `COLLEAGUE_FANOUT = 6`
+ * order-of-magnitude while leaving room for two cross-domain links.
+ */
+export const PERSON_CONNECTIONS_TOP_K = 8;
 
 // ─── Company metadata ────────────────────────────────────────────────────────
 // HQ city/country + industry vertical + known partnerships per company. Drives
@@ -266,6 +687,46 @@ type ProspectWithGraphFields = Prospect & {
   talks?: TalkEntry[];
 };
 
+// ─── Signal-type → EdgeKind mapping (Contract 1 → frontend EdgeKind) ────────
+//
+// Contract 1 returns signal_type values that are 1:1 with EdgeKind for the
+// 4 hidden-connection types. The 3 career_overlap sub-types fold onto two
+// EdgeKind variants based on tenure: same_team → colleague (current/strong),
+// same_domain & general → past_employer (looser overlap). Returns null for
+// signal types that don't map to a renderable hidden-connection edge.
+
+function signalTypeToEdgeKind(signalType: string): EdgeKind | null {
+  switch (signalType) {
+    case "patent_co_inventor":
+      return "patent_co_inventor";
+    case "academic_co_author":
+    case "academic_co_author_single":
+    case "academic_co_author_multi":
+      return "academic_co_author";
+    case "conference_co_presenter":
+      return "conference_co_presenter";
+    case "standards_committee":
+    case "standards_committee_peer":
+      return "standards_committee";
+    case "career_overlap_same_team":
+      return "colleague";
+    case "career_overlap_same_domain":
+    case "career_overlap_general":
+      return "past_employer";
+    // Education-cohort kinds (V3_PT2.md L376-381) — 1:1 with EdgeKind.
+    case "same_mba_cohort":
+      return "same_mba_cohort";
+    case "same_phd_program":
+      return "same_phd_program";
+    case "executive_education":
+      return "executive_education";
+    case "same_undergrad_cohort":
+      return "same_undergrad_cohort";
+    default:
+      return null;
+  }
+}
+
 // ─── buildGraph ──────────────────────────────────────────────────────────────
 
 export function buildGraph(args: BuildGraphArgs): {
@@ -276,13 +737,49 @@ export function buildGraph(args: BuildGraphArgs): {
   const nodes = new Map<string, GraphNode>();
   const edges = new Map<string, GraphEdge>();
 
-  const SYMMETRIC: ReadonlySet<EdgeKind> = new Set<EdgeKind>(["partnership", "colleague"]);
+  // Hidden-connection edges (patent_co_inventor / academic_co_author /
+  // conference_co_presenter / standards_committee) are inherently undirected:
+  // a co-invention between A and B is the same fact as one between B and A,
+  // so dedup must canonicalize endpoints. They join `partnership` and
+  // `colleague` in the symmetric set.
+  //
+  // Education-cohort kinds (same_mba_cohort, same_phd_program,
+  // executive_education, same_undergrad_cohort) are also symmetric: if A and B
+  // shared an MBA cohort the connection is the same regardless of direction.
+  // Without this, a clustering job that emits both A→B and B→A rows (which
+  // the idempotent upsert produces) would land two edges in the graph.
+  //
+  // past_employer is included because career_overlap signals between two
+  // persons are written from both sides (signal for A says connected_to=B,
+  // signal for B says connected_to=A) — both map to past_employer EdgeKind
+  // and would produce two anti-parallel edges without canonicalization.
+  // The directed person→company past_employer edges are unaffected: the
+  // canonicalization only swaps source/target when source > target; the
+  // resulting edge id is still valid for undirected dedup.
+  const SYMMETRIC: ReadonlySet<EdgeKind> = new Set<EdgeKind>([
+    "partnership",
+    "colleague",
+    "past_employer",
+    "patent_co_inventor",
+    "academic_co_author",
+    "conference_co_presenter",
+    "standards_committee",
+    "same_mba_cohort",
+    "same_phd_program",
+    "executive_education",
+    "same_undergrad_cohort",
+  ]);
 
   const addNode = (n: GraphNode): void => {
     if (!nodes.has(n.id)) nodes.set(n.id, n);
   };
 
-  const addEdge = (source: string, target: string, kind: EdgeKind): void => {
+  const addEdge = (
+    source: string,
+    target: string,
+    kind: EdgeKind,
+    evidence?: EdgeEvidence | null,
+  ): void => {
     if (source === target) return;
     let a = source;
     let b = target;
@@ -290,9 +787,23 @@ export function buildGraph(args: BuildGraphArgs): {
       [a, b] = [b, a];
     }
     const id = `${a}|${b}|${kind}`;
-    if (!edges.has(id)) {
-      edges.set(id, { id, source: a, target: b, kind });
+    const existing = edges.get(id);
+    if (existing) {
+      // First-write-wins on evidence: if the existing edge already has rich
+      // evidence, don't overwrite with sparser evidence from the reverse-
+      // direction signal. If the existing has none and we have some, fill in.
+      if (evidence != null && existing.evidence == null) {
+        existing.evidence = evidence;
+      }
+      return;
     }
+    edges.set(id, {
+      id,
+      source: a,
+      target: b,
+      kind,
+      ...(evidence != null ? { evidence } : {}),
+    });
   };
 
   // Track person→companyId to derive colleague edges in a second pass.
@@ -550,6 +1061,117 @@ export function buildGraph(args: BuildGraphArgs): {
       const roleId = `role:${normalizeKey(personNode.role)}`;
       if (nodes.has(roleId)) {
         addEdge(personId, roleId, "evidence_cited");
+      }
+    }
+  }
+
+  // Optional fifth pass: hidden-connection edges from per-prospect signals.
+  //
+  // When a Contract-1-shaped signal lands in `signalsById` (i.e., from
+  // SunnyRidge's Track J extractors writing patent_co_inventor /
+  // academic_co_author / conference_co_presenter / standards_committee /
+  // career_overlap_* rows), we materialize a GraphEdge between the two
+  // prospects with `evidence` populated via `evidenceFromSignal`. The
+  // resulting edges feed `findWarmPaths` (Track I) so WarmPathPanel renders
+  // CLAUDE.md's rich templates without further code changes.
+  //
+  // Duck-typed signal access — the v2 mock `Signal` (in mockStore.ts) uses
+  // `value: unknown` and won't have `structured_value`; those signals are
+  // silently skipped by `evidenceFromSignal`. v3 NormalizedSignal-shaped
+  // rows from the live Supabase signals table will have `structured_value`
+  // and round-trip cleanly. No code change required when v2/v3 cohabit.
+  if (args.signalsById) {
+    for (const [prospectId, sigs] of Object.entries(args.signalsById)) {
+      if (!sigs?.length) continue;
+      const personA = `person:${prospectId}`;
+      if (!nodes.has(personA)) continue;
+
+      for (const sig of sigs) {
+        const sigAny = sig as Signal & {
+          signal_type?: string;
+          structured_value?: Record<string, unknown>;
+        };
+        const sigType = sigAny.signal_type;
+        if (!sigType || !RECOGNIZED_CONNECTION_SIGNAL_TYPES.includes(sigType)) {
+          continue;
+        }
+        // The v3 backend writes Contract 1's `structured_value` payload into
+        // the existing v2 `signals.value` JSONB column (server/credence/
+        // signals.py:184) — the column was renamed-via-content rather than
+        // via ALTER TABLE. So when the frontend reads a live signal, the
+        // structured dict arrives as `signal.value`, not `signal.structured_value`.
+        // Tolerate both shapes: prefer `structured_value` when present
+        // (any future Pydantic-shaped feed), fall back to `value` when it
+        // is an object (the current v3-via-v2-column case).
+        let sv: Record<string, unknown> | null = null;
+        if (sigAny.structured_value && typeof sigAny.structured_value === "object") {
+          sv = sigAny.structured_value;
+        } else if (
+          sigAny.value &&
+          typeof sigAny.value === "object" &&
+          !Array.isArray(sigAny.value)
+        ) {
+          sv = sigAny.value as Record<string, unknown>;
+        }
+        if (!sv) continue;
+
+        const connectedTo =
+          typeof sv.connected_to === "string" ? sv.connected_to : null;
+        if (!connectedTo) continue;
+
+        const personB = `person:${connectedTo}`;
+        if (!nodes.has(personB)) continue; // target not in this graph view
+
+        const edgeKind = signalTypeToEdgeKind(sigType);
+        if (!edgeKind) continue;
+
+        const evidence = evidenceFromSignal({
+          signal_type: sigType,
+          structured_value: sv,
+        });
+        addEdge(personA, personB, edgeKind, evidence);
+      }
+    }
+  }
+
+  // Sixth pass: pre-materialized person_connections rows (CLAUDE.md
+  // Decision 7). The hook layer (`usePersonConnections` in db.ts) has
+  // already done the persons.id → prospects.id translation and filtered
+  // to the current view. We just need to:
+  //   1. Cap each prospect to the top-K records by computed_strength desc
+  //      (PERSON_CONNECTIONS_TOP_K) so a dense node doesn't bury its
+  //      strongest edges under hundreds of weak career_overlap_general rows
+  //   2. Map connection_type → EdgeKind via the same `signalTypeToEdgeKind`
+  //      already used by the fifth pass — keeps a single source of truth
+  //   3. Reuse evidenceFromSignal so the same warmPaths.ts templates render
+  //
+  // `addEdge` already canonicalizes endpoints for SYMMETRIC kinds, so a row
+  // present on both `prospectA → prospectB` and `prospectB → prospectA` (the
+  // hook returns each direction in its respective bucket) dedupes naturally.
+  if (args.personConnections) {
+    for (const [prospectId, records] of Object.entries(args.personConnections)) {
+      if (!records?.length) continue;
+      const personA = `person:${prospectId}`;
+      if (!nodes.has(personA)) continue;
+
+      const ranked = records.length <= PERSON_CONNECTIONS_TOP_K
+        ? records
+        : [...records]
+            .sort((a, b) => b.computed_strength - a.computed_strength)
+            .slice(0, PERSON_CONNECTIONS_TOP_K);
+
+      for (const rec of ranked) {
+        const personB = `person:${rec.connected_prospect_id}`;
+        if (!nodes.has(personB)) continue;
+
+        const edgeKind = signalTypeToEdgeKind(rec.connection_type);
+        if (!edgeKind) continue;
+
+        const evidence = evidenceFromSignal({
+          signal_type: rec.connection_type,
+          structured_value: rec.structured_value,
+        });
+        addEdge(personA, personB, edgeKind, evidence);
       }
     }
   }
