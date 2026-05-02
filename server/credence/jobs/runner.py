@@ -50,17 +50,40 @@ import logging
 import sys
 from dataclasses import dataclass
 
-from ..db import close_pool
+from ..db import acquire, close_pool
 from .career_overlap_clustering import ClusterRollup, cluster_career_overlaps
 from .conference_clustering import ConferenceRollup, cluster_conference_co_presenters
 from .education_cohort_clustering import EducationRollup, cluster_education_cohorts
+from .materialize_prospect_warm_paths import (
+    MaterializeRollup,
+    materialize_prospect_warm_paths_account,
+)
 from .paper_clustering import PaperRollup, cluster_paper_co_authors
 from .patent_clustering import PatentRollup, cluster_patent_co_inventors
 from .standards_clustering import StandardsRollup, cluster_standards_peers
 
 log = logging.getLogger(__name__)
 
-ALL_JOB_NAMES = ("career_overlap", "patent", "paper", "education_cohort", "standards", "conference")
+# `materialize` is a special trailing step: it refreshes the
+# `prospect_warm_paths` read-cache after the clustering jobs have written
+# new rows to `person_connections`. The Wave 9 watch daemon
+# (`materialize_prospect_warm_paths.py --watch`) is the primary refresh
+# mechanism — this is the belt-and-suspenders backup for operators who
+# run `runner --all` without the daemon.
+ALL_JOB_NAMES = (
+    "career_overlap",
+    "patent",
+    "paper",
+    "education_cohort",
+    "standards",
+    "conference",
+    "materialize",
+)
+
+# Jobs that read from accounts table per-tenant rather than running
+# globally. `materialize` MUST run after the clustering jobs because it
+# reads from the just-written `person_connections` rows.
+_PER_TENANT_TRAILING_JOBS = ("materialize",)
 
 
 @dataclass
@@ -71,6 +94,8 @@ class RunnerResult:
     education_cohort: EducationRollup | None = None
     standards: StandardsRollup | None = None
     conference: ConferenceRollup | None = None
+    # ``materialize`` produces one rollup per tenant; collect them as a list.
+    materialize: list[MaterializeRollup] | None = None
 
     def total_inserted(self) -> int:
         total = 0
@@ -98,6 +123,9 @@ class RunnerResult:
         ):
             if rollup is not None:
                 total += len(getattr(rollup, "failures", []))
+        if self.materialize is not None:
+            for mat in self.materialize:
+                total += len(getattr(mat, "failures", []))
         return total
 
     def summary(self) -> str:
@@ -122,6 +150,16 @@ class RunnerResult:
                     f"  {name:<20} found={found:>6}  inserted={ins:>6}  "
                     f"updated={upd:>6}  failures={fail}"
                 )
+        if self.materialize is None:
+            lines.append(f"  {'materialize':<20} skipped")
+        else:
+            tot_del = sum(m.rows_deleted for m in self.materialize)
+            tot_ins = sum(m.rows_inserted for m in self.materialize)
+            tot_fail = sum(len(m.failures) for m in self.materialize)
+            lines.append(
+                f"  {'materialize':<20} accounts={len(self.materialize):>6}  "
+                f"deleted={tot_del:>6}  inserted={tot_ins:>6}  failures={tot_fail}"
+            )
         lines.append(
             f"  {'TOTAL':<20} inserted={self.total_inserted():>6}  "
             f"failures={self.total_failures()}"
@@ -165,6 +203,30 @@ async def run_all(
     async def _conference() -> None:
         result.conference = await cluster_conference_co_presenters(dry_run=dry_run)
 
+    async def _materialize() -> None:
+        # Per-tenant refresh of the prospect_warm_paths read-cache. Iterates
+        # every account with at least one person_connections row, then
+        # deletes + re-inserts that tenant's top-K rows. The Wave 9 watch
+        # daemon does this on a 60s cadence; this is the runner's
+        # belt-and-suspenders backup.
+        async with acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT account_id FROM person_connections "
+                "WHERE account_id IS NOT NULL ORDER BY account_id"
+            )
+        account_ids = [r["account_id"] for r in rows]
+        log.info(
+            "materialize: refreshing prospect_warm_paths for %d account(s)",
+            len(account_ids),
+        )
+        rollups: list[MaterializeRollup] = []
+        for acct in account_ids:
+            rollup = await materialize_prospect_warm_paths_account(
+                acct, dry_run=dry_run,
+            )
+            rollups.append(rollup)
+        result.materialize = rollups
+
     _job_map = {
         "career_overlap": _career,
         "patent": _patent,
@@ -172,18 +234,26 @@ async def run_all(
         "education_cohort": _education,
         "standards": _standards,
         "conference": _conference,
+        "materialize": _materialize,
     }
 
-    coros = [_job_map[j]() for j in jobs if j in _job_map]
-    if not coros:
+    # Split clustering jobs (parallelizable) from per-tenant trailing jobs
+    # (must run AFTER clustering writes complete to read fresh edges).
+    clustering_jobs = [j for j in jobs if j in _job_map and j not in _PER_TENANT_TRAILING_JOBS]
+    trailing_jobs = [j for j in jobs if j in _job_map and j in _PER_TENANT_TRAILING_JOBS]
+    if not clustering_jobs and not trailing_jobs:
         log.warning("No valid jobs selected — nothing to do.")
         return result
 
-    if parallel:
-        await asyncio.gather(*coros, return_exceptions=False)
+    if parallel and clustering_jobs:
+        await asyncio.gather(*(_job_map[j]() for j in clustering_jobs), return_exceptions=False)
     else:
-        for coro in coros:
-            await coro
+        for j in clustering_jobs:
+            await _job_map[j]()
+
+    # Trailing jobs always run sequentially after clustering completes.
+    for j in trailing_jobs:
+        await _job_map[j]()
 
     return result
 

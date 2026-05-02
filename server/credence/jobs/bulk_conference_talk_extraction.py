@@ -105,6 +105,47 @@ VALUES (
 )
 """
 
+# v3 bridge — pivots the in-memory talk index into the v3 ``events`` +
+# ``conference_attendances`` tables so ``conference_clustering`` can JOIN
+# on them. Same pattern as bulk_scholar_ingest --write-v3 (msg 219).
+RESOLVE_PERSONS_FOR_PROSPECTS_SQL = """
+SELECT id, source_prospect_id
+FROM persons
+WHERE account_id = $1
+  AND source_prospect_id = ANY($2::uuid[])
+"""
+
+UPSERT_EVENT_SQL = """
+INSERT INTO events (name, kind, year, venue, url, source, account_id)
+VALUES ($1, 'conference', $2, NULL, $3, 'manual', $4)
+ON CONFLICT (account_id, name, year) DO UPDATE SET
+    url    = COALESCE(EXCLUDED.url, events.url)
+RETURNING id
+"""
+
+# Fallback for the missing ON CONFLICT target — events table doesn't have
+# a unique index on (account_id, name, year) by default. We do a check-
+# then-insert dance instead, which is what _upsert_event() implements.
+SELECT_EVENT_SQL = """
+SELECT id FROM events
+WHERE account_id = $1 AND lower(name) = lower($2) AND year = $3
+LIMIT 1
+"""
+
+INSERT_EVENT_SQL = """
+INSERT INTO events (name, kind, year, venue, url, source, account_id)
+VALUES ($1, 'conference', $2, NULL, $3, 'manual', $4)
+RETURNING id
+"""
+
+UPSERT_ATTENDANCE_SQL = """
+INSERT INTO conference_attendances (
+    person_id, event_id, role, year, source, confidence, account_id
+)
+VALUES ($1, $2, 'speaker', $3, 'manual', $4, $5)
+ON CONFLICT (person_id, event_id) DO NOTHING
+"""
+
 
 # ── Public types ─────────────────────────────────────────────────────────────
 
@@ -146,6 +187,11 @@ class ConferenceCoPresenterRollup:
     signals_skipped_unparseable: int = 0
     errors: list[str] = field(default_factory=list)
     dry_run: bool = False
+    # v3 bridge counters (zero when --write-v3 is not set)
+    write_v3: bool = False
+    events_upserted: int = 0
+    attendances_upserted: int = 0
+    attendances_skipped_no_person: int = 0
 
 
 # ── Pure planning helpers ───────────────────────────────────────────────────
@@ -359,6 +405,141 @@ async def _signal_exists(
     return row is not None
 
 
+# ── v3 bridge helpers (events + conference_attendances) ────────────────────
+
+
+async def _resolve_persons_for_prospects(
+    conn: asyncpg.Connection,
+    account_id: UUID,
+    prospect_ids: list[UUID],
+) -> dict[UUID, UUID]:
+    """``{prospect_id: person_id}`` for prospects with an enriched persons row.
+
+    Same shape as the scholar v3 bridge resolver. Prospects without a
+    persons row drop out — their attendance can't be written because of
+    the FK on conference_attendances.person_id.
+    """
+    if not prospect_ids:
+        return {}
+    rows = await conn.fetch(
+        RESOLVE_PERSONS_FOR_PROSPECTS_SQL, account_id, prospect_ids
+    )
+    return {r["source_prospect_id"]: r["id"] for r in rows}
+
+
+async def _upsert_event(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    name: str,
+    year: int,
+    url: str | None,
+) -> UUID:
+    """Find-or-create one events row; return its id.
+
+    The events table has no unique constraint on (account_id, name, year)
+    so we can't use ON CONFLICT. Check-then-insert is racy in theory but
+    fine here — this is single-threaded per account.
+    """
+    existing = await conn.fetchval(SELECT_EVENT_SQL, account_id, name, year)
+    if existing is not None:
+        return existing
+    new_id = await conn.fetchval(
+        INSERT_EVENT_SQL, name, year, url, account_id
+    )
+    return new_id
+
+
+async def _upsert_attendance(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    person_id: UUID,
+    event_id: UUID,
+    year: int,
+    confidence: float,
+) -> bool:
+    """Returns True if a new row was inserted, False if dedup'd."""
+    status = await conn.execute(
+        UPSERT_ATTENDANCE_SQL,
+        person_id, event_id, year, confidence, account_id,
+    )
+    parts = (status or "").split()
+    return bool(parts) and parts[-1] == "1"
+
+
+async def _materialize_v3_for_index(
+    conn: asyncpg.Connection,
+    account_id: UUID,
+    index: dict[tuple[str, int], list[TalkEntry]],
+    rollup_state: dict[str, int],
+) -> None:
+    """Pivot the talk index into v3 events + conference_attendances.
+
+    rollup_state is mutated in place with: events_upserted,
+    attendances_upserted, attendances_skipped_no_person.
+    """
+    # Pre-resolve every prospect_id that appears anywhere in the index.
+    all_prospects: set[UUID] = set()
+    for entries in index.values():
+        for entry in entries:
+            all_prospects.add(entry.prospect_id)
+    prospect_to_person = await _resolve_persons_for_prospects(
+        conn, account_id, list(all_prospects)
+    )
+
+    for (event_canonical, year), entries in index.items():
+        if not entries:
+            continue
+        # Use the freshest event_raw as the display name (first entry's
+        # raw form preserves capitalization "NVIDIA GTC" vs "nvidia gtc").
+        display_name = entries[0].event_raw or event_canonical
+        url = None
+        # url isn't on TalkEntry but we can pull from the originating
+        # value if a future refactor wants to thread it through. Leave
+        # NULL for now — events.url is nullable.
+        try:
+            event_id = await _upsert_event(
+                conn,
+                account_id=account_id,
+                name=display_name,
+                year=year,
+                url=url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "v3 event upsert failed (%s, %d): %r", display_name, year, exc
+            )
+            continue
+        rollup_state["events_upserted"] += 1
+        # Confidence: 0.85 for v2-pivoted presenter — comparable to
+        # bulk_scholar_ingest's 0.90 confidence for tight author lists.
+        # Slightly lower because event/year normalization is fuzzier than
+        # semantic_scholar_id.
+        for entry in entries:
+            person_id = prospect_to_person.get(entry.prospect_id)
+            if person_id is None:
+                rollup_state["attendances_skipped_no_person"] += 1
+                continue
+            try:
+                inserted = await _upsert_attendance(
+                    conn,
+                    account_id=account_id,
+                    person_id=person_id,
+                    event_id=event_id,
+                    year=year,
+                    confidence=0.85,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "v3 attendance upsert failed (person=%s event=%s): %r",
+                    person_id, event_id, exc,
+                )
+                continue
+            if inserted:
+                rollup_state["attendances_upserted"] += 1
+
+
 async def _insert_signal(
     conn: asyncpg.Connection,
     prospect_id: UUID,
@@ -392,8 +573,16 @@ async def bulk_conference_talk_extraction_account(
     *,
     limit: int | None = None,
     dry_run: bool = False,
+    write_v3: bool = False,
 ) -> ConferenceCoPresenterRollup:
-    """Build the per-account conference co-presenter index and emit signals."""
+    """Build the per-account conference co-presenter index and emit signals.
+
+    Args:
+        write_v3: when True, ALSO pivot the in-memory index into the v3
+            ``events`` + ``conference_attendances`` tables so
+            ``conference_clustering`` can JOIN on them. v2 signal emission
+            still happens. No effect under ``dry_run``.
+    """
 
     talks_read = 0
     talks_indexed = 0
@@ -403,6 +592,11 @@ async def bulk_conference_talk_extraction_account(
     signals_skipped_dedup = 0
     signals_skipped_unparseable = 0
     errors: list[str] = []
+    v3_state = {
+        "events_upserted": 0,
+        "attendances_upserted": 0,
+        "attendances_skipped_no_person": 0,
+    }
 
     # Step 1 — load conference_talk signals.
     async with acquire() as conn:
@@ -451,6 +645,7 @@ async def bulk_conference_talk_extraction_account(
             signals_skipped_unparseable=signals_skipped_unparseable,
             errors=errors,
             dry_run=True,
+            write_v3=write_v3,
         )
 
     # Step 4 — persist with explicit dedupe.
@@ -474,10 +669,19 @@ async def bulk_conference_talk_extraction_account(
                     entry_a.prospect_id, entry_b.prospect_id,
                 )
 
+        # Step 5 (optional) — v3 bridge: pivot index → events + attendances.
+        if write_v3:
+            await _materialize_v3_for_index(
+                conn, account_id, index, v3_state,
+            )
+
     log.info(
         "conference_co_presenter done account=%s inserted=%d "
-        "skipped_dedup=%d errors=%d",
-        account_id, signals_inserted, signals_skipped_dedup, len(errors),
+        "skipped_dedup=%d events=%d attendances=%d skipped_no_person=%d "
+        "errors=%d",
+        account_id, signals_inserted, signals_skipped_dedup,
+        v3_state["events_upserted"], v3_state["attendances_upserted"],
+        v3_state["attendances_skipped_no_person"], len(errors),
     )
     return ConferenceCoPresenterRollup(
         account_id=account_id,
@@ -490,6 +694,10 @@ async def bulk_conference_talk_extraction_account(
         signals_skipped_unparseable=signals_skipped_unparseable,
         errors=errors,
         dry_run=False,
+        write_v3=write_v3,
+        events_upserted=v3_state["events_upserted"],
+        attendances_upserted=v3_state["attendances_upserted"],
+        attendances_skipped_no_person=v3_state["attendances_skipped_no_person"],
     )
 
 
@@ -534,6 +742,7 @@ async def bulk_conference_talk_extraction_all_accounts(
     *,
     limit: int | None = None,
     dry_run: bool = False,
+    write_v3: bool = False,
 ) -> list[ConferenceCoPresenterRollup]:
     """Iterate every account with conference_talk signals and emit co-presenter rows."""
     async with acquire() as conn:
@@ -542,7 +751,7 @@ async def bulk_conference_talk_extraction_all_accounts(
     rollups: list[ConferenceCoPresenterRollup] = []
     for account_id in account_ids:
         rollup = await bulk_conference_talk_extraction_account(
-            account_id, limit=limit, dry_run=dry_run,
+            account_id, limit=limit, dry_run=dry_run, write_v3=write_v3,
         )
         rollups.append(rollup)
     return rollups
@@ -583,6 +792,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Log emissions without writing to the signals table.",
     )
     p.add_argument(
+        "--write-v3",
+        action="store_true",
+        help=(
+            "Also pivot the in-memory talk index into the v3 events + "
+            "conference_attendances tables so conference_clustering can "
+            "JOIN on them. v2 signals are still written. No effect under "
+            "--dry-run."
+        ),
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         help="Python logging level (default INFO).",
@@ -600,8 +819,11 @@ def _print_rollup(rollup: ConferenceCoPresenterRollup) -> None:
         f"signals_inserted={rollup.signals_inserted} "
         f"signals_skipped_dedup={rollup.signals_skipped_dedup} "
         f"signals_skipped_unparseable={rollup.signals_skipped_unparseable} "
+        f"events_upserted={rollup.events_upserted} "
+        f"attendances_upserted={rollup.attendances_upserted} "
+        f"attendances_skipped_no_person={rollup.attendances_skipped_no_person} "
         f"errors={len(rollup.errors)} "
-        f"dry_run={rollup.dry_run}"
+        f"dry_run={rollup.dry_run} write_v3={rollup.write_v3}"
     )
     print(msg)
 
@@ -618,10 +840,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.all_accounts:
                 return await bulk_conference_talk_extraction_all_accounts(
                     limit=args.limit, dry_run=args.dry_run,
+                    write_v3=args.write_v3,
                 )
             return [
                 await bulk_conference_talk_extraction_account(
                     args.account_id, limit=args.limit, dry_run=args.dry_run,
+                    write_v3=args.write_v3,
                 )
             ]
         finally:

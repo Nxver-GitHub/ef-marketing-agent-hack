@@ -75,18 +75,33 @@ FIRECRAWL_DEFAULT_TIMEOUT_SECONDS = 30.0
 # ─── Standards bodies + roster URLs ─────────────────────────────────────────
 
 
-# Per V3_PT2.md L695-702. URL points to the roster index; for some bodies
-# (IEEE SA, SEMI) the index is a top-level "join" page that links to actual
-# committee rosters — we accept lower precision there but the body name is
-# still useful for warm-path explanations.
-
+# Honest caveat on the URLs below: most standards bodies wall their
+# *individual* committee rosters behind member-only logins. The URLs below
+# are the closest publicly-scrapeable pages — many list MEMBER ORGANIZATIONS
+# rather than individual representatives, which limits per-person matching
+# against ``persons.canonical_name``. JEDEC + IEEE-SA in particular only
+# expose committee TITLES publicly; individual member names require an
+# authenticated session. To get individual-level standards data the right
+# move is either (a) source from conference programs / standards-meeting
+# attendee lists where individual names are listed, or (b) acquire member-
+# portal access. See msg 236 audit of the prior URLs.
 STANDARDS_BODIES: dict[str, str] = {
-    "JEDEC": "https://www.jedec.org/committees",
-    "IEEE SA": "https://standards.ieee.org/about/get-involved/join/",
-    "SEMI": "https://www.semi.org/en/standards/standards-committees",
-    "Wi-Fi Alliance": "https://www.wi-fi.org/membership",
-    "RISC-V International": "https://riscv.org/members/",
-    "MLCommons": "https://mlcommons.org/en/members/",
+    # JEDEC — member-companies list (individual reps are member-only).
+    # Previous /committees URL returned only committee titles.
+    "JEDEC": "https://www.jedec.org/standards-documents/about-jedec/jedec-member-list",
+    # IEEE Standards Association — Standards Board public roster (board
+    # members are public; working-group rosters are member-only). The
+    # previous /about/get-involved/join URL was a marketing page.
+    "IEEE SA": "https://standards.ieee.org/about/sasb/board/",
+    # SEMI — Standards Volunteer Leadership page lists committee chairs
+    # publicly. Replaces the previous /standards-committees landing page.
+    "SEMI": "https://www.semi.org/en/communities/standards-volunteer-leadership",
+    # Wi-Fi Alliance — current members directory.
+    "Wi-Fi Alliance": "https://www.wi-fi.org/who-we-are/current-members",
+    # RISC-V International members directory (orgs, not individuals).
+    "RISC-V International": "https://riscv.org/membership/members/",
+    # MLCommons community members.
+    "MLCommons": "https://mlcommons.org/community/members/",
 }
 
 
