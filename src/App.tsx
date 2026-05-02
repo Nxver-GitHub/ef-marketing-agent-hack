@@ -24,6 +24,7 @@ const Validate = lazy(() => import("./pages/Validate.tsx"));
 const Settings = lazy(() => import("./pages/Settings.tsx"));
 const ProspectDetail = lazy(() => import("./pages/ProspectDetail.tsx"));
 const Login = lazy(() => import("./pages/Login.tsx"));
+const OrgChart = lazy(() => import("./pages/OrgChart.tsx"));
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -78,6 +79,7 @@ const App = () => {
                 <Route path="/discover" element={<RequireAuth><Discover /></RequireAuth>} />
                 <Route path="/settings" element={<RequireAuth><Settings /></RequireAuth>} />
                 <Route path="/prospect/:id" element={<RequireAuth><ProspectDetail /></RequireAuth>} />
+                <Route path="/org/:companyId" element={<RequireAuth><OrgChart /></RequireAuth>} />
                 <Route path="*" element={<NotFound />} />
               </Routes>
             </Suspense>

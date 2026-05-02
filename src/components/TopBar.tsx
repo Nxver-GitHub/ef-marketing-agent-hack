@@ -1,6 +1,7 @@
 import { Link, useLocation } from "react-router-dom";
 import { memo, useEffect, useState } from "react";
 import { useAccount } from "@/contexts/AccountContext";
+import { EdgeFilterPills } from "@/components/EdgeFilterPills";
 
 const tz = (timeZone: string) =>
   new Intl.DateTimeFormat("en-US", {
@@ -100,6 +101,10 @@ const AccountChip = memo(function AccountChip() {
 
 const TopBarInner = () => {
   const { pathname } = useLocation();
+  // Show the edge-filter sub-bar only on graph-centric routes where toggling
+  // edge kinds affects what's rendered.
+  const showFilterPills =
+    pathname.startsWith("/discover") || pathname.startsWith("/org");
 
   return (
     <header className="fixed top-0 inset-x-0 z-40 border-b border-border bg-background/80 backdrop-blur">
@@ -130,6 +135,11 @@ const TopBarInner = () => {
           <AccountChip />
         </div>
       </div>
+      {showFilterPills ? (
+        <div className="border-t border-border/60 bg-background/60 px-6 md:px-10 py-2">
+          <EdgeFilterPills />
+        </div>
+      ) : null}
     </header>
   );
 };

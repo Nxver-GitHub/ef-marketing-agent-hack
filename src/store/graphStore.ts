@@ -174,6 +174,9 @@ export interface GraphStoreState {
   /** Hover/preview node. NodeInspector falls back to this when no
    *  pinned selection exists. */
   focusedNodeId: string | null
+  /** The pinned edge — drives EdgeInspector. Mutually exclusive with
+   *  selectedNodeId in display logic (caller chooses which to show). */
+  selectedEdgeId: string | null
 
   // ── Filters ──
   /** EdgeKinds currently visible. Empty set means hide all edges. */
@@ -187,6 +190,7 @@ export interface GraphStoreState {
   setLoadStatus: (status: LoadStatus, error?: string | null) => void
   selectNode: (id: string | null) => void
   focusNode: (id: string | null) => void
+  selectEdge: (id: string | null) => void
   toggleEdgeKind: (kind: EdgeKind) => void
   setVisibleEdgeKinds: (kinds: ReadonlySet<EdgeKind>) => void
   toggleNodeKind: (kind: NodeKind) => void
@@ -226,6 +230,7 @@ const INITIAL_STATE: Omit<
   | "setLoadStatus"
   | "selectNode"
   | "focusNode"
+  | "selectEdge"
   | "toggleEdgeKind"
   | "setVisibleEdgeKinds"
   | "toggleNodeKind"
@@ -241,6 +246,7 @@ const INITIAL_STATE: Omit<
   lastLoadedAt: null,
   selectedNodeId: null,
   focusedNodeId: null,
+  selectedEdgeId: null,
   visibleEdgeKinds: DEFAULT_VISIBLE_EDGE_KINDS,
   visibleNodeKinds: DEFAULT_VISIBLE_NODE_KINDS,
   searchQuery: "",
@@ -266,8 +272,9 @@ export const useGraphStore = create<GraphStoreState>((set) => ({
       loadError: status === "error" ? (error ?? "Unknown error") : null,
     }),
 
-  selectNode: (id) => set({ selectedNodeId: id }),
+  selectNode: (id) => set({ selectedNodeId: id, selectedEdgeId: null }),
   focusNode: (id) => set({ focusedNodeId: id }),
+  selectEdge: (id) => set({ selectedEdgeId: id, selectedNodeId: null }),
 
   toggleEdgeKind: (kind) =>
     set((s) => {
@@ -324,6 +331,12 @@ export const selectActiveNode = (s: GraphStoreState): GraphNode | null => {
   const id = s.selectedNodeId ?? s.focusedNodeId
   if (!id) return null
   return s.nodes.find((n) => n.id === id) ?? null
+}
+
+/** Resolve the pinned edge by id. Used by EdgeInspector. */
+export const selectActiveEdge = (s: GraphStoreState): GraphEdge | null => {
+  if (!s.selectedEdgeId) return null
+  return s.edges.find((e) => e.id === s.selectedEdgeId) ?? null
 }
 
 /** Edges whose kind is currently visible. */

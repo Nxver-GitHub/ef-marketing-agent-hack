@@ -1254,6 +1254,16 @@ const Discover = () => {
     hoveredIdRef.current = null;
     setEngineRunning(true);
   }, []);
+  // Edge click — pin the edge in graphStore so EdgeInspector can render it.
+  // selectEdge clears selectedNodeId; node click clears selectedEdgeId
+  // (mutual exclusion enforced inside the store).
+  const storeSelectEdge = useGraphStore((s) => s.selectEdge);
+  const onLinkClickStable = useCallback(
+    (link: { id?: string }) => {
+      if (link?.id) storeSelectEdge(link.id);
+    },
+    [storeSelectEdge],
+  );
   const onNodeHoverStable = useCallback((node: FGNode | null) => {
     hoveredIdRef.current = node ? (node.id as string) : null;
   }, []);
@@ -1702,6 +1712,7 @@ const Discover = () => {
                   linkVisibility={linkVisibility}
                   nodeVisibility={nodeVisibility}
                   onNodeClick={onNodeClickStable}
+                  onLinkClick={onLinkClickStable}
                   onNodeHover={onNodeHoverStable}
                   onBackgroundClick={onBackgroundClickStable}
                   onEngineStop={onEngineStop}
