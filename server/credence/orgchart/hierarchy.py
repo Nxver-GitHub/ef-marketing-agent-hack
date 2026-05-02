@@ -48,7 +48,12 @@ from typing import Any
 from uuid import UUID
 
 from ..db import acquire, fetch
-from ..taxonomy import is_ic_track, is_manager_title, seniority_tier
+from ..taxonomy import (
+    HIERARCHY_ELIGIBLE_DOMAINS,
+    is_ic_track,
+    is_manager_title,
+    seniority_tier,
+)
 
 log = logging.getLogger(__name__)
 
@@ -657,15 +662,39 @@ async def _load_pair_patent_counts(
 
 
 async def _company_cluster_ids(company_id: UUID) -> list[UUID]:
+    """Hierarchy-eligible cluster ids for one company.
+
+    Skips clusters whose `functional_domain` is outside
+    `HIERARCHY_ELIGIBLE_DOMAINS` — currently `uncategorized` clusters,
+    which exist purely as a registry of prospects with unclassifiable
+    titles. Producing implicit reporting edges from those would invent
+    structure where no signal supports it.
+    """
     rows = await fetch(
-        "SELECT id FROM org_functional_clusters WHERE company_id = $1",
+        """
+        SELECT id FROM org_functional_clusters
+        WHERE company_id = $1
+          AND functional_domain = ANY($2::text[])
+        """,
         company_id,
+        list(HIERARCHY_ELIGIBLE_DOMAINS),
     )
     return [row["id"] for row in rows]
 
 
 async def _all_cluster_ids() -> list[UUID]:
-    rows = await fetch("SELECT id FROM org_functional_clusters")
+    """Hierarchy-eligible cluster ids across every company.
+
+    Mirrors `_company_cluster_ids` — uncategorized clusters are excluded
+    so the batch-scan job doesn't waste round trips on them.
+    """
+    rows = await fetch(
+        """
+        SELECT id FROM org_functional_clusters
+        WHERE functional_domain = ANY($1::text[])
+        """,
+        list(HIERARCHY_ELIGIBLE_DOMAINS),
+    )
     return [row["id"] for row in rows]
 
 

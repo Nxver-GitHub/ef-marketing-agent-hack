@@ -45,11 +45,40 @@ BEGIN;
 ALTER TABLE public.org_chart_corrections
   ADD COLUMN IF NOT EXISTS component_attributions JSONB;
 
--- The keyspace check is enforced row-by-row at INSERT time. We don't enforce
--- "values sum to 1.0" via a constraint because float-summed JSONB blame
--- shares are inherently fuzzy (operator could intentionally submit 0.5 +
--- 0.3 = 0.8 to express "the rest is unattributed"). The optimizer code
--- normalizes when it reads.
+-- Postgres doesn't allow subqueries directly inside a CHECK constraint
+-- expression. We wrap the keyspace test in an IMMUTABLE helper function
+-- and call that from the constraint — same logical guard, same per-row
+-- enforcement at INSERT time. The function is `OR REPLACE`-able so a
+-- future taxonomy widening only needs the function update, not a
+-- column rebuild.
+CREATE OR REPLACE FUNCTION public.corrections_attribution_keys_ok(c jsonb)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT c IS NULL
+      OR (
+        jsonb_typeof(c) = 'object'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM jsonb_object_keys(c) AS k
+          WHERE k NOT IN (
+            'seniority_gap',
+            'domain_match',
+            'subdomain_match',
+            'manager_title',
+            'span_capacity',
+            'patent_cluster',
+            'geographic_scope'
+          )
+        )
+      )
+$$;
+
+-- We don't enforce "values sum to 1.0" via a constraint because float-
+-- summed JSONB blame shares are inherently fuzzy (operator could
+-- intentionally submit 0.5 + 0.3 = 0.8 to express "the rest is
+-- unattributed"). The optimizer code normalizes when it reads.
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -59,26 +88,7 @@ BEGIN
   ) THEN
     ALTER TABLE public.org_chart_corrections
       ADD CONSTRAINT corrections_component_attributions_keyspace
-      CHECK (
-        component_attributions IS NULL
-        OR (
-          jsonb_typeof(component_attributions) = 'object'
-          AND (
-            SELECT bool_and(
-              k IN (
-                'seniority_gap',
-                'domain_match',
-                'subdomain_match',
-                'manager_title',
-                'span_capacity',
-                'patent_cluster',
-                'geographic_scope'
-              )
-            )
-            FROM jsonb_object_keys(component_attributions) AS k
-          )
-        )
-      );
+      CHECK (public.corrections_attribution_keys_ok(component_attributions));
   END IF;
 END $$;
 

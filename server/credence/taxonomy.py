@@ -38,6 +38,24 @@ FUNCTIONAL_DOMAINS: Final[tuple[str, ...]] = (
     "finance_legal",
     "people_ops",
     "general_management",
+    # Catch-all for prospects whose title doesn't match any classifier
+    # pattern. Matching change in
+    # `20260501_v3_orgchart_uncategorized_domain.sql` widens the CHECK
+    # constraint. Hierarchy inference (`hierarchy._build_cluster_hierarchy`)
+    # short-circuits on this domain — uncategorized clusters are a
+    # registry of "we know this person exists at this company but can't
+    # bucket them yet", not a chart input. The frontend renders these
+    # prospects with unresolved-peer placeholders per CLAUDE.md Decision 4.
+    "uncategorized",
+)
+
+
+# Keyspace subset that hierarchy inference will actually score against.
+# Anything else (currently just `uncategorized`) gets recorded as a cluster
+# membership but produces no manager→report edges. Centralized here so
+# downstream callers don't have to hardcode the exclusion.
+HIERARCHY_ELIGIBLE_DOMAINS: Final[frozenset[str]] = frozenset(
+    d for d in FUNCTIONAL_DOMAINS if d != "uncategorized"
 )
 
 

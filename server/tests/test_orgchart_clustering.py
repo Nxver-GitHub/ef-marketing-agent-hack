@@ -91,19 +91,34 @@ def test_nlp_fallback_yields_lower_confidence() -> None:
 
 
 @pytest.mark.unit
-def test_unclassifiable_title_is_dropped() -> None:
-    """No canonical, no NLP match → person not in any cluster."""
+def test_unclassifiable_title_routes_to_uncategorized() -> None:
+    """No canonical, no NLP match → person lands in `uncategorized` cluster.
+
+    Behavior change on 2026-05-01: previously the person was dropped from
+    clustering entirely. Now we route them into a registry bucket so the
+    chart UI can render every prospect even when their title can't be
+    categorized. Hierarchy inference skips uncategorized clusters (see
+    `taxonomy.HIERARCHY_ELIGIBLE_DOMAINS` + `_company_cluster_ids`) so
+    we don't fabricate edges from these registry rows.
+    """
     persons = [
         _person(pid=1, title="Mystery Title"),  # NLP doesn't match
         _person(pid=2, title="Hardware Engineer", domain="hardware_engineering"),
     ]
     plan = _build_cluster_plan(persons)
 
-    # Only the hardware person made it; mystery title was dropped
+    # Hardware person → main hardware cluster
     main_members = plan[("hardware_engineering", None)]
     assert len(main_members) == 1
     pid_2 = UUID("00000000-0000-0000-0000-cccc00000002")
     assert main_members[0][0].person_id == pid_2
+
+    # Mystery title → uncategorized registry bucket with low confidence
+    uncategorized = plan[("uncategorized", None)]
+    assert len(uncategorized) == 1
+    pid_1 = UUID("00000000-0000-0000-0000-cccc00000001")
+    assert uncategorized[0][0].person_id == pid_1
+    assert uncategorized[0][1] == 0.30  # low-confidence registry signal
 
 
 @pytest.mark.unit
@@ -203,6 +218,17 @@ def stub_db(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             if not state["company_present"]:
                 return []
             return [{"id": args[0], "name": state["company_name"]}]
+        # _load_current_persons (post-2026-05-01): FROM persons p LEFT JOIN
+        # employment_periods. Match on the WHERE clause that gates by
+        # current_company_id — this is the 1:1 query for "people at this
+        # company right now per persons.current_company_id truth source".
+        if "FROM PERSONS P" in sql_upper and "P.CURRENT_COMPANY_ID = $1" in sql_upper:
+            return list(state["persons"])
+        # _eligible_company_ids: GROUP BY current_company_id from persons.
+        if "FROM PERSONS" in sql_upper and "GROUP BY CURRENT_COMPANY_ID" in sql_upper:
+            return [{"company_id": args[0], "n": len(state["persons"])}]
+        # Legacy queries (pre-rewrite) — keep matching so old tests still pass
+        # if anyone reverts. Harmless for the post-rewrite path.
         if "FROM EMPLOYMENT_PERIODS" in sql_upper and "WHERE EP.COMPANY_ID" in sql_upper:
             return list(state["persons"])
         if "FROM EMPLOYMENT_PERIODS" in sql_upper and "GROUP BY COMPANY_ID" in sql_upper:
@@ -323,9 +349,16 @@ async def test_cluster_company_writes_main_and_sub_cluster(stub_db) -> None:
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_cluster_company_below_min_size_skipped(stub_db) -> None:
-    """Companies under MIN_CLUSTER_SIZE produce zero rows."""
-    stub_db["persons"] = stub_db["persons"][:2]  # only 2 < MIN_CLUSTER_SIZE
-    rollup = await cluster_company(COMPANY_A)
+    """Explicit `min_size` override still skips companies under threshold.
+
+    The default `MIN_CLUSTER_SIZE` was lowered from 3 → 1 on 2026-05-01
+    (every prospect must land in a chart), so the previous test
+    "fewer than 2 persons → zero clusters" no longer applies under the
+    default. We exercise the gate via an explicit `min_size=3` override
+    so the early-return branch in `cluster_company` keeps test coverage.
+    """
+    stub_db["persons"] = stub_db["persons"][:2]
+    rollup = await cluster_company(COMPANY_A, min_size=3)
 
     assert rollup.cluster_count == 0
     assert rollup.member_count == 0

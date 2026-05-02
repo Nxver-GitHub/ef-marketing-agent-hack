@@ -145,9 +145,20 @@ _PRESS_PROMPT = (
     "Extract press releases / news items from this company news page. "
     "For each, return: {headline, published_at: ISO date if shown, url: "
     "permalink if available, summary: 1-2 sentence preview, "
-    "mentioned_executives: list of named executives mentioned, "
-    "reporting_phrases: any phrases like 'X reports to Y' or 'will report to' "
-    "found in the release}."
+    "mentioned_executives: list of named executives mentioned. "
+    "reporting_phrases: For appointment / hire / promotion announcements, "
+    "extract the EXACT verbatim phrase that names a reporting relationship "
+    "between two people. Examples of high-signal phrases: "
+    "\"Jane Doe will report to John Smith\", "
+    "\"Smith will join the executive team reporting to Doe\", "
+    "\"reports directly to the Chief Executive Officer\", "
+    "\"under the leadership of [Name], [Title]\". "
+    "Capture the COMPLETE phrase (both names + the verb) verbatim, do not "
+    "paraphrase — the downstream scorer needs the exact verb to weight "
+    "direct-report-language (\"will report to\") higher than soft-authority "
+    "language (\"under the leadership of\"). Return an empty array if the "
+    "release contains no reporting language. Most product/financial press "
+    "releases will return empty here, that's expected."
 )
 
 
@@ -229,9 +240,18 @@ async def scrape_company_page(
         return None
 
     schema, prompt = _schema_and_prompt_for(page_kind)
+    # Firecrawl /v1/scrape contract (verified 2026-05-02 via direct probe):
+    #   `formats` is a list of STRING tags ("json", "markdown", "extract", …).
+    #   Structured-extraction config goes into a sibling `jsonOptions` key,
+    #   not inside the `formats` element. The earlier `formats: [{type, ...}]`
+    #   shape was rejected with HTTP 400 + a list of valid string formats.
+    # If Firecrawl re-introduces the object form later, both shapes can be
+    # sent in parallel; for now the string + jsonOptions form is the only
+    # one the live API accepts.
     payload = {
         "url": page_url,
-        "formats": [{"type": "json", "prompt": prompt, "schema": schema}],
+        "formats": ["json"],
+        "jsonOptions": {"prompt": prompt, "schema": schema},
     }
 
     own_client = client is None

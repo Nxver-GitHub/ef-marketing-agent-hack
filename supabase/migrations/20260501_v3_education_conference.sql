@@ -2,7 +2,16 @@
 --
 -- ## Status
 --
--- DRAFT — needs LP apply. Adds the three tables V3_PT2.md L437-479 specs:
+-- APPLIED to live Supabase. Verified 2026-05-02 via msg 244 audit:
+--   institutions             — 30 rows
+--   education_periods        — 33,974 rows
+--   education_overlaps       — 0 (table exists; clustering job hasn't run)
+--   conference_attendances   — 134 (msg 244 v2→v3 bridge populated)
+--   events                   — 129 (same bridge run)
+--   standards_memberships    — 0 (extractor URLs return member-orgs not
+--                                 individuals; needs alternate data source)
+--
+-- Adds the three tables V3_PT2.md L437-479 specs:
 --
 --   1. institutions          — canonical school name registry + aliases
 --   2. education_overlaps    — pre-computed cohort overlaps (mirrors person_connections)

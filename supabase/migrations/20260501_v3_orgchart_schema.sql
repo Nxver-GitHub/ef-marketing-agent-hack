@@ -2,11 +2,18 @@
 --
 -- ## Status
 --
--- DRAFT — needs LP apply. The connection-graph migration
--- (`20260430_v3_connection_graph.sql`) explicitly deferred these tables;
--- V3_PT2.md Plan A assumes they exist. Authoring here so the org-chart
--- pipeline (clustering / hierarchy / scope / corrections / performance)
--- has a target to write to.
+-- APPLIED to live Supabase. Verified 2026-05-02 via msg 244 audit:
+--   org_reporting_edges      — 9,093 rows
+--   org_functional_clusters  — 2,432 rows
+--   org_cluster_members      — 36,960 rows
+--   person_scope_estimates   — 12,983 rows
+--   org_chart_corrections    — 0 (table exists; UI submissions empty)
+--   org_signal_performance   — 0 (table exists; per-component optimizer
+--                                 hasn't run yet — needs ≥5 corrections)
+--
+-- The pipeline (`server/credence/orgchart/`) writes here; the frontend
+-- reads via `fetchOrgV3()` in `src/pages/ProspectDetail.tsx` (Tasks
+-- 3-A/3-B/3-C all shipped — commit `7d966e7`).
 --
 -- Six tables, in dependency order:
 --   1. org_functional_clusters   — (company, functional_domain[, sub_domain]) clusters

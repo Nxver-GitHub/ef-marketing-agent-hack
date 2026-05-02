@@ -73,7 +73,14 @@ log = logging.getLogger(__name__)
 
 
 # Tweak via env if a deployment wants tighter/looser cluster gating.
-MIN_CLUSTER_SIZE: int = 3
+#
+# Lowered from 3 → 1 on 2026-05-01 to satisfy "every prospect lands in a
+# chart" — companies with 1 or 2 current persons now produce a single-member
+# cluster that the frontend renders against. Hierarchy inference still
+# requires ≥2 cluster members to attempt edge writes (see
+# `infer_cluster_hierarchy` early-return), so solo clusters are charted as
+# "this person + unscraped peer placeholders" without fabricating edges.
+MIN_CLUSTER_SIZE: int = 1
 SUB_CLUSTER_MIN_MEMBERS: int = 2  # need ≥2 same-team people to be a sub-cluster
 
 
@@ -203,7 +210,19 @@ async def cluster_all_companies(
     log.info("clustering: %d companies eligible (>= %d current persons)", len(eligible), min_size)
     rollups: list[ClusterRollup] = []
     for company_id in eligible:
-        rollup = await cluster_company(company_id, min_size=min_size)
+        try:
+            rollup = await cluster_company(company_id, min_size=min_size)
+        except LookupError:
+            # Orphan `employment_periods` row points to a deleted company.
+            # Log + skip — the row will surface in a separate data-quality
+            # audit; here we just don't want one bad row halting the whole
+            # batch scan.
+            log.warning(
+                "clustering: company %s referenced by employment_periods "
+                "but missing from companies table; skipping",
+                company_id,
+            )
+            continue
         rollups.append(rollup)
     return rollups
 
@@ -234,13 +253,18 @@ def _build_cluster_plan(
         else:
             inferred = domain_from_title(p.canonical_title)
             if inferred is None:
-                # Skip persons we can't classify — uncategorized cluster
-                # would be useless to the hierarchy step. Leaving them out
-                # is the right call per CLAUDE.md Decision 4 (unknown nodes
-                # rendered, not silently bucketed).
-                continue
-            domain = inferred
-            base_conf = 0.70
+                # Route into the `uncategorized` registry bucket so the
+                # prospect still has a cluster row for the chart UI to
+                # render against. Hierarchy inference short-circuits on
+                # uncategorized clusters (no edges produced) — see
+                # `taxonomy.HIERARCHY_ELIGIBLE_DOMAINS`. Confidence is low
+                # so optimizers can later distinguish "we know" from
+                # "we shrugged" when nudging weights.
+                domain = "uncategorized"
+                base_conf = 0.30
+            else:
+                domain = inferred
+                base_conf = 0.70
 
         by_domain[domain].append(p)
         confidences[p.person_id] = base_conf
@@ -284,22 +308,34 @@ async def _load_company(company_id: UUID) -> dict[str, Any] | None:
 async def _load_current_persons(company_id: UUID) -> list[_PersonRow]:
     """Pull current-employees-of-this-company joined with their canonical title.
 
-    `employment_periods.is_current = TRUE` filter is the gate; canonical
-    title comes from `persons.current_title` if set, else from
-    `employment_periods.title`.
+    Source of truth is ``persons.current_company_id`` — the per-person
+    "where do they work right now" pointer maintained by the entity-resolution
+    layer. We INTENTIONALLY don't gate on
+    ``employment_periods.is_current = TRUE`` because the LinkedIn/Apify
+    parser sets that flag whenever an end_date is missing, which inflates
+    the "current" set with old jobs (Microsemi, Atmel, US Army, university
+    PhD years, etc.) — confirmed at 1,984 "current" companies vs 585 actual
+    current employers.
+
+    Title resolution: ``persons.current_title`` wins, then we fall through
+    to the matching ``employment_periods`` row at the SAME company (which
+    might still be flagged is_current=TRUE for the right reason — the
+    person genuinely works there now). If neither is set we land an
+    untitled person who will route to the `uncategorized` cluster.
     """
     rows = await fetch(
         """
         SELECT
-          p.id                        AS person_id,
-          ep.account_id               AS account_id,
-          COALESCE(p.current_title, ep.title)            AS title,
+          p.id                                                        AS person_id,
+          COALESCE(p.account_id, ep.account_id)                       AS account_id,
+          COALESCE(p.current_title, ep.title)                         AS title,
           COALESCE(p.current_functional_domain, ep.functional_domain) AS domain,
-          ep.inferred_team            AS team
-        FROM employment_periods ep
-        JOIN persons p ON p.id = ep.person_id
-        WHERE ep.company_id = $1
-          AND ep.is_current = TRUE
+          ep.inferred_team                                            AS team
+        FROM persons p
+        LEFT JOIN employment_periods ep
+          ON  ep.person_id = p.id
+          AND ep.company_id = p.current_company_id
+        WHERE p.current_company_id = $1
         """,
         company_id,
     )
@@ -317,13 +353,22 @@ async def _load_current_persons(company_id: UUID) -> list[_PersonRow]:
 
 
 async def _eligible_company_ids(*, min_size: int) -> list[UUID]:
+    """Companies that currently employ ≥``min_size`` known persons.
+
+    Source of truth is ``persons.current_company_id`` (the entity-resolution
+    layer's "where do they work right now" pointer), NOT
+    ``employment_periods.is_current = TRUE`` — the LinkedIn/Apify parser
+    over-flags `is_current` whenever an end_date is missing, which
+    historically inflated the eligible set 3-4× with defunct/past
+    employers (Microsemi, Atmel, university PhD years, etc.).
+    """
     rows = await fetch(
         """
-        SELECT company_id, count(*) AS n
-        FROM employment_periods
-        WHERE is_current = TRUE
-        GROUP BY company_id
-        HAVING count(*) >= $1
+        SELECT current_company_id AS company_id, COUNT(*) AS n
+        FROM persons
+        WHERE current_company_id IS NOT NULL
+        GROUP BY current_company_id
+        HAVING COUNT(*) >= $1
         ORDER BY n DESC
         """,
         min_size,

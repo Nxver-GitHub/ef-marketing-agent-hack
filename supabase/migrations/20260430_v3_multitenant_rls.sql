@@ -1,13 +1,23 @@
 -- 2026-04-30: Wave 6 M1.5 — multitenancy RLS policies (LavenderPrairie).
 --
--- DEFER APPLICATION — apply this migration AFTER:
---   1. `20260430_v3_multitenant.sql` (schema-only) is applied
---   2. M2 (server/credence/auth.py) is wired into api.py middleware
---   3. M3 (src/contexts/AccountContext.tsx + Login.tsx) is shipped and
---      every frontend Supabase read is authenticated (no anon-key bypass)
+-- STATUS: APPLIED to live Supabase. Verified 2026-05-02 via msg 244 audit:
+--   - All 14 tenant-scoped tables have rowsecurity=t
+--     (companies, persons, employment_periods, education_periods,
+--      prospects, signals, person_connections, prospect_warm_paths,
+--      events, conference_attendances, standards_memberships, papers,
+--      paper_authors, org_reporting_edges)
+--   - 27+ tables have between 2 and 5 RLS policies attached
+--   - The original M2 + M3 prerequisites listed below are all shipped
 --
--- Applying it earlier breaks the v2 anon-key reads — anon role gets
--- filtered to empty rows because `auth.uid()` is NULL.
+-- The historical "DEFER APPLICATION" header (preserved as a comment in
+-- this section) was the deferred-apply instruction set. It's left here
+-- as audit trail; the migration has run.
+--
+-- Original deferral instructions (now satisfied):
+--   1. `20260430_v3_multitenant.sql` (schema-only) is applied  ✅
+--   2. M2 (server/credence/auth.py) is wired into api.py middleware  ✅
+--   3. M3 (src/contexts/AccountContext.tsx + Login.tsx) shipped, every
+--      frontend Supabase read is authenticated (no anon-key bypass)  ✅
 --
 -- ## Policy pattern
 --

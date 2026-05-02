@@ -17,6 +17,7 @@ from .auth import Session, get_session, install_session_middleware
 from .chat import run_chat
 from .config import get_settings
 from .db import close_pool, fetchrow, get_pool
+from .admin import router as admin_router
 from .enrich import router as enrich_router
 from .models import ChatRequest, ChatResponse
 from .orgchart.active_sampling import (
@@ -479,6 +480,9 @@ def create_app() -> FastAPI:
 
     # ─── Enrich (Wave 5 Phase 1 — POST /enrich/{prospect_id}) ────────────────
     app.include_router(enrich_router)
+
+    # ─── Admin (COMPANY_ENRICHMENT_PLAN.md Step 6 — refresh) ─────────────────
+    app.include_router(admin_router)
 
     return app
 
