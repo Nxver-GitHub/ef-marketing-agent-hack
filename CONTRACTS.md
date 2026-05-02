@@ -1045,19 +1045,25 @@ Backend taxonomy modules (`server/lib/taxonomy.py`, `text_patterns.py`) **do not
 
 ---
 
-## Org-chart pipeline — v3.1 build in progress (status: 2026-05-01)
+## Org-chart pipeline — v3.1 LIVE (status: 2026-05-02)
 
-The schema migration `20260501_v3_orgchart_schema.sql` (drafted by
-SwiftElk in msg 135) is **NOT YET applied** to live Supabase pending LP
-review — supersedes the earlier note that schemas were live. The 6 tables
-remain absent in the live DB; the population code below ships against
-unit-test shims and goes live the moment LP applies the migration.
+The schema migration `20260501_v3_orgchart_schema.sql` is **applied to
+live Supabase** and the 6 tables are populated:
 
-### What v3.1 ships (in flight, not yet 100%)
+| Table | Live row count (default tenant, 2026-05-02) |
+|---|---|
+| `org_reporting_edges` | 9,093 |
+| `org_functional_clusters` | 2,432 |
+| `org_cluster_members` | 36,960 |
+| `person_scope_estimates` | 12,983 |
+| `org_chart_corrections` | 0 (table exists; no UI submissions yet — see Contract 11) |
+| `org_signal_performance` | 0 (table exists; per-component optimizer hasn't run yet — see Task 4-B) |
 
-The tables `org_reporting_edges`, `org_functional_clusters`,
-`org_cluster_members`, `person_scope_estimates`, `org_chart_corrections`,
-`org_signal_performance` are written by `server/credence/orgchart/`:
+The pipeline (`server/credence/orgchart/`) writes via the population code
+below. Frontend reads via `fetchOrgV3()` in `src/pages/ProspectDetail.tsx`
+(Tasks 3-A/3-B/3-C all shipped — see commit `7d966e7`).
+
+### What v3.1 ships
 
 | Module | Owner | Status |
 |---|---|---|
@@ -1088,7 +1094,7 @@ span-of-control caps per seniority tier, IC-track parity at same seniority.
 
 ---
 
-## Hidden-connections expansion — v3.1 build in progress (status: 2026-05-01)
+## Hidden-connections expansion — v3.1 LIVE (status: 2026-05-02)
 
 V3_PT2.md (Plan B) adds 4 new EdgeKinds (`same_mba_cohort`,
 `same_phd_program`, `executive_education`, `same_undergrad_cohort`)
@@ -1097,7 +1103,7 @@ plus 3 schema tables (`institutions`, `education_overlaps`,
 
 | Item | Owner | Status |
 |---|---|---|
-| Schema migration `20260501_v3_education_conference.sql` | SwiftElk | 📝 drafted (msg 138), **needs LP apply** |
+| Schema migration `20260501_v3_education_conference.sql` | SwiftElk | ✅ APPLIED — `institutions`=30, `education_periods`=33,974, `education_overlaps`=0 (table exists; no clustering job has run yet), `conference_attendances`=134 (populated via msg 244 v2→v3 bridge), `events`=129 |
 | 4 new EdgeKinds in `graph.ts` + EDGE_CONFIGS + CSS | SunnyRidge | ✅ shipped |
 | Education extractor (`extractors/education.py`) | SwiftElk | ✅ shipped (msg 140) — PDL + school normalization + cohort strength, 23 specs |
 | Conference-program extractor (`extractors/conference.py`) | SwiftElk | ✅ shipped (msg 144) — Firecrawl + regex parsing, 16 specs |
