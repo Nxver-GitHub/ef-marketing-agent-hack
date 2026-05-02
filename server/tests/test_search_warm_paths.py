@@ -544,3 +544,218 @@ async def test_unknown_target_name_is_none(patched_search) -> None:
     # Should not crash; should return graceful empty result.
     assert res["paths_found"] == 0
     assert res["target_name"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# `find_warm_paths` — `source_person_ids` filter (Wave A: customer onboarding)
+#
+# Customer-facing chat tool scopes warm-path BFS results to "your team's
+# relationships". Without this filter, every customer would see warm paths
+# through every connection in the DB. The filter keeps Contract 12 invariants
+# (≤10 paths, sort desc, ≤4 hops, etc.) but drops paths whose terminal
+# `connector_id` is NOT in the supplied source set.
+#
+# Backward-compat: `source_person_ids = None` OR `source_person_ids = []` is
+# a safety hatch that preserves the legacy open-ended BFS behavior — existing
+# callers (e.g. the chat-tool dispatch in chat.py until Wave C wires the
+# new arg) keep working untouched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestFindWarmPathsSourceFilter:
+    async def test_source_person_ids_none_preserves_legacy_behavior(
+        self, patched_search
+    ) -> None:
+        """Regression mirror of `test_single_direct_connection_returns_one_path`
+        — passing `source_person_ids=None` must produce the SAME shape and
+        path count as the legacy open-ended BFS."""
+        set_edges, set_persons, _ = patched_search
+        set_persons([_person(1, "A"), _person(2, "B")])
+        set_edges([_edge(0, 1, 2, strength=0.8)])
+        res = await search.find_warm_paths(
+            _pid(1), max_hops=2, source_person_ids=None,
+        )
+        assert res["paths_found"] == 1
+        assert res["paths"][0]["hops"] == 1
+        assert res["paths"][0]["path_strength"] == 0.8
+        assert res["paths"][0]["connector_id"] == _pid(2)
+
+    async def test_source_person_ids_empty_list_preserves_legacy_behavior(
+        self, patched_search
+    ) -> None:
+        """Empty list is the same safety hatch as None — filter NOT applied."""
+        set_edges, set_persons, _ = patched_search
+        set_persons([_person(i) for i in [1, 2, 3]])
+        set_edges([
+            _edge(0, 1, 2, strength=0.8),
+            _edge(1, 1, 3, strength=0.7),
+        ])
+        res = await search.find_warm_paths(
+            _pid(1), max_hops=1, source_person_ids=[],
+        )
+        # Both connectors come back, just like with no filter at all.
+        assert res["paths_found"] == 2
+        connectors = {p["connector_id"] for p in res["paths"]}
+        assert connectors == {_pid(2), _pid(3)}
+
+    async def test_source_person_ids_includes_only_matching_connector(
+        self, patched_search
+    ) -> None:
+        """Filter to exactly one connector that EXISTS in BFS results — get
+        only that connector's path back."""
+        set_edges, set_persons, _ = patched_search
+        set_persons([_person(i) for i in [1, 2, 3, 4]])
+        set_edges([
+            _edge(0, 1, 2, strength=0.9),  # connector 2
+            _edge(1, 1, 3, strength=0.8),  # connector 3
+            _edge(2, 1, 4, strength=0.7),  # connector 4
+        ])
+        res = await search.find_warm_paths(
+            _pid(1), max_hops=1, source_person_ids=[_pid(3)],
+        )
+        assert res["paths_found"] == 1
+        assert res["paths"][0]["connector_id"] == _pid(3)
+        # Path payload still fully rendered.
+        assert res["paths"][0]["path_strength"] == 0.8
+        assert res["paths"][0]["hops"] == 1
+
+    async def test_source_person_ids_unrelated_uuid_returns_team_message(
+        self, patched_search
+    ) -> None:
+        """Filter to a connector NOT in BFS results — empty paths AND the
+        new 'from your team' message wording (NOT the legacy message)."""
+        set_edges, set_persons, _ = patched_search
+        set_persons([_person(i) for i in [1, 2, 3]])
+        set_edges([
+            _edge(0, 1, 2, strength=0.9),
+            _edge(1, 1, 3, strength=0.8),
+        ])
+        unrelated = _pid(999)  # nobody on this UUID
+        res = await search.find_warm_paths(
+            _pid(1), max_hops=1, source_person_ids=[unrelated],
+        )
+        assert res["paths_found"] == 0
+        assert res["paths"] == []
+        # New customer-onboarding message — NOT the legacy "expanding the graph"
+        # copy. This distinguishes "no warm paths exist" from "no warm paths
+        # from your team specifically".
+        assert res["message"] == (
+            "No warm paths found from your team to this person. "
+            "Add more team members in onboarding, or expand the search."
+        )
+
+    async def test_source_person_ids_multi_source_returns_paths_to_either(
+        self, patched_search
+    ) -> None:
+        """Filter to multiple connectors — paths to ANY of them survive."""
+        set_edges, set_persons, _ = patched_search
+        set_persons([_person(i) for i in [1, 2, 3, 4, 5]])
+        set_edges([
+            _edge(0, 1, 2, strength=0.9),
+            _edge(1, 1, 3, strength=0.8),
+            _edge(2, 1, 4, strength=0.7),
+            _edge(3, 1, 5, strength=0.6),
+        ])
+        res = await search.find_warm_paths(
+            _pid(1), max_hops=1, source_person_ids=[_pid(2), _pid(4)],
+        )
+        assert res["paths_found"] == 2
+        connectors = {p["connector_id"] for p in res["paths"]}
+        assert connectors == {_pid(2), _pid(4)}
+
+    async def test_source_filter_preserves_desc_sort_and_ten_cap(
+        self, patched_search
+    ) -> None:
+        """Build 15 connectors, filter to 12 → cap at 10, sorted DESC."""
+        set_edges, set_persons, _ = patched_search
+        # Persons 2..16 are all direct connectors of 1 with descending strengths
+        # 0.99, 0.98, ..., 0.85. (15 total connectors.)
+        set_persons([_person(i) for i in range(1, 17)])
+        edges_in = []
+        for idx, conn_n in enumerate(range(2, 17)):
+            edges_in.append(_edge(idx, 1, conn_n, strength=0.99 - idx * 0.01))
+        set_edges(edges_in)
+        # Filter to connectors 2..13 (12 of the 15).
+        filter_ids = [_pid(n) for n in range(2, 14)]
+        res = await search.find_warm_paths(
+            _pid(1), max_hops=1, min_strength=0.1,
+            source_person_ids=filter_ids,
+        )
+        # ≤10 cap holds.
+        assert len(res["paths"]) == 10
+        assert res["paths_found"] == 10
+        # Returned connectors are a subset of the filter.
+        for p in res["paths"]:
+            assert p["connector_id"] in set(filter_ids)
+        # Descending sort by path_strength preserved.
+        strengths = [p["path_strength"] for p in res["paths"]]
+        assert strengths == sorted(strengths, reverse=True)
+        # And the top 10 are the strongest 10 in the filtered set — i.e. the
+        # filtered candidates ordered by strength desc, then top 10. The
+        # strongest of the 12 (connectors 2..13) are connectors 2..11.
+        expected_top10 = {_pid(n) for n in range(2, 12)}
+        assert {p["connector_id"] for p in res["paths"]} == expected_top10
+
+    async def test_source_filter_applies_to_terminal_not_intermediate_nodes(
+        self, patched_search
+    ) -> None:
+        """The filter compares against the path's TERMINAL `connector_id`,
+        NOT any intermediate hop. A 2-hop path 1 → 2 → 3 should be kept iff
+        person 3 is in `source_person_ids` — even if person 2 is."""
+        set_edges, set_persons, _ = patched_search
+        set_persons([_person(i) for i in [1, 2, 3]])
+        set_edges([
+            _edge(0, 1, 2, strength=0.9),
+            _edge(1, 2, 3, strength=0.9),
+        ])
+        # Filter to the INTERMEDIATE node only. The 1→2 direct path should
+        # survive (connector 2 IS in the filter), but the 1→2→3 path should
+        # be dropped (connector 3 is NOT in the filter).
+        res = await search.find_warm_paths(
+            _pid(1), max_hops=3, min_strength=0.3,
+            source_person_ids=[_pid(2)],
+        )
+        connectors = {p["connector_id"] for p in res["paths"]}
+        assert connectors == {_pid(2)}
+        # Confirm there's exactly one path and it's the 1-hop, not the 2-hop.
+        assert res["paths_found"] == 1
+        assert res["paths"][0]["hops"] == 1
+
+    async def test_filtered_path_payload_has_full_shape(
+        self, patched_search
+    ) -> None:
+        """A path that survives the filter must still come back with the full
+        Contract 12 payload — same keys as the unfiltered case."""
+        set_edges, set_persons, set_ev = patched_search
+        set_persons([_person(1, "Wei Chen"), _person(2, "Sarah Kim")])
+        set_edges([_edge(0, 1, 2, strength=0.95,
+                         ctype="patent_co_inventor",
+                         evidence_ids=["ev-1"])])
+        set_ev({
+            "edge-0": {
+                "patent_title": "Method for Tile Sparsity",
+                "assignee": "NVIDIA",
+                "year": 2018,
+            }
+        })
+        res = await search.find_warm_paths(
+            _pid(1), source_person_ids=[_pid(2)],
+        )
+        assert res["paths_found"] == 1
+        path = res["paths"][0]
+        # Every Contract 12 key is present.
+        required = {
+            "path_strength", "hops", "connector", "connector_id",
+            "path_names", "connection_types", "explanation",
+            "suggested_opener",
+        }
+        assert required.issubset(path.keys())
+        # And the explanation actually used the threaded evidence — i.e. the
+        # path renders fully, not as a shell.
+        assert path["path_strength"] == 0.95
+        assert path["hops"] == 1
+        assert path["connector"] == "Sarah Kim"
+        assert path["connection_types"] == ["patent_co_inventor"]
+        assert "Method for Tile Sparsity" in path["explanation"]
+        assert "NVIDIA" in path["explanation"]

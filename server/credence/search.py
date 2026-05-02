@@ -993,6 +993,7 @@ async def find_warm_paths(
     max_hops: int = 3,
     min_strength: float = 0.30,
     connection_types: list[str] | None = None,
+    source_person_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """BFS over `person_connections` from `target_person_id` outward.
 
@@ -1012,6 +1013,14 @@ async def find_warm_paths(
       - All accumulated paths (1-hop direct connections through max_hops) are
         candidates; we dedup by terminal `connector_id` keeping the strongest
         path per connector and return the top 10.
+
+    `source_person_ids` (CUSTOMER_ONBOARDING_PLAN.md — `find_warm_paths`
+    Update): when non-empty, only paths whose terminal `connector_id` is in
+    this set are returned. This is how the customer-facing chat tool scopes
+    BFS results to "your team's relationships" — without it, every customer
+    would see warm paths through every person in the DB. `None` or `[]`
+    preserves the original open-ended BFS behavior so existing callers (the
+    chat-tool dispatch in chat.py until Wave C) keep working untouched.
 
     Then ONE bulk evidence join + ONE bulk persons hydrate before rendering.
     """
@@ -1114,8 +1123,25 @@ async def find_warm_paths(
         if existing is None or path["path_strength"] > existing["path_strength"]:
             best_by_connector[cid] = path
 
+    # Source-person filter (CUSTOMER_ONBOARDING_PLAN.md — `find_warm_paths`
+    # Update). When the caller supplied a non-empty `source_person_ids`, only
+    # paths whose terminal connector is one of those IDs survive. We track
+    # whether a filter was actually applied so the empty-result message can
+    # distinguish "no warm paths exist at all" from "no warm paths from your
+    # team specifically." None / [] is the safety hatch — preserves the
+    # legacy open-ended BFS behavior so existing callers stay green.
+    source_filter_applied = bool(source_person_ids)
+    if source_filter_applied:
+        source_set = set(source_person_ids or [])
+        candidate_paths = [
+            p for p in best_by_connector.values()
+            if p["connector_id"] in source_set
+        ]
+    else:
+        candidate_paths = list(best_by_connector.values())
+
     top_paths = sorted(
-        best_by_connector.values(),
+        candidate_paths,
         key=lambda p: p["path_strength"],
         reverse=True,
     )[:_TOP_PATHS]
@@ -1126,15 +1152,22 @@ async def find_warm_paths(
         target_name = (
             target_persons[0].get("canonical_name") if target_persons else None
         )
+        if source_filter_applied:
+            empty_message = (
+                "No warm paths found from your team to this person. "
+                "Add more team members in onboarding, or expand the search."
+            )
+        else:
+            empty_message = (
+                "No warm paths found in the current graph. "
+                "Try expanding the graph or lowering min_strength."
+            )
         return {
             "target_id":   target_person_id,
             "target_name": target_name,
             "paths_found": 0,
             "paths":       [],
-            "message": (
-                "No warm paths found in the current graph. "
-                "Try expanding the graph or lowering min_strength."
-            ),
+            "message":     empty_message,
         }
 
     # --- Bulk hydrate persons + first-edge evidence -------------------------
