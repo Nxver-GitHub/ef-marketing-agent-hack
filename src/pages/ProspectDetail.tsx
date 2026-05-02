@@ -7,8 +7,14 @@ import {
   useSignalsFor,
   useLatestScore,
   useLatestRun,
+  useEmploymentEducation,
+  useSkillsFor,
   type ScoringRun,
 } from "@/lib/db";
+import { PersonProfileCard } from "@/components/PersonProfileCard";
+import { CareerTimeline } from "@/components/CareerTimeline";
+import { EducationTimeline } from "@/components/EducationTimeline";
+import { SkillsChipCloud } from "@/components/SkillsChipCloud";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { getCredenceHeaders } from "@/lib/credenceHeaders";
 import { BigScore, ScoreBar, scoreColor } from "@/components/ScoreBar";
@@ -71,6 +77,10 @@ const ProspectDetail = () => {
   const signals = useSignalsFor(id);
   const score = useLatestScore(id);
   const run = useLatestRun(id);
+  // Phase A6 mirror — pull rich Tier-1 enrichment for the standalone page.
+  // Hooks no-op gracefully when the prospect→person link is missing.
+  const { employment, education } = useEmploymentEducation(id ?? null);
+  const { skills } = useSkillsFor(id ?? null);
   const [tab, setTab] = useState<"overview" | "org">("overview");
   const [showRaw, setShowRaw] = useState(false);
   const [expanded, setExpanded] = useState(false);
@@ -222,6 +232,37 @@ const ProspectDetail = () => {
 
               <div className="md:col-span-7 space-y-px">
                 <WebPresence signals={signals} />
+
+                {/* Phase A6 — rich Tier-1 enrichment surface (mirrors NodeInspector).
+                    Sections render only when their backing data is present. */}
+                <PersonProfileCard
+                  person={{
+                    canonical_name: prospect.name,
+                    current_title: prospect.role ?? null,
+                    current_company_name: prospect.company ?? null,
+                    linkedin_url: prospect.linkedin_url ?? null,
+                    email: prospect.email ?? null,
+                  }}
+                  className="border border-border"
+                />
+                {employment.length > 0 ? (
+                  <div className="border border-border p-5">
+                    <div className="label-eyebrow mb-3">Career history</div>
+                    <CareerTimeline employment={employment} maxRows={8} />
+                  </div>
+                ) : null}
+                {education.length > 0 ? (
+                  <div className="border border-border p-5">
+                    <div className="label-eyebrow mb-3">Education</div>
+                    <EducationTimeline education={education} maxRows={5} />
+                  </div>
+                ) : null}
+                {skills.length > 0 ? (
+                  <div className="border border-border p-5">
+                    <div className="label-eyebrow mb-3">Top skills</div>
+                    <SkillsChipCloud skills={skills} topN={20} />
+                  </div>
+                ) : null}
 
                 <div className="border border-border">
                   <button
