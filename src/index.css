@@ -95,6 +95,21 @@
     --score-strong:    142 71% 45%;
     --score-plausible:  38 92% 50%;
     --score-weak:        0 72% 51%;
+
+    /* Functional-domain cluster colors (org chart, 9 keys + fallback).
+     * Mirror the Python `credence.taxonomy.FUNCTIONAL_DOMAINS` keyset
+     * (CLAUDE.md L297-313). Hue choices spread across the wheel for
+     * visual differentiation while staying within the muted palette. */
+    --domain-hardware-engineering:  12 70% 50%;
+    --domain-software-engineering: 217 75% 56%;
+    --domain-product-management:   262 60% 55%;
+    --domain-manufacturing-ops:     35 80% 50%;
+    --domain-sales-marketing:      142 55% 45%;
+    --domain-research:             295 60% 55%;
+    --domain-finance-legal:        178 60% 42%;
+    --domain-people-ops:            90 50% 45%;
+    --domain-general-management:   215 14% 47%;
+    --domain-fallback:             215 14% 47%;
   }
 
   .dark {
@@ -136,6 +151,18 @@
     --score-strong:    142 71% 60%;
     --score-plausible:  38 92% 65%;
     --score-weak:        0 72% 66%;
+
+    /* Functional-domain cluster colors — lifted L for dark canvas. */
+    --domain-hardware-engineering:  12 80% 65%;
+    --domain-software-engineering: 217 85% 70%;
+    --domain-product-management:   262 70% 70%;
+    --domain-manufacturing-ops:     35 90% 65%;
+    --domain-sales-marketing:      142 65% 60%;
+    --domain-research:             295 70% 70%;
+    --domain-finance-legal:        178 70% 58%;
+    --domain-people-ops:            90 60% 60%;
+    --domain-general-management:   215 22% 65%;
+    --domain-fallback:             215 22% 65%;
   }
 }
 

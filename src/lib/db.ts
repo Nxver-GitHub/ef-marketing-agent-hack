@@ -910,6 +910,162 @@ function useSupaPersonConnections(
   }, [ids, data]);
 }
 
+// ─── New: employment + education + skills hooks for the rich person card ───
+// Additive only — no existing-symbol mutation. Per Phase A integration plan
+// (msg 245 ack) — surfaces the Tier-1-enrichment columns the writer landed
+// in 20260501_v3_persons_full_enrichment + person_signals.
+
+export interface PersonEmploymentPeriod {
+  title: string;
+  company_name: string;
+  company_linkedin_url?: string | null;
+  start_year?: number | null;
+  start_month?: number | null;
+  end_year?: number | null;
+  end_month?: number | null;
+  is_current?: boolean | null;
+  inferred_team?: string | null;
+  functional_domain?: string | null;
+  seniority_score?: number | null;
+}
+
+export interface PersonEducationPeriod {
+  school_name: string;
+  school_linkedin_url?: string | null;
+  degree?: string | null;
+  start_year?: number | null;
+  end_year?: number | null;
+  field_of_study?: string | null;
+}
+
+interface PersonHistoryResult {
+  employment: PersonEmploymentPeriod[];
+  education: PersonEducationPeriod[];
+  isLoading: boolean;
+}
+
+const _emptyHistory: PersonHistoryResult = {
+  employment: [],
+  education: [],
+  isLoading: false,
+};
+
+/** Resolve persons.id from prospects.id via source_prospect_id back-reference.
+ *  persons rows store the rich Tier-1 enrichment (Apify/Apollo); prospects
+ *  rows are the v2 entity table. The link is `persons.source_prospect_id =
+ *  prospects.id` (writer-side, established in 20260501_v3_persons_prospect_link). */
+async function _personIdForProspect(prospectId: string): Promise<string | null> {
+  const { data, error } = await supabase!
+    .from("persons")
+    .select("id")
+    .eq("source_prospect_id", prospectId)
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    console.error("[db] persons lookup error:", error);
+    return null;
+  }
+  return (data as { id?: string } | null)?.id ?? null;
+}
+
+function useSupaEmploymentEducation(prospectId: string | null): PersonHistoryResult {
+  const { data, isLoading } = useQuery({
+    queryKey: ["person_history", prospectId, USE_SNAPSHOT ? "snapshot" : "live"],
+    enabled: HAS_REAL_SUPABASE && !!prospectId && !USE_SNAPSHOT,
+    staleTime: BULK_STALE_MS,
+    queryFn: async () => {
+      if (!prospectId) return { employment: [], education: [] };
+      const personId = await _personIdForProspect(prospectId);
+      if (!personId) return { employment: [], education: [] };
+      const [empRes, eduRes] = await Promise.all([
+        supabase!
+          .from("employment_periods")
+          .select(
+            "title,company_name,company_linkedin_url,start_year,start_month,end_year,end_month,is_current,inferred_team,functional_domain,seniority_score",
+          )
+          .eq("person_id", personId)
+          .order("is_current", { ascending: false })
+          .order("start_year", { ascending: false, nullsLast: true }),
+        supabase!
+          .from("education_periods")
+          .select(
+            "school_name,school_linkedin_url,degree,start_year,end_year,field_of_study",
+          )
+          .eq("person_id", personId)
+          .order("start_year", { ascending: false, nullsLast: true }),
+      ]);
+      if (empRes.error)
+        console.error("[db] employment_periods fetch error:", empRes.error);
+      if (eduRes.error)
+        console.error("[db] education_periods fetch error:", eduRes.error);
+      return {
+        employment: (empRes.data ?? []) as PersonEmploymentPeriod[],
+        education: (eduRes.data ?? []) as PersonEducationPeriod[],
+      };
+    },
+  });
+  return useMemo(
+    () => ({
+      employment: data?.employment ?? [],
+      education: data?.education ?? [],
+      isLoading,
+    }),
+    [data, isLoading],
+  );
+}
+
+function useDemoOrMockEmploymentEducation(_personId: string | null): PersonHistoryResult {
+  // Demo + mock modes don't have employment_periods seeded; return empty.
+  return _emptyHistory;
+}
+
+interface PersonSkillsResult {
+  skills: string[];
+  isLoading: boolean;
+}
+
+const _emptySkills: PersonSkillsResult = { skills: [], isLoading: false };
+
+function useSupaSkillsFor(prospectId: string | null): PersonSkillsResult {
+  const { data, isLoading } = useQuery({
+    queryKey: ["person_skills", prospectId, USE_SNAPSHOT ? "snapshot" : "live"],
+    enabled: HAS_REAL_SUPABASE && !!prospectId && !USE_SNAPSHOT,
+    staleTime: BULK_STALE_MS,
+    queryFn: async () => {
+      if (!prospectId) return [] as string[];
+      const personId = await _personIdForProspect(prospectId);
+      if (!personId) return [] as string[];
+      const { data: rows, error } = await supabase!
+        .from("person_signals")
+        .select("structured_value")
+        .eq("person_id", personId)
+        .eq("signal_type", "linkedin_skill_set")
+        .limit(1);
+      if (error) {
+        console.error("[db] person_signals fetch error:", error);
+        return [] as string[];
+      }
+      const sv = (rows?.[0] as { structured_value?: unknown } | undefined)?.structured_value;
+      // structured_value shape per writer: { skills: string[] } OR an array directly
+      if (Array.isArray(sv)) return sv.filter((x): x is string => typeof x === "string");
+      if (sv && typeof sv === "object" && Array.isArray((sv as { skills?: unknown }).skills)) {
+        return ((sv as { skills: unknown[] }).skills).filter(
+          (x): x is string => typeof x === "string",
+        );
+      }
+      return [] as string[];
+    },
+  });
+  return useMemo(
+    () => ({ skills: data ?? [], isLoading }),
+    [data, isLoading],
+  );
+}
+
+function useDemoOrMockSkillsFor(_personId: string | null): PersonSkillsResult {
+  return _emptySkills;
+}
+
 const _DEMO = isDemoMode();
 
 export const useProspects = _DEMO
@@ -941,6 +1097,12 @@ export const useScoresFor = _DEMO
 export const usePersonConnections = _DEMO
   ? useDemoPersonConnections
   : (HAS_REAL_SUPABASE ? useSupaPersonConnections : useMockPersonConnections);
+export const useEmploymentEducation = _DEMO || !HAS_REAL_SUPABASE
+  ? useDemoOrMockEmploymentEducation
+  : useSupaEmploymentEducation;
+export const useSkillsFor = _DEMO || !HAS_REAL_SUPABASE
+  ? useDemoOrMockSkillsFor
+  : useSupaSkillsFor;
 
 // ─── Exported unified mutations ───────────────────────────────────────────────
 
