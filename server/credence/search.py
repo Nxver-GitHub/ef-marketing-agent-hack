@@ -879,12 +879,21 @@ def _build_explanation(
         "career_overlap_same_domain",
         "career_overlap_general",
     ):
+        # Live DB key for the company name is `company_name` (writer in
+        # career_overlap_clustering.py); plan spec said `company`. Read
+        # both for forward-compat. `overlap_start` can be NULL when the
+        # employment_periods row had no start_year — render as `?` only
+        # when truly missing, otherwise show the integer year.
+        company = ev.get("company_name") or ev.get("company") or "a shared employer"
+        ostart = ev.get("overlap_start")
+        oend = ev.get("overlap_end")
+        oyears = ev.get("overlap_years")
+        start_str = str(ostart) if ostart is not None else "?"
+        end_str = str(oend) if oend is not None else "?"
+        years_str = str(oyears) if oyears is not None else "?"
         return (
-            f"{a_name} and {b_name} worked together at "
-            f"{ev.get('company', 'a shared employer')} "
-            f"({ev.get('overlap_start', '?')}–"
-            f"{ev.get('overlap_end', '?')}, "
-            f"{ev.get('overlap_years', '?')} yr overlap)"
+            f"{a_name} and {b_name} worked together at {company} "
+            f"({start_str}–{end_str}, {years_str} yr overlap)"
         )
     if ctype == "same_phd_advisor":
         return (
@@ -957,10 +966,9 @@ def _build_opener(
         "career_overlap_same_domain",
         "career_overlap_general",
     ):
-        return (
-            f"{connector} — we worked together at "
-            f"{ev.get('company', 'the same company')}."
-        )
+        # Live key is `company_name`; spec said `company`. Read both.
+        company = ev.get("company_name") or ev.get("company") or "the same company"
+        return f"{connector} — we worked together at {company}."
     if ctype == "same_phd_advisor":
         return (
             f"{connector} — we both worked under "
