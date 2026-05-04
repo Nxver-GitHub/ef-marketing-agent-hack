@@ -317,6 +317,12 @@ class SessionMiddleware(BaseHTTPMiddleware):
         self._exempt = exempt_prefixes if exempt_prefixes is not None else EXEMPT_PATH_PREFIXES
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        # CORS preflights carry no auth and must reach the CORS middleware
+        # so it can attach Access-Control-Allow-* headers; rejecting them
+        # here would surface as a generic CORS failure in the browser.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         path = request.url.path
         if any(path == p or path.startswith(p) for p in self._exempt):
             return await call_next(request)

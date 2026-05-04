@@ -55,18 +55,17 @@ export function getActiveAccessToken(): string | null {
 /**
  * Resolve the per-request headers for a Credence backend call.
  *
- * - Demo mode  → `{ "X-Credence-Demo": "true" }`
- * - Live mode + signed in → `{ "Authorization": "Bearer <jwt>" }`
- * - Live mode + signed out → `{}` — backend will return 401 on auth-required routes
+ * - Signed in → `{ "Authorization": "Bearer <jwt>" }`
+ * - Anyone else (demo URL, signed out, or auth disabled) → `{ "X-Credence-Demo": "true" }`
+ *
+ * Anonymous access is intentionally bound to the demo tenant since the
+ * RequireAuth gate is disabled (open-access demo).
  *
  * Pure function. Safe to call from non-React contexts (`agent.ts`, `db.ts`).
  */
 export function getCredenceHeaders(): CredenceHeaders {
-  if (isDemoMode()) {
-    return { "X-Credence-Demo": "true" }
-  }
-  if (_activeAccessToken) {
+  if (_activeAccessToken && !isDemoMode()) {
     return { Authorization: `Bearer ${_activeAccessToken}` }
   }
-  return {}
+  return { "X-Credence-Demo": "true" }
 }
